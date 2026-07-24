@@ -35,7 +35,7 @@ class SweepConfig:
 class SweepRow:
     start_hz: float
     bin_hz: float
-    power_db: list[float]
+    power_db: list[float | None]  # None marks an unfilled gap (JSON null, not NaN)
 
 
 class SoapySweeper:
@@ -112,18 +112,36 @@ class SoapySweeper:
                     sdr.setFrequency(SOAPY_SDR_RX, 0, center)
                     sr = sdr.readStream(rx, [buf], FFT_SIZE, timeoutUs=2_000_000)
                     if sr.ret > 0:
-                        fft = np.fft.fftshift(np.fft.fft(buf[: sr.ret] * window[: sr.ret]))
+                        # A partial read still needs to produce an FFT_SIZE-bin spectrum so
+                        # bin_hz/offset math stays valid — zero-pad rather than computing a
+                        # shorter (and differently-spaced) FFT from just the samples we got.
+                        samples = buf[: sr.ret] * window[: sr.ret]
+                        if sr.ret < FFT_SIZE:
+                            padded = np.zeros(FFT_SIZE, np.complex64)
+                            padded[: sr.ret] = samples
+                            samples = padded
+                        fft = np.fft.fftshift(np.fft.fft(samples))
                         power_db = 20 * np.log10(np.abs(fft) + 1e-9)
                         lower_edge = center - half_span
                         offset = int((lower_edge - config.start_hz) / bin_hz)
                         n = min(len(power_db), n_bins_total - offset)
                         if n > 0:
                             row[offset : offset + n] = power_db[:n]
+                    elif sr.ret == 0:
+                        _LOGGER.debug("readStream returned 0 (timeout) at %.3f MHz", center / 1e6)
                     else:
-                        _LOGGER.debug("readStream returned %d at %.3f MHz", sr.ret, center / 1e6)
+                        # A negative return is a genuine SoapySDR error code (stream error,
+                        # overflow, corruption, ...), not a benign empty read — treat it as
+                        # fatal so the dongle claim gets released instead of spinning forever
+                        # on a stalled/unplugged device.
+                        raise RuntimeError(f"readStream error {sr.ret} at {center / 1e6:.3f} MHz")
                     center += config.sample_rate
                 if not self._stop_event.is_set():
-                    self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=bin_hz, power_db=row.tolist()))
+                    # NaN is not valid JSON (json.dumps emits a bare `NaN` token by default,
+                    # which a standards-compliant parser — e.g. the browser's JSON.parse —
+                    # rejects); represent an unfilled gap as null instead.
+                    power_db = [None if np.isnan(v) else float(v) for v in row]
+                    self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=bin_hz, power_db=power_db))
         except Exception as err:  # noqa: BLE001 - surface any runtime failure (e.g. dongle unplugged mid-sweep) to the caller
             _LOGGER.exception("sweep failed for dongle %s", config.dongle_serial)
             if self._on_error is not None:

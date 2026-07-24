@@ -6,6 +6,7 @@ url: https://github.com/8408323/ha-sdr
 arch:
   - aarch64
   - amd64
+init: false
 usb: true
 udev: true
 ports:

@@ -4,7 +4,7 @@ import logging
 
 from auth import verify_token
 from broadcaster import Broadcaster
-from device_manager import DongleBusyError, DongleNotFoundError
+from device_manager import DongleBusyError, DongleNotFoundError, DuplicateDongleSerialError
 from fastapi import (
     APIRouter,
     Depends,
@@ -44,6 +44,8 @@ async def create_receiver(cfg: ReceiverCreate, request: Request) -> Receiver:
         raise HTTPException(status_code=409, detail=str(err)) from err
     except DongleNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+    except DuplicateDongleSerialError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
 
 
 @router.delete("/receivers/{receiver_id}", status_code=204, dependencies=[Depends(verify_token)])
@@ -64,6 +66,8 @@ async def create_sweep(cfg: SweepCreate, request: Request) -> Sweep:
         raise HTTPException(status_code=409, detail=str(err)) from err
     except DongleNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+    except DuplicateDongleSerialError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
 
 
 @router.delete("/sweeps/{sweep_id}", status_code=204, dependencies=[Depends(verify_token)])
