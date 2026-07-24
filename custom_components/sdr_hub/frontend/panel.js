@@ -95,6 +95,7 @@ class SdrHubPanel extends HTMLElement {
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._decodedLog = []; // most-recent-first
     this._unsub = null;
+    this._subscribing = false;
   }
 
   set hass(hass) {
@@ -118,7 +119,13 @@ class SdrHubPanel extends HTMLElement {
     // reattach this same element (e.g. navigating away and back) without recreating it —
     // disconnectedCallback already tore down the subscription, so without this a
     // reconnected panel would silently show static (stale) state with no live updates.
-    if (!this._unsub) {
+    // Guarded by _subscribing (not just _unsub) since connectedCallback can fire while the
+    // very first _subscribe() call (from the hass setter) is still awaiting its result -
+    // _unsub isn't assigned until that resolves, so checking only _unsub let both callers
+    // race into a second, duplicate subscription (confirmed live: rows arrived at ~2x the
+    // add-on's actual broadcast rate, evicting "keep full history" mode's capped buffer
+    // twice as fast as it should).
+    if (!this._unsub && !this._subscribing) {
       this._loadState();
       this._subscribe();
     }
@@ -136,6 +143,8 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _subscribe() {
+    if (this._unsub || this._subscribing) return; // already subscribed, or another call is in flight
+    this._subscribing = true; // set synchronously, before the await below, to close that race
     try {
       this._unsub = await this._hass.connection.subscribeMessage(
         (event) => this._handleEvent(event),
@@ -143,6 +152,8 @@ class SdrHubPanel extends HTMLElement {
       );
     } catch (err) {
       this._showError(`Could not subscribe to live updates: ${err.message || err}`);
+    } finally {
+      this._subscribing = false;
     }
   }
 
@@ -208,6 +219,9 @@ class SdrHubPanel extends HTMLElement {
             <label style="${LABEL}">Start MHz<input name="start_mhz" type="number" step="0.001" value="88" style="${INPUT};width:100px"></label>
             <label style="${LABEL}">Stop MHz<input name="stop_mhz" type="number" step="0.001" value="108" style="${INPUT};width:100px"></label>
             <label style="${LABEL}">Gain dB<input name="gain" type="number" step="0.1" value="30" style="${INPUT};width:80px"></label>
+            <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+              <input type="checkbox" name="scroll_mode"> Keep full history (scrollable)
+            </label>
             <button type="submit" style="${BTN}">Start sweep</button>
           </form>
           <div id="sdr-hub-sweeps"></div>
@@ -290,7 +304,13 @@ class SdrHubPanel extends HTMLElement {
     el.innerHTML = this._state.sweeps
       .map((s) => {
         const scroll = !!this._scrollMode[s.id];
-        const canvasHeight = scroll ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+        // In scroll mode the canvas is sized to exactly how much history there already is
+        // (capped at MAX_SCROLL_ROWS), not pre-allocated - the container only becomes
+        // scrollable (plain CSS overflow:auto) once real content actually exceeds
+        // WATERFALL_HEIGHT, and grows one row at a time as new rows arrive (see
+        // _drawScrollRow). Live mode is unchanged: always a fixed WATERFALL_HEIGHT.
+        const historyLen = (this._sweepRowHistory[s.id] || []).length;
+        const canvasHeight = scroll ? Math.max(1, Math.min(historyLen, MAX_SCROLL_ROWS)) : WATERFALL_HEIGHT;
         return `
       <div style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -422,23 +442,32 @@ class SdrHubPanel extends HTMLElement {
 
   _renderTimeAxis(sweepId) {
     const axisEl = this.querySelector(`[data-sweep-axis="${CSS.escape(sweepId)}"]`);
-    if (!axisEl) return;
+    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
+    if (!axisEl || !canvas) return;
     const rows = this._sweepRowHistory[sweepId];
     const scroll = !!this._scrollMode[sweepId];
-    const canvasHeight = scroll ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+    // canvas.height is always exactly the drawn content height in scroll mode (it grows one
+    // row at a time, no pre-allocation) - read it live rather than assuming a fixed size.
+    const canvasHeight = canvas.height;
     // How many rows are actually drawn right now (live mode: capped at WATERFALL_HEIGHT;
-    // scroll mode: however many have been appended into the pre-allocated canvas so far).
+    // scroll mode: however many have been appended so far, which is exactly canvasHeight).
     const drawnCount = scroll ? this._scrollDrawIndex[sweepId] || 0 : Math.min(rows ? rows.length : 0, WATERFALL_HEIGHT);
     if (!rows || drawnCount === 0) {
       axisEl.innerHTML = "";
       return;
     }
     const now = Date.now();
-    const TICK_COUNT = 5;
+    // Scale tick count to available space instead of a fixed 5 - with only a few rows drawn
+    // so far (a wide/slow sweep early on), 5 fixed ticks would crowd onto 1-2 actual pixels
+    // and overlap unreadably. More slots naturally open up as canvasHeight grows.
+    const MAX_TICKS = 5;
+    const MIN_TICK_SPACING_PX = 40;
+    const tickCount = Math.max(1, Math.min(MAX_TICKS, Math.floor(canvasHeight / MIN_TICK_SPACING_PX) + 1, drawnCount));
     const labels = [];
-    for (let t = 0; t < TICK_COUNT; t++) {
+    for (let t = 0; t < tickCount; t++) {
       // y=0 is the top of the drawn band in both modes (live: newest; scroll: oldest).
-      const y = Math.round((t / (TICK_COUNT - 1)) * (drawnCount - 1));
+      const frac = tickCount > 1 ? t / (tickCount - 1) : 0;
+      const y = Math.round(frac * (drawnCount - 1));
       const rowIndex = scroll ? drawnCount - 1 - y : y; // scroll draws oldest-to-newest top-to-bottom
       const row = rows[rowIndex];
       if (!row || !row._receivedAt) continue;
@@ -481,13 +510,53 @@ class SdrHubPanel extends HTMLElement {
 
   _drawScrollRow(canvas, sweepId, row) {
     const width = row.power_db.length;
-    if (canvas.width !== width) canvas.width = width; // resets the bitmap; only on first row/range change
-    const y = this._scrollDrawIndex[sweepId] || 0;
-    if (y >= canvas.height) return; // pre-allocated MAX_SCROLL_ROWS exhausted; still kept in history for hover
-    this._paintRow(canvas.getContext("2d"), row, width, y);
-    this._scrollDrawIndex[sweepId] = y + 1;
+    // Captured before any resize below - resizing grows scrollHeight first, which would
+    // make "was at bottom" read false right at the moment growth happens (the old scrollTop
+    // is suddenly short of the new, taller scrollHeight by exactly one row) and break the
+    // "only follow if the user hasn't scrolled away" logic exactly when it matters most.
     const container = canvas.closest("[data-sweep-scroll-container]");
-    if (container) container.scrollTop = container.scrollHeight; // reveal the newest row as it arrives
+    const wasAtBottom = container ? container.scrollTop + container.clientHeight >= container.scrollHeight - 4 : false;
+
+    if (canvas.width !== width) {
+      // Range changed - nothing pixel-wise to preserve at the old width.
+      canvas.width = width;
+      canvas.height = 1;
+      canvas.style.height = "1px"; // the .height property is the drawing buffer, not layout size
+      this._scrollDrawIndex[sweepId] = 0;
+    }
+    let y = this._scrollDrawIndex[sweepId] || 0;
+    const ctx = canvas.getContext("2d");
+    if (y >= canvas.height) {
+      if (canvas.height >= MAX_SCROLL_ROWS) {
+        // Cap reached - behave as a bounded sliding window instead of silently freezing
+        // (dropping new data with no visible sign anything is wrong): shift the whole
+        // bitmap up by one row (dropping the oldest) and draw the new row in the now-empty
+        // bottom slot, the same way live mode drops its oldest row off the top.
+        const shifted = ctx.getImageData(0, 1, canvas.width, canvas.height - 1);
+        ctx.putImageData(shifted, 0, 0);
+        y = canvas.height - 1;
+      } else {
+        // Still growing (no pre-allocation): canvas resize clears its bitmap, so blit the
+        // existing content into a temp canvas first, then back, to preserve it.
+        const temp = document.createElement("canvas");
+        temp.width = canvas.width;
+        temp.height = canvas.height;
+        temp.getContext("2d").drawImage(canvas, 0, 0);
+        canvas.height += 1;
+        // The CSS style height is what actually controls the visible/layout size - the
+        // .height property alone only resizes the drawing buffer. Without this, the
+        // container's scrollable content height stays frozen at whatever the very first
+        // render happened to set it to (often 1px), so drawn rows accumulate correctly in
+        // the bitmap but are squeezed into an invisible sliver - looks exactly like data
+        // being silently lost even though every row is still there internally.
+        canvas.style.height = canvas.height + "px";
+        ctx.drawImage(temp, 0, 0);
+        y = canvas.height - 1;
+      }
+    }
+    this._paintRow(ctx, row, width, y);
+    this._scrollDrawIndex[sweepId] = Math.min(y + 1, MAX_SCROLL_ROWS);
+    if (container && wasAtBottom) container.scrollTop = container.scrollHeight;
   }
 
   _paintRow(ctx, row, width, y) {
@@ -509,14 +578,19 @@ class SdrHubPanel extends HTMLElement {
   async _onAddSweep(ev) {
     ev.preventDefault();
     const form = new FormData(ev.target);
+    const wantsScroll = form.get("scroll_mode") === "on"; // unchecked checkboxes are absent from FormData
     try {
-      await this._callWS({
+      const sweep = await this._callWS({
         type: "sdr_hub/add_sweep",
         dongle_serial: form.get("dongle_serial"),
         start_hz: Number(form.get("start_mhz")) * 1e6,
         stop_hz: Number(form.get("stop_mhz")) * 1e6,
         gain: Number(form.get("gain")),
       });
+      // Pre-select scroll mode before _loadState()/_renderSweeps() ever creates this sweep's
+      // canvas, so it's built at the right size from its very first row instead of the user
+      // having to find and check the box after the fact.
+      if (wantsScroll && sweep && sweep.id) this._scrollMode[sweep.id] = true;
       this._showError("");
     } catch (err) {
       this._showError(`Could not start sweep: ${err.message || err}`);
