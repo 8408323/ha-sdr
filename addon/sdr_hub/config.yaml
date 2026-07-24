@@ -1,0 +1,21 @@
+name: SDR Hub
+version: "0.1.0"
+slug: sdr_hub
+description: RTL-SDR hardware access, wideband spectrum sweeps, and configurable receivers (fixed-frequency decoders), exposed over a local API for the sdr_hub HACS integration and other HACS add-ons/integrations to use
+url: https://github.com/8408323/ha-sdr
+arch:
+  - aarch64
+  - amd64
+usb: true
+udev: true
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: HTTP/WebSocket API used by the sdr_hub HACS integration (and other consumers)
+options:
+  log_level: info
+  api_token: ""
+schema:
+  log_level: list(debug|info|warning|error)
+  api_token: str
+map: []

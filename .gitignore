@@ -5,6 +5,9 @@
 secrets.yaml
 *.token
 
+# Private deployment/hardware notes — not for the public repo
+NOTES.local.md
+
 # Raw SDR captures (large, IQ sample dumps)
 *.iq
 *.cu8
