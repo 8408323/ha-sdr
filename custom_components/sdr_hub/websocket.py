@@ -97,7 +97,10 @@ async def ws_subscribe(hass: HomeAssistant, connection, msg) -> None:
         vol.Required("dongle_serial"): str,
         vol.Required("frequencies_hz"): [vol.Coerce(float)],
         vol.Optional("protocols", default=[]): [int],
-        vol.Optional("hop_interval_s", default=10): int,
+        # decode.py passes this straight through to rtl_433's -H <seconds> hop interval - a
+        # zero or negative value would be accepted here and only surface as rtl_433 misbehaving
+        # after the dongle's already claimed, instead of a clear validation error up front.
+        vol.Optional("hop_interval_s", default=10): vol.All(int, vol.Range(min=0, min_included=False)),
     }
 )
 @websocket_api.async_response
@@ -112,7 +115,13 @@ async def ws_add_receiver(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "add_receiver_failed", err.detail)
         return
-    await coordinator.async_request_refresh()
+    # async_refresh() (not the debounced async_request_refresh()) - if a second panel
+    # action lands during another recent mutation's debounce cooldown, async_request_refresh()
+    # here would just queue a delayed refresh and return; this handler's own immediate
+    # get_state-driven async_refresh() calls elsewhere would then cancel that queued refresh
+    # and (via suppress_next_broadcast()) swallow its state_changed broadcast too, so other
+    # open panels would never learn about this change until the next 30s poll.
+    await coordinator.async_refresh()
     connection.send_result(msg["id"], receiver)
 
 
@@ -129,7 +138,7 @@ async def ws_remove_receiver(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "remove_receiver_failed", err.detail)
         return
-    await coordinator.async_request_refresh()
+    await coordinator.async_refresh()  # not the debounced async_request_refresh() - see ws_add_receiver above
     connection.send_result(msg["id"])
 
 
@@ -156,7 +165,7 @@ async def ws_add_sweep(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "add_sweep_failed", err.detail)
         return
-    await coordinator.async_request_refresh()
+    await coordinator.async_refresh()  # not the debounced async_request_refresh() - see ws_add_receiver above
     connection.send_result(msg["id"], sweep)
 
 
@@ -173,7 +182,7 @@ async def ws_remove_sweep(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "remove_sweep_failed", err.detail)
         return
-    await coordinator.async_request_refresh()
+    await coordinator.async_refresh()  # not the debounced async_request_refresh() - see ws_add_receiver above
     connection.send_result(msg["id"])
 
 

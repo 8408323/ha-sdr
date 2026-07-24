@@ -209,10 +209,15 @@ class SdrHubPanel extends HTMLElement {
       // too, an older call that fails *after* a newer call already succeeded would still show
       // this error, even though the latest state is already rendered correctly.
       if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
-      this._showError(`Could not load SDR Hub state: ${err.message || err}`);
+      this._showError(`Could not load SDR Hub state: ${err.message || err}`, { isLoadError: true });
       return;
     }
     if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
+    // Recovered from a prior load failure - clear its banner now that fresh state actually
+    // arrived. Only do this if the banner currently showing IS that load error (the flag
+    // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
+    // action error isn't wiped out just because this background refresh happened to succeed.
+    if (this._loadStateErrorShowing) this._showError("");
     this._state = state;
     this._renderDongles();
     this._renderSweeps(forceRebuildSweeps);
@@ -244,9 +249,15 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
-  _showError(message) {
+  _showError(message, { isLoadError = false } = {}) {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
+    // Tracks whether the *currently displayed* error is specifically a get_state load
+    // failure, so a later successful reload can clear just that one - without this, an
+    // unrelated action error (e.g. "could not start sweep") showing would get silently wiped
+    // out the next time a background state refresh happens to succeed, even though the user
+    // still needs to see it. Whichever call to _showError ran most recently determines this.
+    this._loadStateErrorShowing = isLoadError && !!message;
     el.textContent = message;
     el.style.display = message ? "block" : "none";
   }

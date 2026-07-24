@@ -25,7 +25,10 @@ _ADD_RECEIVER_SCHEMA = vol.Schema(
         vol.Required("dongle_serial"): str,
         vol.Required("frequencies_hz"): [vol.Coerce(float)],
         vol.Optional("protocols", default=[]): [int],
-        vol.Optional("hop_interval_s", default=10): int,
+        # Same rationale as websocket.py's identical field: decode.py passes this straight
+        # through to rtl_433's -H <seconds> hop interval, so a non-positive value should fail
+        # validation here rather than surface as rtl_433 misbehaving after the fact.
+        vol.Optional("hop_interval_s", default=10): vol.All(int, vol.Range(min=0, min_included=False)),
     }
 )
 _REMOVE_RECEIVER_SCHEMA = vol.Schema({vol.Required("receiver_id"): str})
