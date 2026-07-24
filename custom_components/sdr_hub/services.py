@@ -1,0 +1,82 @@
+"""Services proxying to the sdr_hub add-on — the public API surface other integrations/automations use."""
+
+from __future__ import annotations
+
+import logging
+
+import voluptuous as vol
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
+
+from .api import SdrHubApiError
+from .const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
+
+SERVICE_ADD_RECEIVER = "add_receiver"
+SERVICE_REMOVE_RECEIVER = "remove_receiver"
+SERVICE_ADD_SWEEP = "add_sweep"
+SERVICE_REMOVE_SWEEP = "remove_sweep"
+
+_ADD_RECEIVER_SCHEMA = vol.Schema(
+    {
+        vol.Required("dongle_serial"): str,
+        vol.Required("frequencies_hz"): [vol.Coerce(float)],
+        vol.Optional("protocols", default=[]): [int],
+        vol.Optional("hop_interval_s", default=10): int,
+    }
+)
+_REMOVE_RECEIVER_SCHEMA = vol.Schema({vol.Required("receiver_id"): str})
+_ADD_SWEEP_SCHEMA = vol.Schema(
+    {
+        vol.Required("dongle_serial"): str,
+        vol.Required("start_hz"): vol.Coerce(float),
+        vol.Required("stop_hz"): vol.Coerce(float),
+        vol.Optional("sample_rate", default=2.4e6): vol.Coerce(float),
+        vol.Optional("gain", default=30.0): vol.Coerce(float),
+    }
+)
+_REMOVE_SWEEP_SCHEMA = vol.Schema({vol.Required("sweep_id"): str})
+
+
+def async_register(hass: HomeAssistant) -> None:
+    """Registers the sdr_hub services (idempotent — hass-global, not per config entry)."""
+    if hass.services.has_service(DOMAIN, SERVICE_ADD_RECEIVER):
+        return
+
+    def _current_api():
+        entries = hass.config_entries.async_entries(DOMAIN)
+        if not entries:
+            raise HomeAssistantError("SDR Hub is not configured")
+        return entries[0].runtime_data.api
+
+    async def _async_handle_add_receiver(call: ServiceCall) -> None:
+        try:
+            await _current_api().async_add_receiver(dict(call.data))
+        except SdrHubApiError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def _async_handle_remove_receiver(call: ServiceCall) -> None:
+        try:
+            await _current_api().async_remove_receiver(call.data["receiver_id"])
+        except SdrHubApiError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def _async_handle_add_sweep(call: ServiceCall) -> None:
+        try:
+            await _current_api().async_add_sweep(dict(call.data))
+        except SdrHubApiError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def _async_handle_remove_sweep(call: ServiceCall) -> None:
+        try:
+            await _current_api().async_remove_sweep(call.data["sweep_id"])
+        except SdrHubApiError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    hass.services.async_register(DOMAIN, SERVICE_ADD_RECEIVER, _async_handle_add_receiver, schema=_ADD_RECEIVER_SCHEMA)
+    hass.services.async_register(
+        DOMAIN, SERVICE_REMOVE_RECEIVER, _async_handle_remove_receiver, schema=_REMOVE_RECEIVER_SCHEMA
+    )
+    hass.services.async_register(DOMAIN, SERVICE_ADD_SWEEP, _async_handle_add_sweep, schema=_ADD_SWEEP_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_REMOVE_SWEEP, _async_handle_remove_sweep, schema=_REMOVE_SWEEP_SCHEMA)
