@@ -6,7 +6,7 @@ import uuid
 from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
-from devices import discover_dongles
+from devices import Dongle, discover_dongles
 from models import (
     EntityKind,
     EntityStatus,
@@ -38,7 +38,27 @@ class DuplicateDongleSerialError(Exception):
     """
 
     def __init__(self, serial: str) -> None:
-        super().__init__(f"more than one attached dongle reports serial {serial!r} — can't disambiguate")
+        super().__init__(
+            f"more than one attached dongle reports serial {serial!r} — can't disambiguate. "
+            "Cheap RTL2832U clones often ship with an identical or blank factory serial; "
+            "reprogram each dongle with a unique one via `rtl_eeprom -s <new_serial>` "
+            "(one dongle attached at a time) and reattach."
+        )
+
+
+class UnsupportedReceiverDriverError(Exception):
+    """rtl_433 talks to RTL-SDR hardware directly (via librtlsdr), not through SoapySDR - a
+    receiver can't be started on a dongle whose SoapySDR driver isn't "rtlsdr" (e.g. a HackRF
+    or Airspy discovered for wideband sweeps), even though sweeps work with any SoapySDR-
+    supported device. Surfacing this clearly here avoids a confusing failure deep inside the
+    rtl_433 subprocess once it can't find the device at all.
+    """
+
+    def __init__(self, serial: str, driver: str) -> None:
+        super().__init__(
+            f"dongle {serial} uses SoapySDR driver {driver!r}, not 'rtlsdr' - rtl_433 receivers "
+            "only work with actual RTL-SDR hardware; use a wideband sweep for this device instead"
+        )
 
 
 class DeviceManager:
@@ -68,20 +88,27 @@ class DeviceManager:
 
     def list_dongles(self) -> list[dict]:
         return [
-            {"serial": d.serial, "label": d.label, "in_use_by": self._dongle_owner.get(d.serial)}
+            {
+                "serial": d.serial,
+                "label": d.label,
+                "driver": d.driver,
+                "in_use_by": self._dongle_owner.get(d.serial),
+            }
             for d in discover_dongles()
         ]
 
-    def _claim(self, serial: str, owner_id: str) -> None:
-        serials = [d.serial for d in discover_dongles()]
-        if serial not in serials:
+    def _claim(self, serial: str, owner_id: str) -> Dongle:
+        dongles = discover_dongles()
+        matches = [d for d in dongles if d.serial == serial]
+        if not matches:
             raise DongleNotFoundError(serial)
-        if serials.count(serial) > 1:
+        if len(matches) > 1:
             raise DuplicateDongleSerialError(serial)
         current_owner = self._dongle_owner.get(serial)
         if current_owner is not None:
             raise DongleBusyError(serial, current_owner)
         self._dongle_owner[serial] = owner_id
+        return matches[0]
 
     def _release(self, serial: str, owner_id: str) -> None:
         """Only clears the claim if `owner_id` still holds it.
@@ -99,7 +126,10 @@ class DeviceManager:
 
     async def add_receiver(self, cfg: ReceiverCreate) -> Receiver:
         receiver_id = str(uuid.uuid4())
-        self._claim(cfg.dongle_serial, receiver_id)
+        dongle = self._claim(cfg.dongle_serial, receiver_id)
+        if dongle.driver != "rtlsdr":
+            self._release(cfg.dongle_serial, receiver_id)
+            raise UnsupportedReceiverDriverError(cfg.dongle_serial, dongle.driver)
         decoder = Rtl433Decoder(
             config=ReceiverConfig(
                 dongle_serial=cfg.dongle_serial,
@@ -146,7 +176,7 @@ class DeviceManager:
 
     async def add_sweep(self, cfg: SweepCreate) -> Sweep:
         sweep_id = str(uuid.uuid4())
-        self._claim(cfg.dongle_serial, sweep_id)
+        dongle = self._claim(cfg.dongle_serial, sweep_id)
         sweeper = SoapySweeper(
             on_row=lambda row: self._loop.call_soon_threadsafe(self._on_row, sweep_id, row),
             on_error=lambda err: self._loop.call_soon_threadsafe(self._on_sweep_error, sweep_id, err),
@@ -160,6 +190,7 @@ class DeviceManager:
                     stop_hz=cfg.stop_hz,
                     sample_rate=cfg.sample_rate,
                     gain=cfg.gain,
+                    driver=dongle.driver,
                 )
             )
         except Exception:

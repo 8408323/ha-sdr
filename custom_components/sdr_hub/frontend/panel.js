@@ -318,9 +318,14 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
   }
 
-  _renderDongleOptions(select) {
+  _renderDongleOptions(select, { rtlsdrOnly = false } = {}) {
     const current = select.value;
-    select.innerHTML = this._state.devices
+    // rtl_433 receivers only work with actual RTL-SDR hardware (see
+    // UnsupportedReceiverDriverError) - filtering the receiver form's dropdown to just those
+    // avoids the user picking e.g. a HackRF there and hitting a confusing rejection after
+    // submitting, when a wideband sweep would have worked fine on that same device.
+    const devices = rtlsdrOnly ? this._state.devices.filter((d) => d.driver === "rtlsdr") : this._state.devices;
+    select.innerHTML = devices
       .map((d) => `<option value="${esc(d.serial)}">${esc(d.label || d.serial)}</option>`)
       .join("");
     if (current) select.value = current;
@@ -336,7 +341,7 @@ class SdrHubPanel extends HTMLElement {
         <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;">
           <tr style="text-align:left;color:var(--secondary-text-color,#727272);font-size:.85rem;">
-            <th>Serial</th><th>Label</th><th>In use by</th>
+            <th>Serial</th><th>Label</th><th>Driver</th><th>In use by</th>
           </tr>
           ${this._state.devices
             .map(
@@ -344,6 +349,7 @@ class SdrHubPanel extends HTMLElement {
             <tr>
               <td>${esc(d.serial)}</td>
               <td>${esc(d.label || "")}</td>
+              <td>${esc(d.driver || "")}${d.driver && d.driver !== "rtlsdr" ? ` <span style="color:var(--secondary-text-color,#727272);" title="Only RTL-SDR (driver 'rtlsdr') devices support rtl_433 receivers - this one can still run wideband sweeps.">(sweeps only)</span>` : ""}</td>
               <td>${d.in_use_by ? esc(d.in_use_by) : "<em>free</em>"}</td>
             </tr>`,
             )
@@ -353,7 +359,7 @@ class SdrHubPanel extends HTMLElement {
     }
     for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver"]) {
       const select = this.querySelector(`#${form} select[name="dongle_serial"]`);
-      if (select) this._renderDongleOptions(select);
+      if (select) this._renderDongleOptions(select, { rtlsdrOnly: form === "sdr-hub-add-receiver" });
     }
   }
 

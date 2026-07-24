@@ -28,6 +28,7 @@ class EntityKind(str, Enum):
 class DongleInfo(BaseModel):
     serial: str
     label: str
+    driver: str  # SoapySDR driver module (e.g. "rtlsdr", "hackrf") - only "rtlsdr" supports receivers
     in_use_by: str | None = None
 
 

@@ -38,6 +38,12 @@ class SweepConfig:
     stop_hz: float
     sample_rate: float = DEFAULT_SAMPLE_RATE_HZ
     gain: float = DEFAULT_GAIN_DB
+    # Which SoapySDR driver module owns this serial (e.g. "rtlsdr", "hackrf") - opening a device
+    # by serial alone isn't enough once discover_dongles() enumerates across every installed
+    # driver, not just rtlsdr; SoapySDR needs to know which module to ask. Defaults to "rtlsdr"
+    # only so any external caller still constructing a SweepConfig without this field (there are
+    # none in this codebase, but it's a public-ish dataclass) doesn't immediately break.
+    driver: str = "rtlsdr"
 
 
 @dataclass
@@ -153,7 +159,7 @@ class SoapySweeper:
 
     def _run(self, config: SweepConfig) -> None:
         try:
-            sdr = SoapySDR.Device({"driver": "rtlsdr", "serial": config.dongle_serial})
+            sdr = SoapySDR.Device({"driver": config.driver, "serial": config.dongle_serial})
             sdr.setSampleRate(SOAPY_SDR_RX, 0, config.sample_rate)
             sdr.setGain(SOAPY_SDR_RX, 0, config.gain)
             rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
