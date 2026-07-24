@@ -190,7 +190,7 @@ class DeviceManager:
                     stop_hz=cfg.stop_hz,
                     sample_rate=cfg.sample_rate,
                     gain=cfg.gain,
-                    driver=dongle.driver,
+                    soapy_args=dongle.args,
                 )
             )
         except Exception:

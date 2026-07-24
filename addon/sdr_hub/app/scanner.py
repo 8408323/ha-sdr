@@ -4,7 +4,7 @@ import logging
 import math
 import threading
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -38,12 +38,15 @@ class SweepConfig:
     stop_hz: float
     sample_rate: float = DEFAULT_SAMPLE_RATE_HZ
     gain: float = DEFAULT_GAIN_DB
-    # Which SoapySDR driver module owns this serial (e.g. "rtlsdr", "hackrf") - opening a device
-    # by serial alone isn't enough once discover_dongles() enumerates across every installed
-    # driver, not just rtlsdr; SoapySDR needs to know which module to ask. Defaults to "rtlsdr"
-    # only so any external caller still constructing a SweepConfig without this field (there are
-    # none in this codebase, but it's a public-ish dataclass) doesn't immediately break.
-    driver: str = "rtlsdr"
+    # The exact SoapySDR construction kwargs from discover_dongles() (driver, serial, and
+    # anything else that driver needed to identify this device) - opening a device from just
+    # {"driver": ..., "serial": ...} isn't enough for every SoapySDR driver (some need e.g. a
+    # device_id or remote key alongside serial to reopen the *same* device, not just a device
+    # with a matching serial), so the full original args are carried through and reused as-is
+    # rather than reconstructed. Defaults to a plain rtlsdr dict only so any external caller
+    # still constructing a SweepConfig without this field (there are none in this codebase,
+    # but it's a public-ish dataclass) doesn't immediately break.
+    soapy_args: dict[str, str] = field(default_factory=lambda: {"driver": "rtlsdr"})
 
 
 @dataclass
@@ -159,7 +162,7 @@ class SoapySweeper:
 
     def _run(self, config: SweepConfig) -> None:
         try:
-            sdr = SoapySDR.Device({"driver": config.driver, "serial": config.dongle_serial})
+            sdr = SoapySDR.Device(config.soapy_args)
             sdr.setSampleRate(SOAPY_SDR_RX, 0, config.sample_rate)
             sdr.setGain(SOAPY_SDR_RX, 0, config.gain)
             rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)

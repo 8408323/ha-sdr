@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       rtl-433 \
       soapysdr-tools \
       soapysdr-module-rtlsdr \
+      soapysdr-module-hackrf \
+      soapysdr-module-airspy \
       python3-soapysdr \
       python3-numpy \
       python3-pip \

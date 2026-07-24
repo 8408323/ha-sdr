@@ -62,12 +62,19 @@ case as long as a second dongle is attached; see
 use it in practice (multi-dongle passthrough, multi-brand support below).
 
 **Multiple brands:** device discovery isn't limited to RTL-SDR — any
-SoapySDR-supported device (HackRF, Airspy, SDRplay, ...) attached to the host
-is enumerated and can run a wideband sweep. `rtl_433` receivers are the one
-exception: `rtl_433` talks to RTL-SDR hardware directly, not through
-SoapySDR, so receivers only work on a device whose driver is `rtlsdr` — the
-panel's receiver dongle picker only lists those; other devices show
-"(sweeps only)" in the dongles table.
+SoapySDR-supported device attached to the host is enumerated and can run a
+wideband sweep. The add-on image ships driver modules for RTL-SDR, HackRF,
+and Airspy out of the box (`addon/sdr_hub/Dockerfile`); other SoapySDR
+backends (BladeRF, USRP/UHD, ...) work too if you rebuild the image with
+their module added (`soapysdr-module-all` pulls in everything Debian
+packages). **SDRplay is not included** and can't be added the same way — its
+driver depends on a proprietary binary (`libsdrplay`) that isn't in Debian's
+archive at all, so it would need to be installed separately in the image.
+`rtl_433` receivers are the one exception regardless of what's installed:
+`rtl_433` talks to RTL-SDR hardware directly, not through SoapySDR, so
+receivers only work on a device whose driver is `rtlsdr` — the panel's
+receiver dongle picker only lists those; other devices show "(sweeps only)"
+in the dongles table.
 
 **Duplicate serials:** cheap RTL2832U clones commonly ship with an identical
 or blank factory serial. SoapySDR can't tell two such dongles apart by
