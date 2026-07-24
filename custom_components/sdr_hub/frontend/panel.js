@@ -85,7 +85,15 @@ const WATERFALL_HEIGHT = 400;
 // while still bounding worst case.
 const SCROLL_HISTORY_BUDGET_BYTES = 200 * 1024 * 1024;
 const MIN_SCROLL_ROWS = 100; // floor even for a pathologically wide row, so it's never useless
-const scrollRowCapForWidth = (width) => Math.max(MIN_SCROLL_ROWS, Math.floor(SCROLL_HISTORY_BUDGET_BYTES / (width * 8)));
+// Browsers cap a single <canvas> dimension well below what the memory budget alone would allow
+// for a narrow sweep (e.g. a ~500-bin sweep's budget-derived cap is ~50k rows) - exceeding it
+// doesn't throw, it silently makes the canvas unusable (clears/fails to draw), which would look
+// exactly like the "history gets lost" bug this budget was introduced to fix. 16384px is
+// comfortably under the documented/tested limit in every major engine (Chromium, Firefox,
+// Safari all support at least this on both axes), so cap by it in addition to the memory budget.
+const MAX_CANVAS_HEIGHT_PX = 16384;
+const scrollRowCapForWidth = (width) =>
+  Math.min(MAX_CANVAS_HEIGHT_PX, Math.max(MIN_SCROLL_ROWS, Math.floor(SCROLL_HISTORY_BUDGET_BYTES / (width * 8))));
 const MAX_DECODED_LOG = 50;
 
 class SdrHubPanel extends HTMLElement {
@@ -176,7 +184,7 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
-  async _loadState() {
+  async _loadState(forceRebuildSweeps = false) {
     // Two _loadState() calls can overlap (e.g. the initial load racing with the reload
     // triggered right after submitting one of the forms) and their WS responses can resolve
     // out of order. Only the response for the most recently *started* call is allowed to
@@ -198,7 +206,7 @@ class SdrHubPanel extends HTMLElement {
     if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
     this._state = state;
     this._renderDongles();
-    this._renderSweeps();
+    this._renderSweeps(forceRebuildSweeps);
     this._renderReceivers();
   }
 
@@ -755,7 +763,14 @@ class SdrHubPanel extends HTMLElement {
     } catch (err) {
       this._showError(`Could not start sweep: ${err.message || err}`);
     }
-    await this._loadState();
+    // The add-on's own state_changed broadcast for this new sweep can arrive and trigger a
+    // _loadState() (via _handleEvent) before this call's own add_sweep response resolves above -
+    // that earlier, racing _loadState() already builds and caches this sweep's canvas in live
+    // mode (since _scrollMode[sweep.id] wasn't set yet at that point). The no-op-refresh skip in
+    // _renderSweeps() then sees an unchanged id/status set on THIS call's own _loadState() and
+    // skips rebuilding, silently discarding the scroll-mode selection just made above. Force a
+    // rebuild whenever scroll mode was requested so it actually takes effect.
+    await this._loadState(wantsScroll);
   }
 
   async _onRemoveSweep(sweepId) {

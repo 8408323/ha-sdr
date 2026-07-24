@@ -76,9 +76,12 @@ class SweepCreate(BaseModel):
         # sweep looks hung, well after this request was already accepted.
         n_bins_total = int((self.stop_hz - self.start_hz) / bin_hz)
         if n_bins_total > MAX_NATIVE_BINS:
+            # bin_hz = sample_rate / FFT_SIZE, so a *lower* sample rate makes bin_hz smaller and
+            # n_bins_total = range/bin_hz larger - the opposite of what's needed here. The
+            # actionable fixes are a narrower range or a *higher* sample rate.
             raise ValueError(
                 f"range too wide at this sample rate: {n_bins_total} native bins exceeds the "
-                f"{MAX_NATIVE_BINS} limit - use a narrower range or a lower sample rate"
+                f"{MAX_NATIVE_BINS} limit - use a narrower range or a higher sample rate"
             )
         return self
 
