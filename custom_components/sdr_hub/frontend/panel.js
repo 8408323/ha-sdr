@@ -471,30 +471,26 @@ class SdrHubPanel extends HTMLElement {
     canvas.addEventListener("mouseleave", () => {
       readout.textContent = "";
     });
-    // Touch has no hover concept - a single finger drag across the canvas doubles as both
-    // "read a point" and (without this) an attempt to scroll the page, so suppress the
-    // default touch scroll/zoom behavior while dragging on the canvas itself and drive the
-    // same readout from the touch position instead.
-    canvas.addEventListener(
-      "touchstart",
-      (ev) => {
-        if (ev.touches.length !== 1) return;
-        ev.preventDefault();
-        showAt(ev.touches[0].clientX, ev.touches[0].clientY);
-      },
-      { passive: false },
-    );
-    canvas.addEventListener(
-      "touchmove",
-      (ev) => {
-        if (ev.touches.length !== 1) return;
-        ev.preventDefault();
-        showAt(ev.touches[0].clientX, ev.touches[0].clientY);
-      },
-      { passive: false },
-    );
-    canvas.addEventListener("touchend", () => {
-      readout.textContent = "";
+    // Touch has no hover concept, but the canvas lives inside an overflow-y:auto history
+    // container (scroll mode, and live mode once its viewport's been resized shorter than
+    // the canvas) - a continuous touchstart+touchmove drag readout would need
+    // preventDefault() to avoid also scrolling the page, which would permanently block the
+    // user's normal one-finger swipe-to-scroll on that container. Use a single-tap reveal
+    // instead.
+    canvas.addEventListener("touchstart", (ev) => {
+      if (ev.touches.length !== 1) return;
+      // No preventDefault here - a normal one-finger swipe must still scroll the history
+      // container (in scroll mode, or in live mode once the viewport's been resized shorter
+      // than the canvas). A tap has no meaningful "hold and drag" gesture on canvas to lose by
+      // not calling preventDefault, so just read the tapped point and self-clear after a delay,
+      // since touch has no hover-out event to clear it the way mouseleave does.
+      showAt(ev.touches[0].clientX, ev.touches[0].clientY);
+      // Keyed on the canvas itself (not `this`, the shared custom-element instance across
+      // every sweep) so two sweeps' touch readouts don't clear each other's pending timer.
+      clearTimeout(canvas._touchClearTimer);
+      canvas._touchClearTimer = setTimeout(() => {
+        readout.textContent = "";
+      }, 2000);
     });
   }
 
@@ -635,8 +631,13 @@ class SdrHubPanel extends HTMLElement {
         // (dropping new data with no visible sign anything is wrong): shift the whole
         // bitmap up by one row (dropping the oldest) and draw the new row in the now-empty
         // bottom slot, the same way live mode drops its oldest row off the top.
-        const shifted = ctx.getImageData(0, 1, canvas.width, canvas.height - 1);
-        ctx.putImageData(shifted, 0, 0);
+        // A canvas may draw itself as its own source (self-blit): per spec, drawImage takes
+        // an implicit snapshot of the source at call time, so there's no feedback corruption,
+        // and the browser's compositor performs the shift without a CPU pixel readback. The
+        // earlier getImageData/putImageData round-trip forced a full framebuffer readback on
+        // every single row once the cap was reached - not the shift itself, but that readback,
+        // was the freeze risk (~100MB copied per row for a narrow/fast sweep at the 200MB cap).
+        ctx.drawImage(canvas, 0, -1);
         y = canvas.height - 1;
       } else {
         // Still growing (no pre-allocation): canvas resize clears its bitmap, so blit the

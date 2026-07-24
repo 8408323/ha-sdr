@@ -46,6 +46,13 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
     # since a status event can arrive within another recent refresh's debounce cooldown
     # (e.g. right after a mutating command), where the debounced call would be coalesced
     # away and this would still serve pre-event stale data.
+    # Suppress the update-listener's broadcast for this specific refresh: the caller already
+    # gets the fresh data directly as this RPC's result below, so it doesn't also need a
+    # redundant state_changed push - without suppressing it, that push would reach this same
+    # caller, re-trigger its _loadState() -> another get_state -> another forced refresh, an
+    # unbounded feedback loop (confirmed live). Genuine external changes (the coordinator's
+    # own poll, or another client's async_request_refresh()) are unaffected and still broadcast.
+    coordinator.suppress_next_broadcast()
     await coordinator.async_refresh()
     connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
 

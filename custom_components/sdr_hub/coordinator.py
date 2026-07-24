@@ -26,6 +26,7 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
+        self._suppress_next_broadcast = False
         # A refresh triggered by anything other than this panel's own action (a service call,
         # another open panel's WS command, or the periodic poll) otherwise has no way to reach
         # other subscribed panels - only the raw add-on WS events do. Piggyback on the
@@ -34,7 +35,21 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.async_add_listener(self._on_data_updated)
 
     @callback
+    def suppress_next_broadcast(self) -> None:
+        """Marks the next _on_data_updated firing as caller-initiated, so it isn't re-broadcast.
+
+        ws_get_state forces a refresh so it can return fresh data to the one caller that asked -
+        without this, that refresh's own update-listener firing would re-broadcast state_changed
+        to every subscriber (including the caller), which would re-trigger _loadState() -> another
+        get_state -> another forced refresh, an unbounded feedback loop (confirmed live).
+        """
+        self._suppress_next_broadcast = True
+
+    @callback
     def _on_data_updated(self) -> None:
+        if self._suppress_next_broadcast:
+            self._suppress_next_broadcast = False
+            return
         self._dispatch({"type": "state_changed"})
 
     async def _async_update_data(self) -> dict[str, Any]:

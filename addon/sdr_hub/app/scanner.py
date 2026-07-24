@@ -49,13 +49,19 @@ class SweepRow:
 def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], float]:
     """Converts a native-resolution row to JSON-safe output, downsampling if needed.
 
-    A row wider than MAX_ROW_POINTS is averaged down block-by-block (nanmean, so a
-    filled bin isn't dragged toward a neighboring gap) rather than delivered at native
-    resolution — native resolution scales with requested range width and a full-range
-    sweep is ~1.48M bins, which serializes into double-digit megabytes and silently
-    exceeds the WebSocket frame limit. Values are also rounded to 1 decimal place:
-    Python's float repr of a numpy float32 carries far more precision than a dB
-    reading needs, and unrounded is ~3x the JSON bytes for no real information gain.
+    A row wider than MAX_ROW_POINTS is reduced down block-by-block by taking the peak
+    (nanmax, so a filled bin isn't dragged toward a neighboring gap) rather than delivered
+    at native resolution — native resolution scales with requested range width and a
+    full-range sweep is ~1.48M bins, which serializes into double-digit megabytes and
+    silently exceeds the WebSocket frame limit. nanmax (not nanmean) is used because `row`
+    at this point already holds dB values (20*log10(...)) — averaging dB directly is not
+    the same as averaging the underlying power, and washes out narrow strong signals, which
+    are exactly the peaks a waterfall exists to show. dB is a monotonic transform of power,
+    so the max of dB values across a block is mathematically exactly the max of the
+    underlying linear power — no linear round-trip is needed to preserve peaks correctly.
+    Values are also rounded to 1 decimal place: Python's float repr of a numpy float32
+    carries far more precision than a dB reading needs, and unrounded is ~3x the JSON
+    bytes for no real information gain.
     """
     n = len(row)
     if n > MAX_ROW_POINTS:
@@ -63,8 +69,8 @@ def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], 
         pad = (-n) % factor
         if pad:
             row = np.concatenate([row, np.full(pad, np.nan, dtype=row.dtype)])
-        with np.errstate(all="ignore"):  # nanmean warns on an all-NaN block; that's expected, not an error
-            row = np.nanmean(row.reshape(-1, factor), axis=1)
+        with np.errstate(all="ignore"):  # nanmax warns on an all-NaN block; that's expected, not an error
+            row = np.nanmax(row.reshape(-1, factor), axis=1)
         bin_hz = bin_hz * factor
     power_db = [None if np.isnan(v) else round(float(v), 1) for v in row]
     return power_db, bin_hz
