@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Connect to the sdr_hub add-on's API.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "api_token": "API token"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid API token.",
+      "cannot_connect": "Could not reach the sdr_hub add-on at that host/port."
+    }
+  }
+}

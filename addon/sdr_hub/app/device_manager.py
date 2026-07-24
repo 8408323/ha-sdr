@@ -30,6 +30,17 @@ class DongleNotFoundError(Exception):
         super().__init__(f"no dongle with serial {serial} attached")
 
 
+class DuplicateDongleSerialError(Exception):
+    """Two or more attached dongles report the same serial (common with cheap RTL2832U
+    clones that ship an identical/blank factory serial) — SoapySDR's own open-by-serial
+    can't tell them apart either, so neither can this pool; refuse rather than silently
+    picking one and misattributing ownership.
+    """
+
+    def __init__(self, serial: str) -> None:
+        super().__init__(f"more than one attached dongle reports serial {serial!r} — can't disambiguate")
+
+
 class DeviceManager:
     """Pool over N attached dongles: each dongle services at most one receiver or sweep at a time.
 
@@ -62,16 +73,24 @@ class DeviceManager:
         ]
 
     def _claim(self, serial: str, owner_id: str) -> None:
-        known_serials = {d.serial for d in discover_dongles()}
-        if serial not in known_serials:
+        serials = [d.serial for d in discover_dongles()]
+        if serial not in serials:
             raise DongleNotFoundError(serial)
+        if serials.count(serial) > 1:
+            raise DuplicateDongleSerialError(serial)
         current_owner = self._dongle_owner.get(serial)
         if current_owner is not None:
             raise DongleBusyError(serial, current_owner)
         self._dongle_owner[serial] = owner_id
 
-    def _release(self, serial: str) -> None:
-        self._dongle_owner.pop(serial, None)
+    def _release(self, serial: str, owner_id: str) -> None:
+        """Only clears the claim if `owner_id` still holds it.
+
+        Without this check, releasing an already-stale (e.g. errored-and-since-replaced)
+        entity could pop a *different*, currently-valid owner's claim on the same serial.
+        """
+        if self._dongle_owner.get(serial) == owner_id:
+            self._dongle_owner.pop(serial, None)
 
     # -- Receivers (rtl_433) ----------------------------------------------
 
@@ -94,7 +113,7 @@ class DeviceManager:
         try:
             await decoder.start()
         except Exception:
-            self._release(cfg.dongle_serial)
+            self._release(cfg.dongle_serial, receiver_id)
             raise
         self._decoders[receiver_id] = decoder
         receiver = Receiver(id=receiver_id, **cfg.model_dump())
@@ -108,7 +127,7 @@ class DeviceManager:
         decoder = self._decoders.pop(receiver_id, None)
         if decoder is not None:
             await decoder.stop()
-        self._release(receiver.dongle_serial)
+        self._release(receiver.dongle_serial, receiver_id)
 
     def _on_receiver_exit(self, receiver_id: str, returncode: int | None) -> None:
         receiver = self._receivers.get(receiver_id)
@@ -117,7 +136,7 @@ class DeviceManager:
         _LOGGER.error("receiver %s (rtl_433) exited unexpectedly with code %s", receiver_id, returncode)
         receiver.status = EntityStatus.ERROR
         self._decoders.pop(receiver_id, None)
-        self._release(receiver.dongle_serial)
+        self._release(receiver.dongle_serial, receiver_id)
         self._on_status(EntityKind.RECEIVER, receiver_id, EntityStatus.ERROR, f"rtl_433 exited with code {returncode}")
 
     # -- Sweeps (SoapySDR wideband) -----------------------------------------
@@ -131,6 +150,7 @@ class DeviceManager:
         sweeper = SoapySweeper(
             on_row=lambda row: self._loop.call_soon_threadsafe(self._on_row, sweep_id, row),
             on_error=lambda err: self._loop.call_soon_threadsafe(self._on_sweep_error, sweep_id, err),
+            on_late_stop=lambda: self._loop.call_soon_threadsafe(self._on_sweep_late_stop, sweep_id),
         )
         try:
             sweeper.start(
@@ -143,7 +163,7 @@ class DeviceManager:
                 )
             )
         except Exception:
-            self._release(cfg.dongle_serial)
+            self._release(cfg.dongle_serial, sweep_id)
             raise
         self._sweepers[sweep_id] = sweeper
         sweep = Sweep(id=sweep_id, **cfg.model_dump())
@@ -156,7 +176,12 @@ class DeviceManager:
         If the sweeper's capture thread doesn't exit in time, SweepStopTimeoutError
         propagates to the caller and the sweep/dongle claim are left in place - the
         thread may still hold the device open, so it would be unsafe to let another
-        receiver/sweep claim the same dongle.
+        receiver/sweep claim the same dongle. SoapySweeper.stop() itself arranges for
+        _on_sweep_late_stop to eventually clean up once the thread actually exits, so this
+        isn't a *permanent* zombie (confirmed live: without that, the dongle claim and the
+        sweep's entry here were stuck until the add-on process restarted, and a later attempt
+        to start a new sweep on that dongle just failed as "already in use" with no waterfall
+        ever appearing - the frozen old sweep was still what any state reload showed).
         """
         sweep = self._sweeps.get(sweep_id)
         if sweep is None:
@@ -166,7 +191,26 @@ class DeviceManager:
             sweeper.stop()  # raises SweepStopTimeoutError if the thread is still alive
             self._sweepers.pop(sweep_id, None)
         self._sweeps.pop(sweep_id, None)
-        self._release(sweep.dongle_serial)
+        self._release(sweep.dongle_serial, sweep_id)
+
+    def _on_sweep_late_stop(self, sweep_id: str) -> None:
+        """Cleans up a sweep whose stop() timed out earlier but whose thread has now exited.
+
+        remove_sweep() already returned (raising SweepStopTimeoutError) without popping this
+        sweep or releasing its dongle claim, since the thread might still have held the device
+        open at that moment. This runs later, once SoapySweeper's background watcher confirms
+        the thread is actually gone - release the claim and forget the sweep now. Guarded by
+        the dict .pop(..., None)/get(...) defaults in case a *different* successful
+        remove_sweep() call (e.g. a user retry, once the thread happened to exit just inside
+        that retry's own timeout window) already did this cleanup first.
+        """
+        sweep = self._sweeps.pop(sweep_id, None)
+        self._sweepers.pop(sweep_id, None)
+        if sweep is None:
+            return
+        self._release(sweep.dongle_serial, sweep_id)
+        _LOGGER.info("sweep %s's capture thread exited after a delayed stop; dongle released", sweep_id)
+        self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.STOPPED, "stopped after a delayed shutdown")
 
     def _on_sweep_error(self, sweep_id: str, err: Exception) -> None:
         sweep = self._sweeps.get(sweep_id)
@@ -175,7 +219,7 @@ class DeviceManager:
         _LOGGER.error("sweep %s failed: %s", sweep_id, err)
         sweep.status = EntityStatus.ERROR
         self._sweepers.pop(sweep_id, None)
-        self._release(sweep.dongle_serial)
+        self._release(sweep.dongle_serial, sweep_id)
         self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.ERROR, str(err))
 
     async def shutdown(self) -> None:

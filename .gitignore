@@ -44,4 +44,7 @@ plan.md
 CLAUDE.local.md
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Claude Code background-agent worktrees (isolated copies, not part of the repo)
+.claude/worktrees/
 # dotclaude:end

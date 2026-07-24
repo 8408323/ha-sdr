@@ -1,0 +1,71 @@
+add_receiver:
+  fields:
+    dongle_serial:
+      required: true
+      selector:
+        text:
+    frequencies_hz:
+      required: true
+      example: "[433920000]"
+      selector:
+        object:
+    protocols:
+      example: "[]"
+      selector:
+        object:
+    hop_interval_s:
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 3600
+          unit_of_measurement: s
+
+remove_receiver:
+  fields:
+    receiver_id:
+      required: true
+      selector:
+        text:
+
+add_sweep:
+  fields:
+    dongle_serial:
+      required: true
+      selector:
+        text:
+    start_hz:
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: Hz
+    stop_hz:
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: Hz
+    sample_rate:
+      default: 2400000
+      selector:
+        number:
+          min: 0
+          mode: box
+          unit_of_measurement: Hz
+    gain:
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 50
+          unit_of_measurement: dB
+
+remove_sweep:
+  fields:
+    sweep_id:
+      required: true
+      selector:
+        text:

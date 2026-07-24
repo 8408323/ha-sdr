@@ -1,5 +1,4 @@
-ARG BUILD_FROM
-FROM $BUILD_FROM
+FROM ghcr.io/home-assistant/base-debian:bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       rtl-sdr \

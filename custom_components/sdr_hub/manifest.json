@@ -1,0 +1,14 @@
+{
+  "domain": "sdr_hub",
+  "name": "SDR Hub",
+  "codeowners": ["@8408323"],
+  "config_flow": true,
+  "dependencies": ["frontend", "http", "panel_custom", "websocket_api"],
+  "documentation": "https://github.com/8408323/ha-sdr",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/8408323/ha-sdr/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
