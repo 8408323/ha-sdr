@@ -76,11 +76,16 @@ function sequentialColor(t) {
 const WATERFALL_MIN_DB = -20;
 const WATERFALL_MAX_DB = 60;
 const WATERFALL_HEIGHT = 400;
-// Cap for "keep full history (scrollable)" mode - a fixed, pre-allocated canvas height,
-// since resizing a <canvas> element clears its bitmap (redrawing all rows on every new
-// row would be O(n) per row / O(n^2) overall). 1000 rows is a long session for most sweep
-// rates while keeping worst-case memory (1000 rows x up to 8192 points) reasonable.
-const MAX_SCROLL_ROWS = 1000;
+// "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
+// fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
+// few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
+// either wastes the budget on narrow sweeps (retaining far less time than the memory could
+// afford - confirmed live: a narrow ~60ms/row sweep hit a 1000-row cap at almost exactly one
+// minute) or blows it on wide ones. 200MB retained history is generous for a browser tab
+// while still bounding worst case.
+const SCROLL_HISTORY_BUDGET_BYTES = 200 * 1024 * 1024;
+const MIN_SCROLL_ROWS = 100; // floor even for a pathologically wide row, so it's never useless
+const scrollRowCapForWidth = (width) => Math.max(MIN_SCROLL_ROWS, Math.floor(SCROLL_HISTORY_BUDGET_BYTES / (width * 8)));
 const MAX_DECODED_LOG = 50;
 
 class SdrHubPanel extends HTMLElement {
@@ -88,11 +93,12 @@ class SdrHubPanel extends HTMLElement {
     super();
     this._state = { devices: [], receivers: [], sweeps: [] };
     // sweep_id -> [SweepRow, ...] newest-first. Capped at WATERFALL_HEIGHT normally, or
-    // MAX_SCROLL_ROWS while "keep full history" is checked for that sweep - either way this
-    // is what hover reads from, and what a rerender replays into a freshly (re)created canvas.
+    // scrollRowCapForWidth(width) while "keep full history" is checked for that sweep - either
+    // way this is what hover reads from, and what a rerender replays into a freshly (re)created canvas.
     this._sweepRowHistory = {};
     this._scrollMode = {}; // sweep_id -> bool, "keep full history (scrollable)" toggle
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
+    this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
     this._unsub = null;
     this._subscribing = false;
@@ -176,7 +182,9 @@ class SdrHubPanel extends HTMLElement {
       rows.unshift(event);
       // Switching a sweep to "keep full history" only stops future rows being discarded -
       // it can't retroactively recover rows already trimmed off while in live (capped) mode.
-      const cap = this._scrollMode[event.sweep_id] ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+      const cap = this._scrollMode[event.sweep_id]
+        ? scrollRowCapForWidth(event.power_db.length)
+        : WATERFALL_HEIGHT;
       if (rows.length > cap) rows.length = cap;
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
@@ -264,6 +272,7 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No dongles detected.</p>`;
     } else {
       el.innerHTML = `
+        <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;">
           <tr style="text-align:left;color:var(--secondary-text-color,#727272);font-size:.85rem;">
             <th>Serial</th><th>Label</th><th>In use by</th>
@@ -278,7 +287,8 @@ class SdrHubPanel extends HTMLElement {
             </tr>`,
             )
             .join("")}
-        </table>`;
+        </table>
+        </div>`;
     }
     for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver"]) {
       const select = this.querySelector(`#${form} select[name="dongle_serial"]`);
@@ -295,6 +305,7 @@ class SdrHubPanel extends HTMLElement {
         delete this._sweepRowHistory[id];
         delete this._scrollMode[id];
         delete this._scrollDrawIndex[id];
+        delete this._viewportHeight[id];
       }
     }
     if (this._state.sweeps.length === 0) {
@@ -305,12 +316,17 @@ class SdrHubPanel extends HTMLElement {
       .map((s) => {
         const scroll = !!this._scrollMode[s.id];
         // In scroll mode the canvas is sized to exactly how much history there already is
-        // (capped at MAX_SCROLL_ROWS), not pre-allocated - the container only becomes
-        // scrollable (plain CSS overflow:auto) once real content actually exceeds
+        // (capped at scrollRowCapForWidth(width)), not pre-allocated - the container only
+        // becomes scrollable (plain CSS overflow:auto) once real content actually exceeds
         // WATERFALL_HEIGHT, and grows one row at a time as new rows arrive (see
         // _drawScrollRow). Live mode is unchanged: always a fixed WATERFALL_HEIGHT.
-        const historyLen = (this._sweepRowHistory[s.id] || []).length;
-        const canvasHeight = scroll ? Math.max(1, Math.min(historyLen, MAX_SCROLL_ROWS)) : WATERFALL_HEIGHT;
+        const history = this._sweepRowHistory[s.id] || [];
+        const historyLen = history.length;
+        const rowWidth = history[0]?.power_db.length || 1;
+        const canvasHeight = scroll
+          ? Math.max(1, Math.min(historyLen, scrollRowCapForWidth(rowWidth)))
+          : WATERFALL_HEIGHT;
+        const viewportHeight = this._viewportHeight[s.id] ?? WATERFALL_HEIGHT;
         return `
       <div style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -323,13 +339,17 @@ class SdrHubPanel extends HTMLElement {
           Keep full history (scrollable) — only affects rows from now on
         </label>
         <div data-sweep-scroll-container="${esc(s.id)}"
-          style="max-height:${WATERFALL_HEIGHT}px;overflow-y:${scroll ? "auto" : "hidden"};border-radius:8px;">
+          style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
             <canvas data-sweep-canvas="${esc(s.id)}" height="${canvasHeight}"
               style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
             <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
           </div>
         </div>
+        <div data-sweep-resize="${esc(s.id)}" title="Drag to resize" role="separator" aria-label="Resize waterfall height"
+          style="height:20px;margin-top:2px;border-radius:4px;cursor:ns-resize;touch-action:none;
+          background:repeating-linear-gradient(to right,var(--divider-color,#e0e0e0) 0 6px,transparent 0 12px);
+          display:flex;align-items:center;justify-content:center;"></div>
         <div data-sweep-hover="${esc(s.id)}" style="font-size:.8rem;color:var(--secondary-text-color,#727272);height:1.2em;"></div>
       </div>`;
       })
@@ -346,6 +366,7 @@ class SdrHubPanel extends HTMLElement {
         });
       }
       this._wireCanvasHover(s.id);
+      this._wireResizeHandle(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
       // retained history oldest-to-newest so the full waterfall reappears instead of just
       // the latest row, matching what hover (which reads the same history) implies is there.
@@ -366,6 +387,7 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     el.innerHTML = `
+      <div style="overflow-x:auto;">
       <table style="width:100%;border-collapse:collapse;">
         <tr style="text-align:left;color:var(--secondary-text-color,#727272);font-size:.85rem;">
           <th>Frequencies</th><th>Dongle</th><th>Status</th><th></th>
@@ -381,7 +403,8 @@ class SdrHubPanel extends HTMLElement {
           </tr>`,
           )
           .join("")}
-      </table>`;
+      </table>
+      </div>`;
     for (const r of this._state.receivers) {
       el.querySelector(`[data-remove-receiver="${CSS.escape(r.id)}"]`).addEventListener("click", () =>
         this._onRemoveReceiver(r.id),
@@ -407,11 +430,11 @@ class SdrHubPanel extends HTMLElement {
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     const readout = this.querySelector(`[data-sweep-hover="${CSS.escape(sweepId)}"]`);
     if (!canvas || !readout) return;
-    canvas.addEventListener("mousemove", (ev) => {
+    const showAt = (clientX, clientY) => {
       const rows = this._sweepRowHistory[sweepId];
       if (!rows || rows.length === 0) return;
       const rect = canvas.getBoundingClientRect();
-      const y = Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * canvas.height));
+      const y = Math.max(0, Math.floor(((clientY - rect.top) / rect.height) * canvas.height));
       let row;
       if (this._scrollMode[sweepId]) {
         // Scroll mode draws oldest-to-newest top-to-bottom (append), unlike live mode's
@@ -424,7 +447,7 @@ class SdrHubPanel extends HTMLElement {
         // hovering an older band of the waterfall reads that row's data, not the newest.
         row = rows[y];
       }
-      const frac = (ev.clientX - rect.left) / rect.width;
+      const frac = (clientX - rect.left) / rect.width;
       if (!row) {
         readout.textContent = "";
         return;
@@ -432,11 +455,76 @@ class SdrHubPanel extends HTMLElement {
       const bin = Math.max(0, Math.min(row.power_db.length - 1, Math.round(frac * row.power_db.length)));
       const freqHz = row.start_hz + bin * row.bin_hz;
       const db = row.power_db[bin];
-      readout.textContent =
-        Number.isFinite(db) ? `${fmtMHz(freqHz)} MHz — ${db.toFixed(1)} dB` : `${fmtMHz(freqHz)} MHz`;
-    });
+      // Elapsed-since-now (not a wall-clock timestamp) so two hovered points' *delta* can be
+      // read directly by subtracting the two "-Xs" values, matching the axis's own relative
+      // labels - an absolute clock time would need the same subtraction the label already saves.
+      const age = row._receivedAt ? `-${fmtElapsed(Date.now() - row._receivedAt)}` : "";
+      readout.textContent = [
+        `${fmtMHz(freqHz)} MHz`,
+        Number.isFinite(db) ? `${db.toFixed(1)} dB` : null,
+        age || null,
+      ]
+        .filter(Boolean)
+        .join(" — ");
+    };
+    canvas.addEventListener("mousemove", (ev) => showAt(ev.clientX, ev.clientY));
     canvas.addEventListener("mouseleave", () => {
       readout.textContent = "";
+    });
+    // Touch has no hover concept - a single finger drag across the canvas doubles as both
+    // "read a point" and (without this) an attempt to scroll the page, so suppress the
+    // default touch scroll/zoom behavior while dragging on the canvas itself and drive the
+    // same readout from the touch position instead.
+    canvas.addEventListener(
+      "touchstart",
+      (ev) => {
+        if (ev.touches.length !== 1) return;
+        ev.preventDefault();
+        showAt(ev.touches[0].clientX, ev.touches[0].clientY);
+      },
+      { passive: false },
+    );
+    canvas.addEventListener(
+      "touchmove",
+      (ev) => {
+        if (ev.touches.length !== 1) return;
+        ev.preventDefault();
+        showAt(ev.touches[0].clientX, ev.touches[0].clientY);
+      },
+      { passive: false },
+    );
+    canvas.addEventListener("touchend", () => {
+      readout.textContent = "";
+    });
+  }
+
+  // Lets the user drag the waterfall's visible viewport taller/shorter (the canvas itself -
+  // and thus how much history is retained - is unaffected; this only changes how much of it
+  // is shown before the container's own overflow:auto scrolls). Pointer Events (rather than
+  // separate mouse/touch handlers) cover mouse, touch, and pen with one code path.
+  _wireResizeHandle(sweepId) {
+    const handle = this.querySelector(`[data-sweep-resize="${CSS.escape(sweepId)}"]`);
+    const container = this.querySelector(`[data-sweep-scroll-container="${CSS.escape(sweepId)}"]`);
+    if (!handle || !container) return;
+    const MIN_VIEWPORT_PX = 80;
+    handle.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      handle.setPointerCapture(ev.pointerId);
+      const startY = ev.clientY;
+      const startHeight = container.getBoundingClientRect().height;
+      const onMove = (moveEv) => {
+        const next = Math.max(MIN_VIEWPORT_PX, Math.round(startHeight + (moveEv.clientY - startY)));
+        this._viewportHeight[sweepId] = next;
+        container.style.maxHeight = `${next}px`;
+      };
+      const onUp = () => {
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        handle.removeEventListener("pointercancel", onUp);
+      };
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+      handle.addEventListener("pointercancel", onUp);
     });
   }
 
@@ -457,12 +545,22 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     const now = Date.now();
-    // Scale tick count to available space instead of a fixed 5 - with only a few rows drawn
-    // so far (a wide/slow sweep early on), 5 fixed ticks would crowd onto 1-2 actual pixels
-    // and overlap unreadably. More slots naturally open up as canvasHeight grows.
-    const MAX_TICKS = 5;
+    // Scale tick count to the actual drawn pixel extent (drawnCount), not the full canvas
+    // height - a fixed number of ticks (e.g. 5) spread across the *entire* scroll history
+    // stays readable only while the canvas is short. Once "keep full history" has grown it to
+    // thousands of pixels, those same 5 ticks end up thousands of pixels apart - far outside
+    // any single scrolled-to viewport, so most scroll positions show zero labels. Keeping tick
+    // spacing constant (one roughly every MIN_TICK_SPACING_PX) guarantees a label is always
+    // nearby. Using drawnCount rather than canvasHeight also fixes the opposite problem in live
+    // mode: canvasHeight is pre-allocated to a fixed WATERFALL_HEIGHT from the first row, so
+    // early on (a handful of rows drawn into a 400px canvas) canvasHeight-based spacing would
+    // still allow ~10 ticks - all crammed into the first few actually-drawn pixels, overlapping
+    // each other, since drawnCount (the real constraint on how many distinct rows exist to
+    // label) is far smaller than the canvas's eventual full height.
+    // MAX_TICKS is just a sanity ceiling on DOM node count for a pathologically long session.
+    const MAX_TICKS = 300;
     const MIN_TICK_SPACING_PX = 40;
-    const tickCount = Math.max(1, Math.min(MAX_TICKS, Math.floor(canvasHeight / MIN_TICK_SPACING_PX) + 1, drawnCount));
+    const tickCount = Math.max(1, Math.min(MAX_TICKS, Math.floor(drawnCount / MIN_TICK_SPACING_PX) + 1, drawnCount));
     const labels = [];
     for (let t = 0; t < tickCount; t++) {
       // y=0 is the top of the drawn band in both modes (live: newest; scroll: oldest).
@@ -472,8 +570,12 @@ class SdrHubPanel extends HTMLElement {
       const row = rows[rowIndex];
       if (!row || !row._receivedAt) continue;
       const pct = (y / (canvasHeight - 1)) * 100;
+      // Centering every label on its row (translateY(-50%)) pushes the topmost/bottommost
+      // label half its own height past the container edge, clipping it - anchor those two
+      // to the edge instead (no vertical centering) and only center the ones in between.
+      const posStyle = t === 0 ? `top:0;` : t === tickCount - 1 ? `bottom:0;` : `top:${pct}%;transform:translateY(-50%);`;
       labels.push(
-        `<div style="position:absolute;top:${pct}%;right:4px;transform:translateY(-50%);` +
+        `<div style="position:absolute;${posStyle}right:4px;` +
           `font-size:.7rem;color:var(--secondary-text-color,#727272);white-space:nowrap;` +
           `background:var(--card-background-color,#fff);padding:0 3px;border-radius:3px;">` +
           `-${esc(fmtElapsed(now - row._receivedAt))}</div>`,
@@ -526,8 +628,9 @@ class SdrHubPanel extends HTMLElement {
     }
     let y = this._scrollDrawIndex[sweepId] || 0;
     const ctx = canvas.getContext("2d");
+    const rowCap = scrollRowCapForWidth(width);
     if (y >= canvas.height) {
-      if (canvas.height >= MAX_SCROLL_ROWS) {
+      if (canvas.height >= rowCap) {
         // Cap reached - behave as a bounded sliding window instead of silently freezing
         // (dropping new data with no visible sign anything is wrong): shift the whole
         // bitmap up by one row (dropping the oldest) and draw the new row in the now-empty
@@ -555,7 +658,7 @@ class SdrHubPanel extends HTMLElement {
       }
     }
     this._paintRow(ctx, row, width, y);
-    this._scrollDrawIndex[sweepId] = Math.min(y + 1, MAX_SCROLL_ROWS);
+    this._scrollDrawIndex[sweepId] = Math.min(y + 1, rowCap);
     if (container && wasAtBottom) container.scrollTop = container.scrollHeight;
   }
 
