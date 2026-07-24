@@ -21,6 +21,7 @@ const BTN = `
   background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
 `;
 const BTN_DANGER = `${BTN} background: var(--error-color, #db4437);`;
+const BTN_SECONDARY = `${BTN} background: var(--secondary-background-color, #e0e0e0); color: var(--primary-text-color, #212121);`;
 const LABEL = "display:block;font-size:.8rem;color:var(--secondary-text-color,#727272);margin:0 0 4px";
 
 // Entity/device names, decoded-device fields, and error messages are effectively
@@ -73,6 +74,33 @@ function sequentialColor(t) {
   return SEQUENTIAL_RAMP[SEQUENTIAL_RAMP.length - 1][1];
 }
 
+// Remembers the last values a user actually submitted in the add-sweep/add-receiver forms
+// (start/stop/gain/frequencies/hop-interval/scroll-mode/dongle), so reopening the panel - or a
+// page reload, which resets all in-memory JS state - doesn't reset a user's typical settings
+// back to the hardcoded defaults every time. Scoped to localStorage (this browser only,
+// survives reloads) rather than any server-side state, since these are pure UI conveniences,
+// not something another client or an automation needs to see.
+const SWEEP_FORM_PREFS_KEY = "sdr_hub_sweep_form_prefs";
+const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
+
+function loadFormPrefs(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {}; // corrupt/unavailable storage - fall back to hardcoded defaults, not a hard failure
+  }
+}
+
+function saveFormPrefs(key, values) {
+  try {
+    localStorage.setItem(key, JSON.stringify(values));
+  } catch {
+    // localStorage can throw (private browsing, quota exceeded) - losing this convenience isn't
+    // worth failing the actual sweep/receiver submission over.
+  }
+}
+
 // Quick-select shortcuts for common bands, so starting a typical sweep/receiver doesn't need
 // looking up frequencies elsewhere first. Not exhaustive - just the bands a hobbyist RTL-SDR
 // user is most likely to want immediately (broadcast/ISM bands rtl_433 and general SDR use
@@ -92,6 +120,48 @@ const RECEIVER_PRESETS = [
   { label: "ISM 915 MHz, US", frequencies_mhz: "915" },
   { label: "Car remotes 314.98/315 MHz, US", frequencies_mhz: "314.98,315" },
 ];
+
+// rtl_433's own JSON already carries model/id/channel/time prominently, and mic/protocol/
+// raw_message are internal decode-diagnostic fields, not something an end user reads - shown
+// separately (model/id/channel/relative-time) or hidden entirely, not repeated in the field list.
+const DECODED_HIDDEN_FIELDS = new Set(["time", "model", "id", "channel", "mic", "protocol", "raw_message"]);
+// Per-field formatters for the handful of fields common enough across rtl_433 device types to
+// be worth a nicer rendering than a bare "key: value" - not exhaustive, everything else falls
+// back to the generic formatter below.
+const DECODED_FIELD_FORMATTERS = {
+  battery_ok: (v) => `Battery: ${v ? "OK" : "LOW"}`,
+  temperature_C: (v) => `${v}°C`,
+  temperature_F: (v) => `${v}°F`,
+  humidity: (v) => `${v}% humidity`,
+};
+
+function fmtDecodedField(key, value) {
+  const formatter = DECODED_FIELD_FORMATTERS[key];
+  if (formatter) return formatter(value);
+  return `${key.replace(/_/g, " ")}: ${value}`;
+}
+
+// Builds a copy-pasteable HA automation/script action snippet for a running sweep/receiver -
+// bridges "ad-hoc thing I started from the panel" to "permanent thing an automation manages",
+// without the user needing to look up the service's field names themselves.
+function yamlQuoted(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function yamlServiceCall(service, data) {
+  const lines = [`service: ${service}`, "data:"];
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value)) {
+      lines.push(`  ${key}: [${value.join(", ")}]`);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      lines.push(`  ${key}: ${value}`);
+    } else {
+      lines.push(`  ${key}: ${yamlQuoted(value)}`);
+    }
+  }
+  return lines.join("\n");
+}
 
 const WATERFALL_MIN_DB = -20;
 const WATERFALL_MAX_DB = 60;
@@ -263,6 +333,7 @@ class SdrHubPanel extends HTMLElement {
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
     } else if (event.type === "decoded_device") {
+      event._receivedAt = Date.now(); // client-side only, for the relative-time label
       this._decodedLog.unshift(event);
       if (this._decodedLog.length > MAX_DECODED_LOG) this._decodedLog.length = MAX_DECODED_LOG;
       this._renderDecodedLog();
@@ -296,6 +367,8 @@ class SdrHubPanel extends HTMLElement {
     // populated, leaving the sweep list permanently blank after a shell rebuild.
     this._renderedSweepIdsKey = null;
     this._renderedSweepStatusKey = null;
+    const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
+    const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
     this.innerHTML = `
       <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <h1 style="font-size:1.4rem;margin:0 0 16px;color:var(--primary-text-color,#212121);">SDR Hub</h1>
@@ -319,12 +392,12 @@ class SdrHubPanel extends HTMLElement {
               ${SWEEP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
             </select></label>
             <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
-            <label style="${LABEL}">Start MHz<input name="start_mhz" type="number" step="0.001" value="88" style="${INPUT};width:100px"></label>
-            <label style="${LABEL}">Stop MHz<input name="stop_mhz" type="number" step="0.001" value="108" style="${INPUT};width:100px"></label>
-            <label style="${LABEL}">Gain dB<input name="gain" type="number" step="0.1" value="30" style="${INPUT};width:80px"></label>
+            <label style="${LABEL}">Start MHz<input name="start_mhz" type="number" step="0.001" value="${esc(sweepPrefs.start_mhz ?? 88)}" style="${INPUT};width:100px"></label>
+            <label style="${LABEL}">Stop MHz<input name="stop_mhz" type="number" step="0.001" value="${esc(sweepPrefs.stop_mhz ?? 108)}" style="${INPUT};width:100px"></label>
+            <label style="${LABEL}">Gain dB<input name="gain" type="number" step="0.1" value="${esc(sweepPrefs.gain ?? 30)}" style="${INPUT};width:80px"></label>
             <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. FM stations" style="${INPUT};width:140px"></label>
             <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
-              <input type="checkbox" name="scroll_mode"> Keep full history (scrollable)
+              <input type="checkbox" name="scroll_mode" ${sweepPrefs.scroll_mode ? "checked" : ""}> Keep full history (scrollable)
             </label>
             <button type="submit" style="${BTN}">Start sweep</button>
           </form>
@@ -339,8 +412,8 @@ class SdrHubPanel extends HTMLElement {
               ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
             </select></label>
             <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
-            <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="433.92" style="${INPUT};width:180px"></label>
-            <label style="${LABEL}">Hop interval s<input name="hop_interval_s" type="number" value="10" style="${INPUT};width:90px"></label>
+            <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="${esc(receiverPrefs.frequencies_mhz ?? "433.92")}" style="${INPUT};width:180px"></label>
+            <label style="${LABEL}">Hop interval s<input name="hop_interval_s" type="number" value="${esc(receiverPrefs.hop_interval_s ?? 10)}" style="${INPUT};width:90px"></label>
             <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. Weather station" style="${INPUT};width:140px"></label>
             <button type="submit" style="${BTN}">Start receiver</button>
           </form>
@@ -349,7 +422,7 @@ class SdrHubPanel extends HTMLElement {
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Decoded devices</h2>
-          <div id="sdr-hub-decoded" style="font-family:monospace;font-size:.85rem;max-height:240px;overflow-y:auto;"></div>
+          <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
         </div>
       </div>
     `;
@@ -377,14 +450,18 @@ class SdrHubPanel extends HTMLElement {
     });
   }
 
-  _renderDongleOptions(select, { rtlsdrOnly = false } = {}) {
+  _renderDongleOptions(select, { rtlsdrOnly = false, preferredSerial = null } = {}) {
     // Captures both serial and driver of the previously-selected option, not just its value -
     // two devices from different SoapySDR drivers can share the same serial (or both omit
     // one), so restoring by value alone would always land on the *first* matching option
     // regardless of which one the user actually had selected, silently switching the target
     // device on a later re-render (e.g. after an unrelated state_changed refresh).
+    // On the very first render there's no previous selection yet (select has no options at
+    // all) - preferredSerial (the last serial actually submitted, from localStorage) fills
+    // that gap so the dongle picker doesn't just reset to whatever happens to be first.
     const previousOption = select.selectedOptions[0];
-    const previousSerial = previousOption ? previousOption.value : "";
+    const hasPreference = !!previousOption || preferredSerial != null;
+    const previousSerial = previousOption ? previousOption.value : (preferredSerial ?? "");
     const previousDriver = previousOption ? previousOption.dataset.driver : "";
     // rtl_433 receivers only work with actual RTL-SDR hardware (see
     // UnsupportedReceiverDriverError) - filtering the receiver form's dropdown to just those
@@ -403,11 +480,12 @@ class SdrHubPanel extends HTMLElement {
     select.innerHTML = devices
       .map((d) => `<option value="${esc(d.serial)}" data-driver="${esc(d.driver || "")}">${esc(d.label || d.serial)}</option>`)
       .join("");
-    // Checks that there WAS a previous selection at all, not that previousSerial is truthy -
-    // an empty string is exactly the valid "device omits a serial" case this whole
-    // driver-aware restore exists to support, and would otherwise skip restoration entirely
-    // for those devices, silently falling back to the browser's default (first option).
-    if (previousOption) {
+    // Checks hasPreference (was there a previous selection OR a remembered serial), not that
+    // previousSerial is truthy - an empty string is exactly the valid "device omits a serial"
+    // case this whole driver-aware restore exists to support, and would otherwise skip
+    // restoration entirely for those devices, silently falling back to the browser's default
+    // (first option).
+    if (hasPreference) {
       const options = [...select.options];
       // Prefer an exact (serial, driver) match; fall back to serial-only if that specific
       // device is no longer listed (e.g. it was unplugged and a different-driver device
@@ -525,7 +603,10 @@ class SdrHubPanel extends HTMLElement {
     }
     for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver"]) {
       const select = this.querySelector(`#${form} select[name="dongle_serial"]`);
-      if (select) this._renderDongleOptions(select, { rtlsdrOnly: form === "sdr-hub-add-receiver" });
+      if (!select) continue;
+      const isReceiver = form === "sdr-hub-add-receiver";
+      const prefs = loadFormPrefs(isReceiver ? RECEIVER_FORM_PREFS_KEY : SWEEP_FORM_PREFS_KEY);
+      this._renderDongleOptions(select, { rtlsdrOnly: isReceiver, preferredSerial: prefs.dongle_serial ?? null });
     }
   }
 
@@ -592,7 +673,10 @@ class SdrHubPanel extends HTMLElement {
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <span>${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
-          <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
+          <span style="display:flex;gap:8px;">
+            <button data-copy-sweep-yaml="${esc(s.id)}" title="Copy as an sdr_hub.add_sweep automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
+            <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
+          </span>
         </div>
         <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
           <input type="checkbox" data-scroll-toggle="${esc(s.id)}" ${scroll ? "checked" : ""}>
@@ -621,6 +705,7 @@ class SdrHubPanel extends HTMLElement {
       el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`).addEventListener("click", () =>
         this._onRemoveSweep(s.id),
       );
+      this._wireCopyButton(el.querySelector(`[data-copy-sweep-yaml="${CSS.escape(s.id)}"]`), () => this._sweepYaml(s));
       const toggle = el.querySelector(`[data-scroll-toggle="${CSS.escape(s.id)}"]`);
       if (toggle) {
         toggle.addEventListener("change", () => {
@@ -663,7 +748,10 @@ class SdrHubPanel extends HTMLElement {
             <td>${r.frequencies_hz.map(fmtMHz).join(", ")} MHz</td>
             <td>${esc(r.dongle_serial)}</td>
             <td>${r.status === "error" ? `<span style="color:var(--error-color,#db4437);">error</span>` : "running"}</td>
-            <td><button data-remove-receiver="${esc(r.id)}" style="${BTN_DANGER}">Stop</button></td>
+            <td style="display:flex;gap:8px;">
+              <button data-copy-receiver-yaml="${esc(r.id)}" title="Copy as an sdr_hub.add_receiver automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
+              <button data-remove-receiver="${esc(r.id)}" style="${BTN_DANGER}">Stop</button>
+            </td>
           </tr>`,
           )
           .join("")}
@@ -672,6 +760,9 @@ class SdrHubPanel extends HTMLElement {
     for (const r of this._state.receivers) {
       el.querySelector(`[data-remove-receiver="${CSS.escape(r.id)}"]`).addEventListener("click", () =>
         this._onRemoveReceiver(r.id),
+      );
+      this._wireCopyButton(el.querySelector(`[data-copy-receiver-yaml="${CSS.escape(r.id)}"]`), () =>
+        this._receiverYaml(r),
       );
     }
   }
@@ -683,8 +774,27 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No devices decoded yet.</p>`;
       return;
     }
+    const now = Date.now();
     el.innerHTML = this._decodedLog
-      .map((event) => `<div>${esc(JSON.stringify(event.device))}</div>`)
+      .map((event) => {
+        const d = event.device || {};
+        const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
+          Boolean,
+        );
+        const fields = Object.keys(d)
+          .filter((k) => !DECODED_HIDDEN_FIELDS.has(k))
+          .map((k) => fmtDecodedField(k, d[k]));
+        const age = event._receivedAt ? `-${fmtElapsed(now - event._receivedAt)}` : "";
+        return `
+          <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;">
+              <strong>${esc(d.model || "Unknown device")}</strong>
+              <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
+            </div>
+            ${idParts.length ? `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(idParts.join(", "))}</div>` : ""}
+            ${fields.length ? `<div style="font-size:.85rem;">${fields.map(esc).join(" · ")}</div>` : ""}
+          </div>`;
+      })
       .join("");
   }
 
@@ -995,6 +1105,43 @@ class SdrHubPanel extends HTMLElement {
     return (option && option.dataset.driver) || undefined;
   }
 
+  _sweepYaml(s) {
+    return yamlServiceCall("sdr_hub.add_sweep", {
+      dongle_serial: s.dongle_serial,
+      start_hz: s.start_hz,
+      stop_hz: s.stop_hz,
+      gain: s.gain,
+      label: s.label,
+    });
+  }
+
+  _receiverYaml(r) {
+    return yamlServiceCall("sdr_hub.add_receiver", {
+      dongle_serial: r.dongle_serial,
+      frequencies_hz: r.frequencies_hz,
+      hop_interval_s: r.hop_interval_s,
+      label: r.label,
+    });
+  }
+
+  // Generic "copy this text to the clipboard, then briefly confirm" wiring shared by every
+  // copy-as-YAML button - transient button-text feedback since there's nowhere else obvious to
+  // confirm a clipboard write succeeded.
+  _wireCopyButton(button, textFn) {
+    button.addEventListener("click", async () => {
+      const original = button.textContent;
+      try {
+        await navigator.clipboard.writeText(textFn());
+        button.textContent = "Copied!";
+      } catch (err) {
+        this._showError(`Could not copy to clipboard: ${err.message || err}`);
+      }
+      setTimeout(() => {
+        button.textContent = original;
+      }, 1500);
+    });
+  }
+
   async _onAddSweep(ev) {
     ev.preventDefault();
     const form = new FormData(ev.target);
@@ -1022,6 +1169,15 @@ class SdrHubPanel extends HTMLElement {
         this._scrollMode[sweep.id] = true;
         forceRebuild = true;
       }
+      // Only remembered once the add-on actually accepted these values - a rejected submission
+      // (validation error) shouldn't overwrite a previously-working set of defaults.
+      saveFormPrefs(SWEEP_FORM_PREFS_KEY, {
+        dongle_serial: form.get("dongle_serial"),
+        start_mhz: form.get("start_mhz"),
+        stop_mhz: form.get("stop_mhz"),
+        gain: form.get("gain"),
+        scroll_mode: wantsScroll,
+      });
       this._showError("");
     } catch (err) {
       this._showError(`Could not start sweep: ${err.message || err}`);
@@ -1062,6 +1218,12 @@ class SdrHubPanel extends HTMLElement {
         frequencies_hz: frequenciesHz,
         hop_interval_s: Number(form.get("hop_interval_s")) || 10,
         label: form.get("label") || undefined,
+      });
+      // Only remembered once the add-on actually accepted these values - see _onAddSweep.
+      saveFormPrefs(RECEIVER_FORM_PREFS_KEY, {
+        dongle_serial: form.get("dongle_serial"),
+        frequencies_mhz: form.get("frequencies_mhz"),
+        hop_interval_s: form.get("hop_interval_s"),
       });
       this._showError("");
     } catch (err) {
