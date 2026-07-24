@@ -86,7 +86,13 @@ const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
 function loadFormPrefs(key) {
   try {
     const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : {};
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    // JSON.parse happily succeeds on valid-but-useless values too - most importantly `null`
+    // (e.g. from stale/manually-edited storage), which would otherwise flow straight into
+    // _renderShell and blow up on `sweepPrefs.start_mhz`/`receiverPrefs.frequencies_mhz`.
+    // Only a genuine object is usable as a prefs bag; anything else is as good as absent.
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {}; // corrupt/unavailable storage - fall back to hardcoded defaults, not a hard failure
   }
@@ -153,6 +159,7 @@ function yamlServiceCall(service, data) {
   for (const [key, value] of Object.entries(data)) {
     if (value === undefined || value === null || value === "") continue;
     if (Array.isArray(value)) {
+      if (value.length === 0) continue; // e.g. an unset protocols filter - nothing worth exporting
       lines.push(`  ${key}: [${value.join(", ")}]`);
     } else if (typeof value === "number" || typeof value === "boolean") {
       lines.push(`  ${key}: ${value}`);
@@ -216,6 +223,7 @@ class SdrHubPanel extends HTMLElement {
     this._loadStateRequestId = 0; // guards against overlapping _loadState() calls resolving out of order
     this._renderedSweepIdsKey = null; // last-rendered sweep id set, to skip redundant canvas rebuilds
     this._renderedSweepStatusKey = null;
+    this._decodedAgeInterval = null; // re-renders decoded-log relative ages even when decoding goes quiet
   }
 
   set hass(hass) {
@@ -225,6 +233,9 @@ class SdrHubPanel extends HTMLElement {
       this._renderShell();
       this._loadState();
       this._subscribe();
+      if (!this._decodedAgeInterval) {
+        this._decodedAgeInterval = setInterval(() => this._renderDecodedLog(), 30000);
+      }
     }
   }
 
@@ -249,12 +260,23 @@ class SdrHubPanel extends HTMLElement {
       this._loadState();
       this._subscribe();
     }
+    // _renderDecodedLog otherwise only reruns when a new decoded_device event arrives - if
+    // decoding goes quiet, the last card's "-Ns" age would silently freeze (or read "-0s")
+    // forever instead of counting up. A lightweight periodic re-render keeps it live without
+    // needing a full _loadState() round-trip.
+    if (!this._decodedAgeInterval) {
+      this._decodedAgeInterval = setInterval(() => this._renderDecodedLog(), 30000);
+    }
   }
 
   disconnectedCallback() {
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
+    }
+    if (this._decodedAgeInterval) {
+      clearInterval(this._decodedAgeInterval);
+      this._decodedAgeInterval = null;
     }
   }
 
@@ -450,19 +472,21 @@ class SdrHubPanel extends HTMLElement {
     });
   }
 
-  _renderDongleOptions(select, { rtlsdrOnly = false, preferredSerial = null } = {}) {
+  _renderDongleOptions(select, { rtlsdrOnly = false, preferredSerial = null, preferredDriver = null } = {}) {
     // Captures both serial and driver of the previously-selected option, not just its value -
     // two devices from different SoapySDR drivers can share the same serial (or both omit
     // one), so restoring by value alone would always land on the *first* matching option
     // regardless of which one the user actually had selected, silently switching the target
     // device on a later re-render (e.g. after an unrelated state_changed refresh).
     // On the very first render there's no previous selection yet (select has no options at
-    // all) - preferredSerial (the last serial actually submitted, from localStorage) fills
-    // that gap so the dongle picker doesn't just reset to whatever happens to be first.
+    // all) - preferredSerial/preferredDriver (the last (serial, driver) pair actually
+    // submitted, from localStorage) fill that gap so the dongle picker doesn't just reset to
+    // whatever happens to be first, and doesn't land on a *different* device that happens to
+    // share the same serial under another driver.
     const previousOption = select.selectedOptions[0];
     const hasPreference = !!previousOption || preferredSerial != null;
     const previousSerial = previousOption ? previousOption.value : (preferredSerial ?? "");
-    const previousDriver = previousOption ? previousOption.dataset.driver : "";
+    const previousDriver = previousOption ? previousOption.dataset.driver : (preferredDriver ?? "");
     // rtl_433 receivers only work with actual RTL-SDR hardware (see
     // UnsupportedReceiverDriverError) - filtering the receiver form's dropdown to just those
     // avoids the user picking e.g. a HackRF there and hitting a confusing rejection after
@@ -606,7 +630,11 @@ class SdrHubPanel extends HTMLElement {
       if (!select) continue;
       const isReceiver = form === "sdr-hub-add-receiver";
       const prefs = loadFormPrefs(isReceiver ? RECEIVER_FORM_PREFS_KEY : SWEEP_FORM_PREFS_KEY);
-      this._renderDongleOptions(select, { rtlsdrOnly: isReceiver, preferredSerial: prefs.dongle_serial ?? null });
+      this._renderDongleOptions(select, {
+        rtlsdrOnly: isReceiver,
+        preferredSerial: prefs.dongle_serial ?? null,
+        preferredDriver: prefs.dongle_driver ?? null,
+      });
     }
   }
 
@@ -1106,20 +1134,33 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _sweepYaml(s) {
+    // Includes every field the add-on's SweepCreate accepts, not just the ones the add-sweep
+    // form itself exposes - a sweep started with a non-default sample_rate (or one whose
+    // dongle_serial is ambiguous across drivers) needs those in the export too, or "copy as
+    // YAML" recreates a materially different sweep (default sample_rate) or fails outright
+    // (DuplicateDongleSerialError) instead of reproducing this exact running sweep.
     return yamlServiceCall("sdr_hub.add_sweep", {
       dongle_serial: s.dongle_serial,
+      dongle_driver: s.dongle_driver,
       start_hz: s.start_hz,
       stop_hz: s.stop_hz,
       gain: s.gain,
+      sample_rate: s.sample_rate,
       label: s.label,
     });
   }
 
   _receiverYaml(r) {
+    // See _sweepYaml above - dongle_driver disambiguates a shared serial across drivers, and a
+    // non-default protocols filter must round-trip too, or the copied action either fails on
+    // an ambiguous serial or silently decodes a broader set of protocols than this receiver
+    // was actually restricted to.
     return yamlServiceCall("sdr_hub.add_receiver", {
       dongle_serial: r.dongle_serial,
+      dongle_driver: r.dongle_driver,
       frequencies_hz: r.frequencies_hz,
       hop_interval_s: r.hop_interval_s,
+      protocols: r.protocols,
       label: r.label,
     });
   }
@@ -1130,8 +1171,18 @@ class SdrHubPanel extends HTMLElement {
   _wireCopyButton(button, textFn) {
     button.addEventListener("click", async () => {
       const original = button.textContent;
+      const text = textFn();
       try {
-        await navigator.clipboard.writeText(textFn());
+        // navigator.clipboard requires a secure context (HTTPS or localhost) - it's simply
+        // undefined otherwise, which is exactly the case for the plain-HTTP HA installs this
+        // project's own README documents (HA_URL=http://homeassistant.local:8123). Falling
+        // through to the execCommand("copy") + off-screen-textarea trick keeps the button
+        // working there instead of only ever showing an error.
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else if (!this._copyViaExecCommand(text)) {
+          throw new Error("Clipboard access unavailable in this browser context");
+        }
         button.textContent = "Copied!";
       } catch (err) {
         this._showError(`Could not copy to clipboard: ${err.message || err}`);
@@ -1140,6 +1191,29 @@ class SdrHubPanel extends HTMLElement {
         button.textContent = original;
       }, 1500);
     });
+  }
+
+  // Legacy fallback for browsers/contexts without the (secure-context-only) Clipboard API.
+  // Selecting the text in an off-screen textarea and invoking the deprecated but still
+  // universally-supported document.execCommand("copy") is the standard workaround for this.
+  _copyViaExecCommand(text) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.top = "0";
+    textarea.style.left = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    document.body.removeChild(textarea);
+    return ok;
   }
 
   async _onAddSweep(ev) {
@@ -1173,6 +1247,7 @@ class SdrHubPanel extends HTMLElement {
       // (validation error) shouldn't overwrite a previously-working set of defaults.
       saveFormPrefs(SWEEP_FORM_PREFS_KEY, {
         dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(ev.target) ?? "",
         start_mhz: form.get("start_mhz"),
         stop_mhz: form.get("stop_mhz"),
         gain: form.get("gain"),
@@ -1222,6 +1297,7 @@ class SdrHubPanel extends HTMLElement {
       // Only remembered once the add-on actually accepted these values - see _onAddSweep.
       saveFormPrefs(RECEIVER_FORM_PREFS_KEY, {
         dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(ev.target) ?? "",
         frequencies_mhz: form.get("frequencies_mhz"),
         hop_interval_s: form.get("hop_interval_s"),
       });
