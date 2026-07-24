@@ -26,7 +26,9 @@ directly by other HACS integrations/add-ons too.
 ## Hardware model
 
 Each attached dongle can service one "capture window" (a center frequency +
-bandwidth) at a time. Receivers whose frequencies fall inside the same
-window are decoded concurrently from one IQ stream; receivers that don't fit
-any single dongle's window are time-multiplexed across it, or serviced by a
-second dongle if attached.
+bandwidth) for one receiver or sweep at a time. v1 enforces this strictly:
+claiming a dongle that's already in use by another receiver/sweep returns a
+409 conflict rather than sharing or time-multiplexing the window. With
+multiple dongles attached, each can service a different receiver/sweep
+concurrently. Window-sharing and time-multiplexing across a single dongle
+are on the roadmap, not yet implemented.

@@ -52,12 +52,17 @@ stream (that's how `rtl_433` decodes many devices from one dongle already).
 Two frequencies far apart cannot be received at the same instant on one
 dongle — only time-sliced, or with a second dongle.
 
-The add-on models this as a pool of dongles, each servicing one capture
-window at a time. **Receivers** (user-configured: frequency + decode type)
-that fall inside the same window are serviced together; receivers that
-don't fit any single window are time-multiplexed across it if only one
-dongle covers them. The wideband spectrum sweep is just another receiver
-type — a window that wanders across the full tunable range.
+The add-on models this as a pool of dongles, where **v1's actual behavior is
+strictly one owner (one receiver, or one sweep) per dongle at a time** —
+claiming an already-claimed dongle returns a 409 conflict. With N dongles
+attached, up to N receivers/sweeps can run concurrently, one per dongle.
+
+**Roadmap (not yet implemented):** receivers that fall inside the same
+capture window sharing that window, and time-multiplexing receivers that
+don't fit any single window across it when only one dongle covers them. The
+wideband spectrum sweep is meant to become just another receiver type — a
+window that wanders across the full tunable range — once that pooling model
+lands.
 
 ## Repository layout
 

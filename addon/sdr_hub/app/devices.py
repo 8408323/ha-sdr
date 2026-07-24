@@ -7,6 +7,8 @@ import SoapySDR
 
 @dataclass
 class Dongle:
+    """A single attached RTL-SDR dongle, as reported by SoapySDR's device enumerator."""
+
     serial: str
     label: str
 
