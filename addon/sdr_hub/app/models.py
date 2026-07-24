@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from constants import DEFAULT_GAIN_DB, DEFAULT_HOP_INTERVAL_S, DEFAULT_SAMPLE_RATE_HZ, FFT_SIZE
+from constants import DEFAULT_GAIN_DB, DEFAULT_HOP_INTERVAL_S, DEFAULT_SAMPLE_RATE_HZ, FFT_SIZE, MAX_NATIVE_BINS
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -11,6 +11,11 @@ class EntityStatus(str, Enum):
 
     RUNNING = "running"
     ERROR = "error"
+    # Used only in a transient status *broadcast* (never persisted on a Receiver/Sweep model -
+    # the entity is already removed from bookkeeping by the time this fires) when a sweep's
+    # capture thread finally exits after its stop() call had already timed out and returned an
+    # error to the original caller - see DeviceManager._on_sweep_late_stop.
+    STOPPED = "stopped"
 
 
 class EntityKind(str, Enum):
@@ -64,6 +69,17 @@ class SweepCreate(BaseModel):
         bin_hz = self.sample_rate / FFT_SIZE
         if (self.stop_hz - self.start_hz) < bin_hz:
             raise ValueError(f"range must be at least one bin wide ({bin_hz:.1f} Hz at this sample rate)")
+        # The scanner allocates a native-resolution row of n_bins_total float32s *before* any
+        # downsampling (see MAX_ROW_POINTS) - unbounded, a mistyped huge stop_hz or a tiny
+        # positive sample_rate can request an allocation of tens of millions to billions of
+        # bins, which either OOMs the add-on's capture thread/container or takes so long the
+        # sweep looks hung, well after this request was already accepted.
+        n_bins_total = int((self.stop_hz - self.start_hz) / bin_hz)
+        if n_bins_total > MAX_NATIVE_BINS:
+            raise ValueError(
+                f"range too wide at this sample rate: {n_bins_total} native bins exceeds the "
+                f"{MAX_NATIVE_BINS} limit - use a narrower range or a lower sample rate"
+            )
         return self
 
 

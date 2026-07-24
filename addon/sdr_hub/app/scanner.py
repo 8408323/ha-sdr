@@ -95,11 +95,16 @@ class SoapySweeper:
         self,
         on_row: Callable[[SweepRow], None],
         on_error: Callable[[Exception], None] | None = None,
+        on_late_stop: Callable[[], None] | None = None,
     ) -> None:
         self._on_row = on_row
         self._on_error = on_error
+        # Called (from a background watcher thread, not the capture thread) if the capture
+        # thread finally exits after a stop() call already timed out and raised - see stop().
+        self._on_late_stop = on_late_stop
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._late_stop_watcher: threading.Thread | None = None
 
     def start(self, config: SweepConfig) -> None:
         if self._thread is not None:
@@ -115,6 +120,13 @@ class SoapySweeper:
         seconds (e.g. blocked in a long readStream call). In that case the thread
         is left in place (not cleared) so the dongle is not considered free and a
         retry can join the same thread again.
+
+        On timeout, also arranges for on_late_stop to fire once the thread *does* eventually
+        exit on its own (confirmed live: it's very likely to, once its current blocking
+        readStream call returns and it notices _stop_event) - without this, nothing would
+        ever notice that later exit, permanently stranding this sweep's DeviceManager
+        bookkeeping and dongle claim (until the whole add-on process restarts), even though
+        the thread is actually gone and the dongle is actually free.
         """
         self._stop_event.set()
         thread = self._thread
@@ -122,6 +134,18 @@ class SoapySweeper:
             return
         thread.join(timeout=timeout)
         if thread.is_alive():
+            if self._late_stop_watcher is None or not self._late_stop_watcher.is_alive():
+                # Guarded so a retried stop() call (still failing, e.g. polled by the caller)
+                # while a watcher from an earlier timeout is already waiting doesn't spawn a
+                # second one racing the first for the same thread/callback.
+                def _watch() -> None:
+                    thread.join()  # blocking, no timeout - this thread has nothing else to do
+                    self._thread = None
+                    if self._on_late_stop is not None:
+                        self._on_late_stop()
+
+                self._late_stop_watcher = threading.Thread(target=_watch, daemon=True)
+                self._late_stop_watcher.start()
             raise SweepStopTimeoutError(
                 f"sweep thread did not exit within {timeout}s; dongle may still be claimed"
             )

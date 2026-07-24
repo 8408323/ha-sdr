@@ -150,6 +150,7 @@ class DeviceManager:
         sweeper = SoapySweeper(
             on_row=lambda row: self._loop.call_soon_threadsafe(self._on_row, sweep_id, row),
             on_error=lambda err: self._loop.call_soon_threadsafe(self._on_sweep_error, sweep_id, err),
+            on_late_stop=lambda: self._loop.call_soon_threadsafe(self._on_sweep_late_stop, sweep_id),
         )
         try:
             sweeper.start(
@@ -175,7 +176,12 @@ class DeviceManager:
         If the sweeper's capture thread doesn't exit in time, SweepStopTimeoutError
         propagates to the caller and the sweep/dongle claim are left in place - the
         thread may still hold the device open, so it would be unsafe to let another
-        receiver/sweep claim the same dongle.
+        receiver/sweep claim the same dongle. SoapySweeper.stop() itself arranges for
+        _on_sweep_late_stop to eventually clean up once the thread actually exits, so this
+        isn't a *permanent* zombie (confirmed live: without that, the dongle claim and the
+        sweep's entry here were stuck until the add-on process restarted, and a later attempt
+        to start a new sweep on that dongle just failed as "already in use" with no waterfall
+        ever appearing - the frozen old sweep was still what any state reload showed).
         """
         sweep = self._sweeps.get(sweep_id)
         if sweep is None:
@@ -186,6 +192,25 @@ class DeviceManager:
             self._sweepers.pop(sweep_id, None)
         self._sweeps.pop(sweep_id, None)
         self._release(sweep.dongle_serial, sweep_id)
+
+    def _on_sweep_late_stop(self, sweep_id: str) -> None:
+        """Cleans up a sweep whose stop() timed out earlier but whose thread has now exited.
+
+        remove_sweep() already returned (raising SweepStopTimeoutError) without popping this
+        sweep or releasing its dongle claim, since the thread might still have held the device
+        open at that moment. This runs later, once SoapySweeper's background watcher confirms
+        the thread is actually gone - release the claim and forget the sweep now. Guarded by
+        the dict .pop(..., None)/get(...) defaults in case a *different* successful
+        remove_sweep() call (e.g. a user retry, once the thread happened to exit just inside
+        that retry's own timeout window) already did this cleanup first.
+        """
+        sweep = self._sweeps.pop(sweep_id, None)
+        self._sweepers.pop(sweep_id, None)
+        if sweep is None:
+            return
+        self._release(sweep.dongle_serial, sweep_id)
+        _LOGGER.info("sweep %s's capture thread exited after a delayed stop; dongle released", sweep_id)
+        self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.STOPPED, "stopped after a delayed shutdown")
 
     def _on_sweep_error(self, sweep_id: str, err: Exception) -> None:
         sweep = self._sweeps.get(sweep_id)

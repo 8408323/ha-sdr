@@ -61,6 +61,16 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
         # will never be consumed by _on_data_updated. Undo it now or it leaks, silently
         # swallowing the next genuine state_changed broadcast once the add-on recovers.
         coordinator.cancel_pending_suppression()
+    if not coordinator.last_update_success:
+        # async_refresh() records a failure on the coordinator but does not raise, so without
+        # this check a genuinely unreachable add-on would still return the previous (now stale)
+        # cached snapshot as if it were a successful, authoritative get_state response - the
+        # panel's failure path never runs and it keeps rendering stale devices/receivers/sweeps
+        # as though nothing were wrong. Report the failure explicitly instead.
+        connection.send_error(
+            msg["id"], "refresh_failed", str(coordinator.last_exception or "SDR Hub add-on is unreachable")
+        )
+        return
     connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
 
 

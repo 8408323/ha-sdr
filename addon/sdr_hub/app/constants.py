@@ -33,6 +33,14 @@ DEFAULT_HOP_INTERVAL_S: int = 10
 # the server's memory grow unboundedly (see Broadcaster).
 WS_SEND_QUEUE_MAXSIZE: int = 64
 
+# Cap on the *native*-resolution bin count a sweep range is allowed to request, before any
+# downsampling. A legitimate full-range sweep (24MHz-1764MHz at the default sample rate) is
+# ~1.48M bins - generous headroom above that catches a mistyped huge stop frequency or a tiny
+# positive sample rate turning into a request for tens/hundreds of millions (or billions) of
+# bins, which would allocate a many-GB float32 array and OOM the add-on's thread/container
+# well after the caller was already told the sweep started successfully.
+MAX_NATIVE_BINS: int = 10_000_000
+
 # Cap on delivered points per sweep row, regardless of how wide a range is requested.
 # Native resolution (bin_hz = sample_rate/FFT_SIZE) produces a bin count proportional to
 # range width - a full 24-1764MHz sweep is ~1.48M bins, which serializes to double-digit
