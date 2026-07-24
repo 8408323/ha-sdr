@@ -344,7 +344,11 @@ class SdrHubPanel extends HTMLElement {
     select.innerHTML = devices
       .map((d) => `<option value="${esc(d.serial)}" data-driver="${esc(d.driver || "")}">${esc(d.label || d.serial)}</option>`)
       .join("");
-    if (previousSerial) {
+    // Checks that there WAS a previous selection at all, not that previousSerial is truthy -
+    // an empty string is exactly the valid "device omits a serial" case this whole
+    // driver-aware restore exists to support, and would otherwise skip restoration entirely
+    // for those devices, silently falling back to the browser's default (first option).
+    if (previousOption) {
       const options = [...select.options];
       // Prefer an exact (serial, driver) match; fall back to serial-only if that specific
       // device is no longer listed (e.g. it was unplugged and a different-driver device
