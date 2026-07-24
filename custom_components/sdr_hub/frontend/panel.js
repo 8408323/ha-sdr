@@ -324,9 +324,18 @@ class SdrHubPanel extends HTMLElement {
     // UnsupportedReceiverDriverError) - filtering the receiver form's dropdown to just those
     // avoids the user picking e.g. a HackRF there and hitting a confusing rejection after
     // submitting, when a wideband sweep would have worked fine on that same device.
-    const devices = rtlsdrOnly ? this._state.devices.filter((d) => d.driver === "rtlsdr") : this._state.devices;
+    // Treats a missing `driver` (an add-on older than this multi-brand change, which only ever
+    // returned RTL-SDR dongles anyway) as "rtlsdr" rather than filtering it out - the panel and
+    // add-on are updated/configured independently, so a newer panel talking to an older add-on
+    // would otherwise see every device vanish from the receiver picker, unable to start a
+    // receiver at all until the add-on itself is upgraded too.
+    const devices = rtlsdrOnly ? this._state.devices.filter((d) => (d.driver || "rtlsdr") === "rtlsdr") : this._state.devices;
+    // data-driver lets the submit handler send dongle_driver alongside dongle_serial - the
+    // panel always knows exactly which specific device it displayed, so it can pass this
+    // disambiguator along unconditionally instead of only reacting after an ambiguous-serial
+    // error (which the add-on can't attribute to one specific device to retry against anyway).
     select.innerHTML = devices
-      .map((d) => `<option value="${esc(d.serial)}">${esc(d.label || d.serial)}</option>`)
+      .map((d) => `<option value="${esc(d.serial)}" data-driver="${esc(d.driver || "")}">${esc(d.label || d.serial)}</option>`)
       .join("");
     if (current) select.value = current;
   }
@@ -769,6 +778,16 @@ class SdrHubPanel extends HTMLElement {
 
   // ── forms ────────────────────────────────────────────────────────────────
 
+  // The panel always knows exactly which specific device its dropdown displayed - passing its
+  // driver along unconditionally as a disambiguator lets the add-on's optional dongle_driver
+  // field resolve an otherwise-ambiguous serial (e.g. two different SoapySDR drivers, or
+  // devices that both omit a serial) without the panel needing to react after the fact.
+  _selectedDongleDriver(form) {
+    const select = form.querySelector('select[name="dongle_serial"]');
+    const option = select && select.selectedOptions[0];
+    return (option && option.dataset.driver) || undefined;
+  }
+
   async _onAddSweep(ev) {
     ev.preventDefault();
     const form = new FormData(ev.target);
@@ -783,6 +802,7 @@ class SdrHubPanel extends HTMLElement {
       const sweep = await this._callWS({
         type: "sdr_hub/add_sweep",
         dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(ev.target),
         start_hz: Number(form.get("start_mhz")) * 1e6,
         stop_hz: Number(form.get("stop_mhz")) * 1e6,
         gain: Number(form.get("gain")),
@@ -830,6 +850,7 @@ class SdrHubPanel extends HTMLElement {
       await this._callWS({
         type: "sdr_hub/add_receiver",
         dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(ev.target),
         frequencies_hz: frequenciesHz,
         hop_interval_s: Number(form.get("hop_interval_s")) || 10,
       });

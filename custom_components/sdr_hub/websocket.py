@@ -95,6 +95,10 @@ async def ws_subscribe(hass: HomeAssistant, connection, msg) -> None:
     {
         vol.Required("type"): "sdr_hub/add_receiver",
         vol.Required("dongle_serial"): str,
+        # See addon/sdr_hub/app/models.py's ReceiverCreate.dongle_driver - optional
+        # disambiguator, only needed when dongle_serial alone matches more than one attached
+        # device. The panel always sends the driver of whichever device it displayed.
+        vol.Optional("dongle_driver"): vol.Any(str, None),
         vol.Required("frequencies_hz"): [vol.Coerce(float)],
         vol.Optional("protocols", default=[]): [int],
         # decode.py passes this straight through to rtl_433's -H <seconds> hop interval - a
@@ -147,6 +151,8 @@ async def ws_remove_receiver(hass: HomeAssistant, connection, msg) -> None:
     {
         vol.Required("type"): "sdr_hub/add_sweep",
         vol.Required("dongle_serial"): str,
+        # See ws_add_receiver's dongle_driver above - same optional disambiguator.
+        vol.Optional("dongle_driver"): vol.Any(str, None),
         vol.Required("start_hz"): vol.Coerce(float),
         vol.Required("stop_hz"): vol.Coerce(float),
         vol.Optional("sample_rate", default=2.4e6): vol.Coerce(float),

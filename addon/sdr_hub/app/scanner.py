@@ -22,6 +22,29 @@ from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
 _LOGGER = logging.getLogger(__name__)
 
 
+def _resolve_sample_rate(sdr, requested_hz: float) -> float:
+    """Returns requested_hz unchanged if the device can actually produce it, else the closest
+    rate it does support.
+
+    Not every SoapySDR driver accepts the same sample rates - RTL-SDR happens to support a
+    wide continuous range (confirmed: 900kHz-3.2MHz) that covers the panel's 2.4MHz default,
+    but e.g. Airspy R2 hardware only supports a couple of fixed discrete rates (10MSPS, or an
+    experimental 2.5MSPS) and would otherwise silently receive a request its own hardware
+    can't produce, yielding no usable capture data with no clear error (caught by review).
+    Checking listSampleRates()/getSampleRateRange() BEFORE calling setSampleRate(), rather
+    than just calling it and hoping the driver clamps gracefully, avoids depending on
+    per-driver behavior for an unsupported value.
+    """
+    ranges = sdr.getSampleRateRange(SOAPY_SDR_RX, 0)
+    if any(r.minimum() <= requested_hz <= r.maximum() for r in ranges):
+        return requested_hz
+    candidates = list(sdr.listSampleRates(SOAPY_SDR_RX, 0))
+    candidates += [v for r in ranges for v in (r.minimum(), r.maximum())]
+    if not candidates:
+        return requested_hz  # driver exposes no discoverable rates - let setSampleRate itself decide
+    return min(candidates, key=lambda v: abs(v - requested_hz))
+
+
 class SweepStopTimeoutError(Exception):
     """Raised when a sweep's capture thread does not exit within the stop timeout.
 
@@ -163,7 +186,15 @@ class SoapySweeper:
     def _run(self, config: SweepConfig) -> None:
         try:
             sdr = SoapySDR.Device(config.soapy_args)
-            sdr.setSampleRate(SOAPY_SDR_RX, 0, config.sample_rate)
+            sample_rate = _resolve_sample_rate(sdr, config.sample_rate)
+            if sample_rate != config.sample_rate:
+                _LOGGER.info(
+                    "dongle %s: requested sample rate %.0f Hz not supported, using %.0f Hz instead",
+                    config.dongle_serial,
+                    config.sample_rate,
+                    sample_rate,
+                )
+            sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
             sdr.setGain(SOAPY_SDR_RX, 0, config.gain)
             rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
             sdr.activateStream(rx)
@@ -173,9 +204,9 @@ class SoapySweeper:
                 self._on_error(err)
             return
 
-        bin_hz = config.sample_rate / FFT_SIZE
+        bin_hz = sample_rate / FFT_SIZE
         n_bins_total = int((config.stop_hz - config.start_hz) / bin_hz)
-        half_span = config.sample_rate / 2
+        half_span = sample_rate / 2
         window = np.hanning(FFT_SIZE)
         buf = np.zeros(FFT_SIZE, np.complex64)
         consecutive_errors = 0
@@ -235,7 +266,7 @@ class SoapySweeper:
                                 f"readStream error {sr.ret} persisted for {consecutive_errors} "
                                 f"consecutive reads at {center / 1e6:.3f} MHz"
                             )
-                    center += config.sample_rate
+                    center += sample_rate
                 if not self._stop_event.is_set():
                     power_db, out_bin_hz = _serialize_row(row, bin_hz)
                     self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=out_bin_hz, power_db=power_db))
