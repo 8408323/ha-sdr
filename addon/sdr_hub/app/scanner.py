@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -69,7 +70,14 @@ def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], 
         pad = (-n) % factor
         if pad:
             row = np.concatenate([row, np.full(pad, np.nan, dtype=row.dtype)])
-        with np.errstate(all="ignore"):  # nanmax warns on an all-NaN block; that's expected, not an error
+        # nanmax raises a RuntimeWarning (via Python's warnings module) for a block that's
+        # entirely NaN (e.g. every read in that block hit a tolerated timeout/error) - that's
+        # expected here, not a real problem, but np.errstate does NOT suppress it: errstate only
+        # controls floating-point *exception* state (invalid/divide/overflow), not warnings.warn
+        # calls, so a naive np.errstate(all="ignore") guard here is a no-op against this specific
+        # warning and would let wide sweeps with transient gaps spam the add-on log.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
             row = np.nanmax(row.reshape(-1, factor), axis=1)
         bin_hz = bin_hz * factor
     power_db = [None if np.isnan(v) else round(float(v), 1) for v in row]

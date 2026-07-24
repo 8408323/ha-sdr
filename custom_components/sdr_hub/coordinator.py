@@ -26,7 +26,7 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
-        self._suppress_next_broadcast = False
+        self._suppress_broadcast_count = 0
         # A refresh triggered by anything other than this panel's own action (a service call,
         # another open panel's WS command, or the periodic poll) otherwise has no way to reach
         # other subscribed panels - only the raw add-on WS events do. Piggyback on the
@@ -42,13 +42,23 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         without this, that refresh's own update-listener firing would re-broadcast state_changed
         to every subscriber (including the caller), which would re-trigger _loadState() -> another
         get_state -> another forced refresh, an unbounded feedback loop (confirmed live).
+
+        Uses a counter, not a plain boolean: two subscribed panels can react to the same
+        state_changed event and both enter ws_get_state before either's async_refresh() call
+        completes (async_refresh() calls aren't serialized against each other), so both call
+        this and both later fire _on_data_updated. A shared boolean would be cleared by the
+        first completion, leaving the second completion to broadcast unsuppressed and repeat
+        the feedback loop - a counter lets each forced refresh consume exactly one suppression,
+        however the calls interleave, since suppress_next_broadcast() is always called
+        synchronously (no await between it and the matching async_refresh()) right before the
+        refresh that will eventually consume it.
         """
-        self._suppress_next_broadcast = True
+        self._suppress_broadcast_count += 1
 
     @callback
     def _on_data_updated(self) -> None:
-        if self._suppress_next_broadcast:
-            self._suppress_next_broadcast = False
+        if self._suppress_broadcast_count > 0:
+            self._suppress_broadcast_count -= 1
             return
         self._dispatch({"type": "state_changed"})
 

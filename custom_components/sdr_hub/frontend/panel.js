@@ -102,6 +102,9 @@ class SdrHubPanel extends HTMLElement {
     this._decodedLog = []; // most-recent-first
     this._unsub = null;
     this._subscribing = false;
+    this._loadStateRequestId = 0; // guards against overlapping _loadState() calls resolving out of order
+    this._renderedSweepIdsKey = null; // last-rendered sweep id set, to skip redundant canvas rebuilds
+    this._renderedSweepStatusKey = null;
   }
 
   set hass(hass) {
@@ -152,10 +155,20 @@ class SdrHubPanel extends HTMLElement {
     if (this._unsub || this._subscribing) return; // already subscribed, or another call is in flight
     this._subscribing = true; // set synchronously, before the await below, to close that race
     try {
-      this._unsub = await this._hass.connection.subscribeMessage(
+      const unsub = await this._hass.connection.subscribeMessage(
         (event) => this._handleEvent(event),
         { type: "sdr_hub/subscribe" },
       );
+      if (!this.isConnected) {
+        // The element detached while this subscribe was still in flight - disconnectedCallback
+        // already ran and found _unsub still null (nothing to call yet), so nothing tore this
+        // subscription down. Cancel it now instead of storing it, or it lives on in the
+        // background (still accumulating "keep full history" rows) until the whole HA page
+        // is reloaded.
+        unsub();
+        return;
+      }
+      this._unsub = unsub;
     } catch (err) {
       this._showError(`Could not subscribe to live updates: ${err.message || err}`);
     } finally {
@@ -164,12 +177,22 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _loadState() {
+    // Two _loadState() calls can overlap (e.g. the initial load racing with the reload
+    // triggered right after submitting one of the forms) and their WS responses can resolve
+    // out of order. Only the response for the most recently *started* call is allowed to
+    // apply - otherwise a stale response arriving last would overwrite newer state, making an
+    // already-created/removed receiver or sweep flicker back until the next state event or the
+    // 30s poll corrects it.
+    const requestId = ++this._loadStateRequestId;
+    let state;
     try {
-      this._state = await this._callWS({ type: "sdr_hub/get_state" });
+      state = await this._callWS({ type: "sdr_hub/get_state" });
     } catch (err) {
       this._showError(`Could not load SDR Hub state: ${err.message || err}`);
       return;
     }
+    if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
+    this._state = state;
     this._renderDongles();
     this._renderSweeps();
     this._renderReceivers();
@@ -210,6 +233,12 @@ class SdrHubPanel extends HTMLElement {
   // ── shell ────────────────────────────────────────────────────────────────
 
   _renderShell() {
+    // Recreates #sdr-hub-sweeps as empty - invalidate the cached "already rendered" keys used
+    // by _renderSweeps()'s no-op-refresh skip, or the next _renderSweeps() call would see an
+    // unchanged sweep id set and wrongly conclude the (now-empty) container is already
+    // populated, leaving the sweep list permanently blank after a shell rebuild.
+    this._renderedSweepIdsKey = null;
+    this._renderedSweepStatusKey = null;
     this.innerHTML = `
       <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <h1 style="font-size:1.4rem;margin:0 0 16px;color:var(--primary-text-color,#212121);">SDR Hub</h1>
@@ -296,7 +325,7 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
-  _renderSweeps() {
+  _renderSweeps(forceRebuild = false) {
     const el = this.querySelector("#sdr-hub-sweeps");
     if (!el) return;
     const activeIds = new Set(this._state.sweeps.map((s) => s.id));
@@ -308,6 +337,29 @@ class SdrHubPanel extends HTMLElement {
         delete this._viewportHeight[id];
       }
     }
+    // _loadState() (and thus this) runs on every state_changed event, including the harmless
+    // 30s poll and other panels' unrelated actions - not just changes to *this* sweep list. The
+    // full rebuild below recreates every canvas element and replays its whole retained history
+    // into it; in scroll mode _drawScrollRow's canvas-growth path copies the existing bitmap
+    // through a temp canvas one row at a time, so replaying a near-200MB history on every no-op
+    // refresh can turn into hundreds of GB of pixel copies and freeze the tab. Skip all of that
+    // when the set of sweeps hasn't actually changed - only patch the small mutable bits (the
+    // error status label) instead. forceRebuild is used by call sites that genuinely need a
+    // fresh canvas (the scroll-mode toggle, which changes canvas sizing).
+    const idsKey = [...activeIds].sort().join(",");
+    const statusKey = this._state.sweeps.map((s) => `${s.id}:${s.status}`).join(",");
+    if (!forceRebuild && this._renderedSweepIdsKey === idsKey) {
+      if (this._renderedSweepStatusKey !== statusKey) {
+        for (const s of this._state.sweeps) {
+          const label = el.querySelector(`[data-sweep-status="${CSS.escape(s.id)}"]`);
+          if (label) label.textContent = s.status === "error" ? " (error)" : "";
+        }
+        this._renderedSweepStatusKey = statusKey;
+      }
+      return;
+    }
+    this._renderedSweepIdsKey = idsKey;
+    this._renderedSweepStatusKey = statusKey;
     if (this._state.sweeps.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
@@ -331,7 +383,7 @@ class SdrHubPanel extends HTMLElement {
       <div style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <span>${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz on ${esc(s.dongle_serial)}
-            ${s.status === "error" ? `<span style="color:var(--error-color,#db4437);"> (error)</span>` : ""}</span>
+            <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
           <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
         </div>
         <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
@@ -362,7 +414,7 @@ class SdrHubPanel extends HTMLElement {
       if (toggle) {
         toggle.addEventListener("change", () => {
           this._scrollMode[s.id] = toggle.checked;
-          this._renderSweeps(); // rebuilds this sweep's canvas at the new size and replays below
+          this._renderSweeps(true); // force: rebuilds this sweep's canvas at the new size and replays below
         });
       }
       this._wireCanvasHover(s.id);
