@@ -73,9 +73,33 @@ function sequentialColor(t) {
   return SEQUENTIAL_RAMP[SEQUENTIAL_RAMP.length - 1][1];
 }
 
+// Quick-select shortcuts for common bands, so starting a typical sweep/receiver doesn't need
+// looking up frequencies elsewhere first. Not exhaustive - just the bands a hobbyist RTL-SDR
+// user is most likely to want immediately (broadcast/ISM bands rtl_433 and general SDR use
+// commonly target), each independently verified against public band-plan references.
+const SWEEP_PRESETS = [
+  { label: "FM broadcast (88–108 MHz)", start_mhz: 88, stop_mhz: 108 },
+  { label: "Airband VHF voice (118–137 MHz)", start_mhz: 118, stop_mhz: 137 },
+  { label: "Marine VHF (156–163 MHz)", start_mhz: 156, stop_mhz: 163 },
+  { label: "ISM 433 MHz (433.05–434.79 MHz)", start_mhz: 433.05, stop_mhz: 434.79 },
+  { label: "ISM/SRD 868 MHz, EU (863–870 MHz)", start_mhz: 863, stop_mhz: 870 },
+  { label: "ISM 915 MHz, US (902–928 MHz)", start_mhz: 902, stop_mhz: 928 },
+  { label: "ADS-B (1089–1091 MHz)", start_mhz: 1089, stop_mhz: 1091 },
+];
+const RECEIVER_PRESETS = [
+  { label: "ISM 433.92 MHz, EU", frequencies_mhz: "433.92" },
+  { label: "ISM 868.3/868.95 MHz, EU", frequencies_mhz: "868.3,868.95" },
+  { label: "ISM 915 MHz, US", frequencies_mhz: "915" },
+  { label: "Car remotes 314.98/315 MHz, US", frequencies_mhz: "314.98,315" },
+];
+
 const WATERFALL_MIN_DB = -20;
 const WATERFALL_MAX_DB = 60;
 const WATERFALL_HEIGHT = 400;
+// A row's strongest bin only counts as a "peak" worth marking if it clears the row's own
+// median by this many dB - a fixed absolute dB floor would need per-device/gain calibration
+// (noise floor varies a lot), but "stands out from this row's own noise" doesn't.
+const PEAK_MIN_DELTA_DB = 6;
 // "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
 // fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
 // few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
@@ -290,10 +314,15 @@ class SdrHubPanel extends HTMLElement {
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Wideband sweeps</h2>
           <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+            <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
+              <option value="">Custom</option>
+              ${SWEEP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
+            </select></label>
             <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
             <label style="${LABEL}">Start MHz<input name="start_mhz" type="number" step="0.001" value="88" style="${INPUT};width:100px"></label>
             <label style="${LABEL}">Stop MHz<input name="stop_mhz" type="number" step="0.001" value="108" style="${INPUT};width:100px"></label>
             <label style="${LABEL}">Gain dB<input name="gain" type="number" step="0.1" value="30" style="${INPUT};width:80px"></label>
+            <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. FM stations" style="${INPUT};width:140px"></label>
             <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
               <input type="checkbox" name="scroll_mode"> Keep full history (scrollable)
             </label>
@@ -305,9 +334,14 @@ class SdrHubPanel extends HTMLElement {
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Receivers (rtl_433)</h2>
           <form id="sdr-hub-add-receiver" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+            <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
+              <option value="">Custom</option>
+              ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
+            </select></label>
             <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
             <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="433.92" style="${INPUT};width:180px"></label>
             <label style="${LABEL}">Hop interval s<input name="hop_interval_s" type="number" value="10" style="${INPUT};width:90px"></label>
+            <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. Weather station" style="${INPUT};width:140px"></label>
             <button type="submit" style="${BTN}">Start receiver</button>
           </form>
           <div id="sdr-hub-receivers"></div>
@@ -322,6 +356,25 @@ class SdrHubPanel extends HTMLElement {
 
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
+    this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
+    this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
+  }
+
+  // Fills the form's fields from the chosen preset - a starting point the user can still edit
+  // before submitting, not an auto-submit, since e.g. gain/hop-interval still need a real
+  // value picked for their actual hardware/environment.
+  _wirePresetSelect(formId, presets) {
+    const form = this.querySelector(`#${formId}`);
+    const select = form.querySelector("[data-preset-select]");
+    select.addEventListener("change", () => {
+      const preset = presets[Number(select.value)];
+      if (!preset) return; // "Custom" - leave whatever the user already has
+      for (const [field, value] of Object.entries(preset)) {
+        if (field === "label") continue;
+        const input = form.querySelector(`[name="${field}"]`);
+        if (input) input.value = value;
+      }
+    });
   }
 
   _renderDongleOptions(select, { rtlsdrOnly = false } = {}) {
@@ -383,12 +436,17 @@ class SdrHubPanel extends HTMLElement {
       start: s.start_hz,
       stop: s.stop_hz,
       error: s.status === "error",
-      label: `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz sweep on ${s.dongle_serial}`,
+      label: s.label
+        ? `${s.label} (${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz sweep on ${s.dongle_serial})`
+        : `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz sweep on ${s.dongle_serial}`,
     }));
     const points = [];
     for (const r of receivers) {
       for (const freq of r.frequencies_hz) {
-        points.push({ freq, error: r.status === "error", label: `${fmtMHz(freq)} MHz receiver on ${r.dongle_serial}` });
+        const label = r.label
+          ? `${r.label} (${fmtMHz(freq)} MHz receiver on ${r.dongle_serial})`
+          : `${fmtMHz(freq)} MHz receiver on ${r.dongle_serial}`;
+        points.push({ freq, error: r.status === "error", label });
       }
     }
     if (segments.length === 0 && points.length === 0) {
@@ -525,10 +583,14 @@ class SdrHubPanel extends HTMLElement {
           ? Math.max(1, Math.min(historyLen, scrollRowCapForWidth(rowWidth)))
           : WATERFALL_HEIGHT;
         const viewportHeight = this._viewportHeight[s.id] ?? WATERFALL_HEIGHT;
+        const rangeText = `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz`;
+        const titleHtml = s.label
+          ? `<strong>${esc(s.label)}</strong> <span style="color:var(--secondary-text-color,#727272);">(${rangeText})</span>`
+          : rangeText;
         return `
       <div style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-          <span>${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz on ${esc(s.dongle_serial)}
+          <span>${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
           <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
         </div>
@@ -548,7 +610,10 @@ class SdrHubPanel extends HTMLElement {
           style="height:20px;margin-top:2px;border-radius:4px;cursor:ns-resize;touch-action:none;
           background:repeating-linear-gradient(to right,var(--divider-color,#e0e0e0) 0 6px,transparent 0 12px);
           display:flex;align-items:center;justify-content:center;"></div>
-        <div data-sweep-hover="${esc(s.id)}" style="font-size:.8rem;color:var(--secondary-text-color,#727272);height:1.2em;"></div>
+        <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--secondary-text-color,#727272);">
+          <div data-sweep-hover="${esc(s.id)}" style="height:1.2em;"></div>
+          <div data-sweep-peak="${esc(s.id)}" style="height:1.2em;"></div>
+        </div>
       </div>`;
       })
       .join("");
@@ -588,12 +653,13 @@ class SdrHubPanel extends HTMLElement {
       <div style="overflow-x:auto;">
       <table style="width:100%;border-collapse:collapse;">
         <tr style="text-align:left;color:var(--secondary-text-color,#727272);font-size:.85rem;">
-          <th>Frequencies</th><th>Dongle</th><th>Status</th><th></th>
+          <th>Label</th><th>Frequencies</th><th>Dongle</th><th>Status</th><th></th>
         </tr>
         ${this._state.receivers
           .map(
             (r) => `
           <tr>
+            <td>${r.label ? esc(r.label) : `<em style="color:var(--secondary-text-color,#727272);">—</em>`}</td>
             <td>${r.frequencies_hz.map(fmtMHz).join(", ")} MHz</td>
             <td>${esc(r.dongle_serial)}</td>
             <td>${r.status === "error" ? `<span style="color:var(--error-color,#db4437);">error</span>` : "running"}</td>
@@ -785,14 +851,47 @@ class SdrHubPanel extends HTMLElement {
     if (!row.power_db || row.power_db.length === 0) return;
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     if (!canvas) return;
+    const peak = this._findPeak(row);
+    this._renderPeakReadout(sweepId, peak);
     if (this._scrollMode[sweepId]) {
-      this._drawScrollRow(canvas, sweepId, row);
+      this._drawScrollRow(canvas, sweepId, row, peak);
     } else {
-      this._drawLiveRow(canvas, row);
+      this._drawLiveRow(canvas, row, peak);
     }
   }
 
-  _drawLiveRow(canvas, row) {
+  // Finds this row's strongest bin, if it stands out enough from the row's own noise floor to
+  // be worth calling out - most rows are just noise with no real signal, and marking every
+  // row's technical maximum (even noise has *a* highest sample) would be meaningless clutter.
+  _findPeak(row) {
+    const power_db = row.power_db;
+    let maxDb = -Infinity;
+    let maxIdx = -1;
+    const finite = [];
+    for (let i = 0; i < power_db.length; i++) {
+      const db = power_db[i];
+      if (Number.isFinite(db)) {
+        finite.push(db);
+        if (db > maxDb) {
+          maxDb = db;
+          maxIdx = i;
+        }
+      }
+    }
+    if (maxIdx < 0) return null;
+    finite.sort((a, b) => a - b);
+    const median = finite[Math.floor(finite.length / 2)];
+    if (maxDb - median < PEAK_MIN_DELTA_DB) return null;
+    return { bin: maxIdx, db: maxDb, freqHz: row.start_hz + maxIdx * row.bin_hz };
+  }
+
+  _renderPeakReadout(sweepId, peak) {
+    const el = this.querySelector(`[data-sweep-peak="${CSS.escape(sweepId)}"]`);
+    if (!el) return;
+    el.textContent = peak ? `Peak: ${fmtMHz(peak.freqHz)} MHz — ${peak.db.toFixed(1)} dB` : "";
+  }
+
+  _drawLiveRow(canvas, row, peak) {
     const width = row.power_db.length;
     if (canvas.width !== width) canvas.width = width; // resets the bitmap; only on first row/range change
     const ctx = canvas.getContext("2d");
@@ -801,10 +900,10 @@ class SdrHubPanel extends HTMLElement {
       const existing = ctx.getImageData(0, 0, width, height - 1);
       ctx.putImageData(existing, 0, 1);
     }
-    this._paintRow(ctx, row, width, 0);
+    this._paintRow(ctx, row, width, 0, peak);
   }
 
-  _drawScrollRow(canvas, sweepId, row) {
+  _drawScrollRow(canvas, sweepId, row, peak) {
     const width = row.power_db.length;
     // Captured before any resize below - resizing grows scrollHeight first, which would
     // make "was at bottom" read false right at the moment growth happens (the old scrollTop
@@ -856,12 +955,12 @@ class SdrHubPanel extends HTMLElement {
         y = canvas.height - 1;
       }
     }
-    this._paintRow(ctx, row, width, y);
+    this._paintRow(ctx, row, width, y, peak);
     this._scrollDrawIndex[sweepId] = Math.min(y + 1, rowCap);
     if (container && wasAtBottom) container.scrollTop = container.scrollHeight;
   }
 
-  _paintRow(ctx, row, width, y) {
+  _paintRow(ctx, row, width, y, peak) {
     const rowImage = ctx.createImageData(width, 1);
     for (let i = 0; i < width; i++) {
       const db = row.power_db[i];
@@ -871,6 +970,15 @@ class SdrHubPanel extends HTMLElement {
       rowImage.data[i * 4 + 1] = g;
       rowImage.data[i * 4 + 2] = b;
       rowImage.data[i * 4 + 3] = 255;
+    }
+    if (peak) {
+      // Overwrite the peak bin's pixel with a stark, unmistakable color - baked directly into
+      // the bitmap (not a separate overlay), so it stays exactly where it happened even once
+      // this row scrolls into history, without needing to track marker positions separately.
+      rowImage.data[peak.bin * 4] = 255;
+      rowImage.data[peak.bin * 4 + 1] = 255;
+      rowImage.data[peak.bin * 4 + 2] = 255;
+      rowImage.data[peak.bin * 4 + 3] = 255;
     }
     ctx.putImageData(rowImage, 0, y);
   }
@@ -905,6 +1013,7 @@ class SdrHubPanel extends HTMLElement {
         start_hz: Number(form.get("start_mhz")) * 1e6,
         stop_hz: Number(form.get("stop_mhz")) * 1e6,
         gain: Number(form.get("gain")),
+        label: form.get("label") || undefined,
       });
       // Pre-select scroll mode before _loadState()/_renderSweeps() ever creates this sweep's
       // canvas, so it's built at the right size from its very first row instead of the user
@@ -952,6 +1061,7 @@ class SdrHubPanel extends HTMLElement {
         dongle_driver: this._selectedDongleDriver(ev.target),
         frequencies_hz: frequenciesHz,
         hop_interval_s: Number(form.get("hop_interval_s")) || 10,
+        label: form.get("label") || undefined,
       });
       this._showError("");
     } catch (err) {
