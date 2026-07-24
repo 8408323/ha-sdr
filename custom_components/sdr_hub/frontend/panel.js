@@ -108,6 +108,19 @@ function saveFormPrefs(key, values) {
   }
 }
 
+function loadHelpDismissed() {
+  try {
+    // Some browsers/WebViews (notably with DOM storage disabled) throw a SecurityError just
+    // from *touching* localStorage, not only on read of missing/corrupt data. This read runs
+    // inside _renderShell() before `innerHTML` is assigned, so letting it throw would abort
+    // the whole shell render and leave the panel blank. Default to showing the help card,
+    // same as a first-time visitor, if storage isn't usable.
+    return localStorage.getItem(HELP_DISMISSED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 // Quick-select shortcuts for common bands, so starting a typical sweep/receiver doesn't need
 // looking up frequencies elsewhere first. Not exhaustive - just the bands a hobbyist RTL-SDR
 // user is most likely to want immediately (broadcast/ISM bands rtl_433 and general SDR use
@@ -396,7 +409,7 @@ class SdrHubPanel extends HTMLElement {
     // "Dismissed" only skips showing it by default on load - the Help button in the header
     // always reopens it, so dismissing is never a one-way door for a first-time user who
     // dismissed too quickly or wants a refresher later.
-    const helpDismissed = localStorage.getItem(HELP_DISMISSED_KEY) === "true";
+    const helpDismissed = loadHelpDismissed();
     this.innerHTML = `
       <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -479,7 +492,12 @@ class SdrHubPanel extends HTMLElement {
       helpEl.style.display = "block";
     });
     helpEl.querySelector("[data-dismiss-help]").addEventListener("click", () => {
-      localStorage.setItem(HELP_DISMISSED_KEY, "true");
+      try {
+        localStorage.setItem(HELP_DISMISSED_KEY, "true");
+      } catch {
+        // Same unavailable-storage case as loadHelpDismissed() - dismissal just won't persist
+        // across reloads; still hide the card for this session.
+      }
       helpEl.style.display = "none";
     });
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
