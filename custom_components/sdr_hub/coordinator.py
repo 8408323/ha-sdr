@@ -26,6 +26,16 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
+        # A refresh triggered by anything other than this panel's own action (a service call,
+        # another open panel's WS command, or the periodic poll) otherwise has no way to reach
+        # other subscribed panels - only the raw add-on WS events do. Piggyback on the
+        # coordinator's own standard update-listener mechanism so every successful refresh,
+        # regardless of what triggered it, notifies every sdr_hub/subscribe client too.
+        self.async_add_listener(self._on_data_updated)
+
+    @callback
+    def _on_data_updated(self) -> None:
+        self._dispatch({"type": "state_changed"})
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:

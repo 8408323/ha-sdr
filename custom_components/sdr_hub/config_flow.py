@@ -29,6 +29,13 @@ class SdrHubConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        # manifest.json's single_config_entry should already stop a second flow from being
+        # started in the common case, but that check and this entry's creation aren't atomic -
+        # two flows completed concurrently (or via the config-entry WebSocket API) could still
+        # both get this far. Everything downstream (services, websocket, panel) assumes exactly
+        # one loaded entry, so guard explicitly rather than rely solely on the manifest flag.
+        if self._async_current_entries():
+            return self.async_abort(reason="already_configured")
         errors: dict[str, str] = {}
         if user_input is not None:
             api = SdrHubApiClient(

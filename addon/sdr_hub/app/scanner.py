@@ -9,6 +9,7 @@ from typing import Callable
 import numpy as np
 import SoapySDR
 from constants import (
+    DC_SPIKE_BLANK_BINS,
     DEFAULT_GAIN_DB,
     DEFAULT_SAMPLE_RATE_HZ,
     FFT_SIZE,
@@ -155,6 +156,11 @@ class SoapySweeper:
                             samples = padded
                         fft = np.fft.fftshift(np.fft.fft(samples))
                         power_db = 20 * np.log10(np.abs(fft) + 1e-9)
+                        # Blank the DC/LO-leakage spike at this capture's exact center bin —
+                        # a hardware artifact of the R820T's direct-conversion tuner, not a
+                        # real signal (see DC_SPIKE_BLANK_BINS).
+                        center_bin = FFT_SIZE // 2
+                        power_db[center_bin - DC_SPIKE_BLANK_BINS : center_bin + DC_SPIKE_BLANK_BINS + 1] = np.nan
                         lower_edge = center - half_span
                         offset = int((lower_edge - config.start_hz) / bin_hz)
                         n = min(len(power_db), n_bins_total - offset)

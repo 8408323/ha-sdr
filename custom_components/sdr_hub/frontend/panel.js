@@ -34,6 +34,13 @@ const esc = (s) =>
 
 const fmtMHz = (hz) => (Number(hz) / 1e6).toFixed(3);
 
+// "2m14s" / "48s" — used for the waterfall's relative-time axis ticks.
+const fmtElapsed = (ms) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${(s % 60).toString().padStart(2, "0")}s`;
+};
+
 // Sequential (single-hue, light→dark) ramp — dataviz skill's blue sequential steps 100→700.
 // Power near the noise floor recedes toward pale; strong signals go dark blue. Deliberately
 // not a rainbow/jet colormap.
@@ -68,14 +75,24 @@ function sequentialColor(t) {
 
 const WATERFALL_MIN_DB = -20;
 const WATERFALL_MAX_DB = 60;
-const WATERFALL_HEIGHT = 200;
+const WATERFALL_HEIGHT = 400;
+// Cap for "keep full history (scrollable)" mode - a fixed, pre-allocated canvas height,
+// since resizing a <canvas> element clears its bitmap (redrawing all rows on every new
+// row would be O(n) per row / O(n^2) overall). 1000 rows is a long session for most sweep
+// rates while keeping worst-case memory (1000 rows x up to 8192 points) reasonable.
+const MAX_SCROLL_ROWS = 1000;
 const MAX_DECODED_LOG = 50;
 
 class SdrHubPanel extends HTMLElement {
   constructor() {
     super();
     this._state = { devices: [], receivers: [], sweeps: [] };
-    this._sweepRowHistory = {}; // sweep_id -> [SweepRow, ...] newest-first, capped at WATERFALL_HEIGHT (index = canvas row = hover Y), for hover lookups
+    // sweep_id -> [SweepRow, ...] newest-first. Capped at WATERFALL_HEIGHT normally, or
+    // MAX_SCROLL_ROWS while "keep full history" is checked for that sweep - either way this
+    // is what hover reads from, and what a rerender replays into a freshly (re)created canvas.
+    this._sweepRowHistory = {};
+    this._scrollMode = {}; // sweep_id -> bool, "keep full history (scrollable)" toggle
+    this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._decodedLog = []; // most-recent-first
     this._unsub = null;
   }
@@ -143,17 +160,23 @@ class SdrHubPanel extends HTMLElement {
 
   _handleEvent(event) {
     if (event.type === "sweep_row") {
+      event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
       rows.unshift(event);
-      if (rows.length > WATERFALL_HEIGHT) rows.length = WATERFALL_HEIGHT;
-      this._drawWaterfallRow(event);
+      // Switching a sweep to "keep full history" only stops future rows being discarded -
+      // it can't retroactively recover rows already trimmed off while in live (capped) mode.
+      const cap = this._scrollMode[event.sweep_id] ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+      if (rows.length > cap) rows.length = cap;
+      this._appendRow(event.sweep_id, event);
+      this._renderTimeAxis(event.sweep_id);
     } else if (event.type === "decoded_device") {
       this._decodedLog.unshift(event);
       if (this._decodedLog.length > MAX_DECODED_LOG) this._decodedLog.length = MAX_DECODED_LOG;
       this._renderDecodedLog();
-    } else if (event.type === "status") {
-      // A receiver/sweep died (or similar) — the add-on already released the dongle;
-      // reload the authoritative snapshot rather than hand-patch local state.
+    } else if (event.type === "status" || event.type === "state_changed") {
+      // A receiver/sweep died, or something else changed the add-on's state from outside
+      // this panel (an automation service call, another open panel) - reload the
+      // authoritative snapshot rather than hand-patch local state.
       this._loadState();
     }
   }
@@ -254,39 +277,64 @@ class SdrHubPanel extends HTMLElement {
     if (!el) return;
     const activeIds = new Set(this._state.sweeps.map((s) => s.id));
     for (const id of Object.keys(this._sweepRowHistory)) {
-      if (!activeIds.has(id)) delete this._sweepRowHistory[id];
+      if (!activeIds.has(id)) {
+        delete this._sweepRowHistory[id];
+        delete this._scrollMode[id];
+        delete this._scrollDrawIndex[id];
+      }
     }
     if (this._state.sweeps.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
     }
     el.innerHTML = this._state.sweeps
-      .map(
-        (s) => `
+      .map((s) => {
+        const scroll = !!this._scrollMode[s.id];
+        const canvasHeight = scroll ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+        return `
       <div style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <span>${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz on ${esc(s.dongle_serial)}
             ${s.status === "error" ? `<span style="color:var(--error-color,#db4437);"> (error)</span>` : ""}</span>
           <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
         </div>
-        <canvas data-sweep-canvas="${esc(s.id)}" height="${WATERFALL_HEIGHT}"
-          style="width:100%;height:${WATERFALL_HEIGHT}px;image-rendering:pixelated;display:block;border-radius:8px;"></canvas>
+        <label style="${LABEL};display:inline-flex;align-items:center;gap:4px;cursor:pointer;">
+          <input type="checkbox" data-scroll-toggle="${esc(s.id)}" ${scroll ? "checked" : ""}>
+          Keep full history (scrollable) — only affects rows from now on
+        </label>
+        <div data-sweep-scroll-container="${esc(s.id)}"
+          style="max-height:${WATERFALL_HEIGHT}px;overflow-y:${scroll ? "auto" : "hidden"};border-radius:8px;">
+          <div style="position:relative;">
+            <canvas data-sweep-canvas="${esc(s.id)}" height="${canvasHeight}"
+              style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
+            <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
+          </div>
+        </div>
         <div data-sweep-hover="${esc(s.id)}" style="font-size:.8rem;color:var(--secondary-text-color,#727272);height:1.2em;"></div>
-      </div>`,
-      )
+      </div>`;
+      })
       .join("");
     for (const s of this._state.sweeps) {
       el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`).addEventListener("click", () =>
         this._onRemoveSweep(s.id),
       );
+      const toggle = el.querySelector(`[data-scroll-toggle="${CSS.escape(s.id)}"]`);
+      if (toggle) {
+        toggle.addEventListener("change", () => {
+          this._scrollMode[s.id] = toggle.checked;
+          this._renderSweeps(); // rebuilds this sweep's canvas at the new size and replays below
+        });
+      }
       this._wireCanvasHover(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
       // retained history oldest-to-newest so the full waterfall reappears instead of just
       // the latest row, matching what hover (which reads the same history) implies is there.
+      this._scrollDrawIndex[s.id] = 0;
       const rows = this._sweepRowHistory[s.id];
       if (rows) {
-        for (let i = rows.length - 1; i >= 0; i--) this._drawWaterfallRow(rows[i]);
+        for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
       }
+      this._renderTimeAxis(s.id);
     }
   }
 
@@ -343,11 +391,19 @@ class SdrHubPanel extends HTMLElement {
       const rows = this._sweepRowHistory[sweepId];
       if (!rows || rows.length === 0) return;
       const rect = canvas.getBoundingClientRect();
-      // Row 0 is newest and drawn at canvas y=0; each older row is one pixel further down
-      // (the scroll-down in _drawWaterfallRow) — map the cursor's Y back to that same index
-      // so hovering an older band of the waterfall reads that row's data, not the newest.
-      const rowIndex = Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * canvas.height));
-      const row = rows[rowIndex];
+      const y = Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * canvas.height));
+      let row;
+      if (this._scrollMode[sweepId]) {
+        // Scroll mode draws oldest-to-newest top-to-bottom (append), unlike live mode's
+        // newest-at-top scroll-down - y=0 is the oldest drawn row, increasing y is newer.
+        const drawnCount = this._scrollDrawIndex[sweepId] || 0;
+        row = y < drawnCount ? rows[drawnCount - 1 - y] : null;
+      } else {
+        // Row 0 is newest and drawn at canvas y=0; each older row is one pixel further down
+        // (the scroll-down in _drawLiveRow) — map the cursor's Y back to that same index so
+        // hovering an older band of the waterfall reads that row's data, not the newest.
+        row = rows[y];
+      }
       const frac = (ev.clientX - rect.left) / rect.width;
       if (!row) {
         readout.textContent = "";
@@ -364,18 +420,77 @@ class SdrHubPanel extends HTMLElement {
     });
   }
 
-  _drawWaterfallRow(row) {
-    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(row.sweep_id)}"]`);
+  _renderTimeAxis(sweepId) {
+    const axisEl = this.querySelector(`[data-sweep-axis="${CSS.escape(sweepId)}"]`);
+    if (!axisEl) return;
+    const rows = this._sweepRowHistory[sweepId];
+    const scroll = !!this._scrollMode[sweepId];
+    const canvasHeight = scroll ? MAX_SCROLL_ROWS : WATERFALL_HEIGHT;
+    // How many rows are actually drawn right now (live mode: capped at WATERFALL_HEIGHT;
+    // scroll mode: however many have been appended into the pre-allocated canvas so far).
+    const drawnCount = scroll ? this._scrollDrawIndex[sweepId] || 0 : Math.min(rows ? rows.length : 0, WATERFALL_HEIGHT);
+    if (!rows || drawnCount === 0) {
+      axisEl.innerHTML = "";
+      return;
+    }
+    const now = Date.now();
+    const TICK_COUNT = 5;
+    const labels = [];
+    for (let t = 0; t < TICK_COUNT; t++) {
+      // y=0 is the top of the drawn band in both modes (live: newest; scroll: oldest).
+      const y = Math.round((t / (TICK_COUNT - 1)) * (drawnCount - 1));
+      const rowIndex = scroll ? drawnCount - 1 - y : y; // scroll draws oldest-to-newest top-to-bottom
+      const row = rows[rowIndex];
+      if (!row || !row._receivedAt) continue;
+      const pct = (y / (canvasHeight - 1)) * 100;
+      labels.push(
+        `<div style="position:absolute;top:${pct}%;right:4px;transform:translateY(-50%);` +
+          `font-size:.7rem;color:var(--secondary-text-color,#727272);white-space:nowrap;` +
+          `background:var(--card-background-color,#fff);padding:0 3px;border-radius:3px;">` +
+          `-${esc(fmtElapsed(now - row._receivedAt))}</div>`,
+      );
+    }
+    axisEl.innerHTML = labels.join("");
+  }
+
+  _appendRow(sweepId, row) {
+    // Sub-bin-width sweep ranges are now rejected by the add-on's own validation, but guard
+    // defensively anyway - a zero-length power_db would make canvas.width 0, and
+    // getImageData/createImageData throw on a zero-size request.
+    if (!row.power_db || row.power_db.length === 0) return;
+    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     if (!canvas) return;
+    if (this._scrollMode[sweepId]) {
+      this._drawScrollRow(canvas, sweepId, row);
+    } else {
+      this._drawLiveRow(canvas, row);
+    }
+  }
+
+  _drawLiveRow(canvas, row) {
     const width = row.power_db.length;
     if (canvas.width !== width) canvas.width = width; // resets the bitmap; only on first row/range change
     const ctx = canvas.getContext("2d");
     const height = canvas.height;
-
     if (height > 1) {
       const existing = ctx.getImageData(0, 0, width, height - 1);
       ctx.putImageData(existing, 0, 1);
     }
+    this._paintRow(ctx, row, width, 0);
+  }
+
+  _drawScrollRow(canvas, sweepId, row) {
+    const width = row.power_db.length;
+    if (canvas.width !== width) canvas.width = width; // resets the bitmap; only on first row/range change
+    const y = this._scrollDrawIndex[sweepId] || 0;
+    if (y >= canvas.height) return; // pre-allocated MAX_SCROLL_ROWS exhausted; still kept in history for hover
+    this._paintRow(canvas.getContext("2d"), row, width, y);
+    this._scrollDrawIndex[sweepId] = y + 1;
+    const container = canvas.closest("[data-sweep-scroll-container]");
+    if (container) container.scrollTop = container.scrollHeight; // reveal the newest row as it arrives
+  }
+
+  _paintRow(ctx, row, width, y) {
     const rowImage = ctx.createImageData(width, 1);
     for (let i = 0; i < width; i++) {
       const db = row.power_db[i];
@@ -386,7 +501,7 @@ class SdrHubPanel extends HTMLElement {
       rowImage.data[i * 4 + 2] = b;
       rowImage.data[i * 4 + 3] = 255;
     }
-    ctx.putImageData(rowImage, 0, 0);
+    ctx.putImageData(rowImage, 0, y);
   }
 
   // ── forms ────────────────────────────────────────────────────────────────

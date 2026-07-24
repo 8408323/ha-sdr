@@ -12,6 +12,13 @@ DEFAULT_SAMPLE_RATE_HZ: float = 2.4e6
 DEFAULT_GAIN_DB: float = 30.0
 FFT_SIZE: int = 2048
 
+# RTL2832U/R820T direct-conversion tuners leak the local oscillator into the ADC, producing
+# a spurious "DC spike" at the exact center frequency of every capture window - a hardware
+# artifact, not a real signal (every SDR waterfall tool has this, e.g. SDR#/GQRX). Since a
+# wideband sweep retunes every sample_rate Hz, this shows up as one fake blob per step,
+# evenly spaced. Blank this many bins on each side of the FFT's center bin before display.
+DC_SPIKE_BLANK_BINS: int = 2
+
 # readStream returning a negative SoapySDR error code (timeout, overflow, ...) is common
 # and usually transient during a long sweep (confirmed empirically: a real sweep hit
 # OVERFLOW (-4) mid-run with no other sign of trouble) - only treat it as a fatal,

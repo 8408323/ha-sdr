@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from constants import DEFAULT_GAIN_DB, DEFAULT_HOP_INTERVAL_S, DEFAULT_SAMPLE_RATE_HZ
+from constants import DEFAULT_GAIN_DB, DEFAULT_HOP_INTERVAL_S, DEFAULT_SAMPLE_RATE_HZ, FFT_SIZE
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -49,6 +49,13 @@ class SweepCreate(BaseModel):
     def _validate_range(self) -> SweepCreate:
         if self.stop_hz <= self.start_hz:
             raise ValueError("stop_hz must be greater than start_hz")
+        # A positive range narrower than one FFT bin (bin_hz = sample_rate/FFT_SIZE, e.g.
+        # ~1.17kHz at the default sample rate) passed the check above but still produces
+        # n_bins_total == 0 in the scanner - an empty power_db that crashes the panel's
+        # getImageData/createImageData calls (zero width) instead of just failing to start.
+        bin_hz = self.sample_rate / FFT_SIZE
+        if (self.stop_hz - self.start_hz) < bin_hz:
+            raise ValueError(f"range must be at least one bin wide ({bin_hz:.1f} Hz at this sample rate)")
         return self
 
 
