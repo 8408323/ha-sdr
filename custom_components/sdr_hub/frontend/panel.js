@@ -92,8 +92,17 @@ const MIN_SCROLL_ROWS = 100; // floor even for a pathologically wide row, so it'
 // comfortably under the documented/tested limit in every major engine (Chromium, Firefox,
 // Safari all support at least this on both axes), so cap by it in addition to the memory budget.
 const MAX_CANVAS_HEIGHT_PX = 16384;
-const scrollRowCapForWidth = (width) =>
-  Math.min(MAX_CANVAS_HEIGHT_PX, Math.max(MIN_SCROLL_ROWS, Math.floor(SCROLL_HISTORY_BUDGET_BYTES / (width * 8))));
+// A height-only cap still lets a *wide* sweep produce a canvas whose total pixel area is too
+// big for mobile WebKit even though neither side alone hits MAX_CANVAS_HEIGHT_PX - e.g. an
+// 8192-bin sweep's memory-budget cap alone allows ~3200 rows, an 8192x3200 (~26Mpx) canvas,
+// which exceeds the ~16Mpx (4096x4096) area iOS Safari/HA Companion WebViews are documented to
+// reliably support regardless of per-side limits. Bound the row cap by area too, not just height.
+const MAX_CANVAS_AREA_PX = 4096 * 4096;
+const scrollRowCapForWidth = (width) => {
+  const memoryCap = Math.floor(SCROLL_HISTORY_BUDGET_BYTES / (width * 8));
+  const areaCap = Math.floor(MAX_CANVAS_AREA_PX / Math.max(1, width));
+  return Math.max(MIN_SCROLL_ROWS, Math.min(MAX_CANVAS_HEIGHT_PX, memoryCap, areaCap));
+};
 const MAX_DECODED_LOG = 50;
 
 class SdrHubPanel extends HTMLElement {
@@ -747,6 +756,12 @@ class SdrHubPanel extends HTMLElement {
     ev.preventDefault();
     const form = new FormData(ev.target);
     const wantsScroll = form.get("scroll_mode") === "on"; // unchecked checkboxes are absent from FormData
+    // Only true once a new sweep id actually exists and had scroll mode applied to it - a
+    // rejected add_sweep (busy dongle, validation error) has no sweep to apply it to, and
+    // forcing a rebuild in that case would pointlessly bypass _renderSweeps()'s no-op guard and
+    // replay every *other* already-rendered sweep's full retained history, which is exactly the
+    // expensive-redraw problem that guard exists to avoid.
+    let forceRebuild = false;
     try {
       const sweep = await this._callWS({
         type: "sdr_hub/add_sweep",
@@ -758,19 +773,22 @@ class SdrHubPanel extends HTMLElement {
       // Pre-select scroll mode before _loadState()/_renderSweeps() ever creates this sweep's
       // canvas, so it's built at the right size from its very first row instead of the user
       // having to find and check the box after the fact.
-      if (wantsScroll && sweep && sweep.id) this._scrollMode[sweep.id] = true;
+      if (wantsScroll && sweep && sweep.id) {
+        this._scrollMode[sweep.id] = true;
+        forceRebuild = true;
+      }
       this._showError("");
     } catch (err) {
       this._showError(`Could not start sweep: ${err.message || err}`);
     }
-    // The add-on's own state_changed broadcast for this new sweep can arrive and trigger a
-    // _loadState() (via _handleEvent) before this call's own add_sweep response resolves above -
-    // that earlier, racing _loadState() already builds and caches this sweep's canvas in live
-    // mode (since _scrollMode[sweep.id] wasn't set yet at that point). The no-op-refresh skip in
-    // _renderSweeps() then sees an unchanged id/status set on THIS call's own _loadState() and
-    // skips rebuilding, silently discarding the scroll-mode selection just made above. Force a
-    // rebuild whenever scroll mode was requested so it actually takes effect.
-    await this._loadState(wantsScroll);
+    // The add-on's own state_changed broadcast for a successfully-created sweep can arrive and
+    // trigger a _loadState() (via _handleEvent) before this call's own add_sweep response
+    // resolves above - that earlier, racing _loadState() already builds and caches the new
+    // sweep's canvas in live mode (since _scrollMode[sweep.id] wasn't set yet at that point). The
+    // no-op-refresh skip in _renderSweeps() then sees an unchanged id/status set on THIS call's
+    // own _loadState() and skips rebuilding, silently discarding the scroll-mode selection just
+    // made above. Force a rebuild only in that specific case so it actually takes effect.
+    await this._loadState(forceRebuild);
   }
 
   async _onRemoveSweep(sweepId) {
