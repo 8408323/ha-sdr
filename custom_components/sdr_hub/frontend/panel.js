@@ -272,8 +272,13 @@ class SdrHubPanel extends HTMLElement {
         this._onRemoveSweep(s.id),
       );
       this._wireCanvasHover(s.id);
+      // The canvas element (and its bitmap) is fresh after this rerender — replay the
+      // retained history oldest-to-newest so the full waterfall reappears instead of just
+      // the latest row, matching what hover (which reads the same history) implies is there.
       const rows = this._sweepRowHistory[s.id];
-      if (rows && rows.length > 0) this._drawWaterfallRow(rows[0]);
+      if (rows) {
+        for (let i = rows.length - 1; i >= 0; i--) this._drawWaterfallRow(rows[i]);
+      }
     }
   }
 

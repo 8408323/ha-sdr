@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import voluptuous as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.service import async_register_admin_service
@@ -46,10 +47,17 @@ def async_register(hass: HomeAssistant) -> None:
         return
 
     def _current_api():
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if not entries:
-            raise HomeAssistantError("SDR Hub is not configured")
-        return entries[0].runtime_data.api
+        # async_entries() returns entries regardless of load state, and this integration
+        # never unregisters these services on unload — a stale/unloaded entry has no
+        # runtime_data, so both must be checked or a disabled/unloaded config entry turns
+        # into an AttributeError instead of a clean user-facing message.
+        entry = next(
+            (e for e in hass.config_entries.async_entries(DOMAIN) if e.state is ConfigEntryState.LOADED),
+            None,
+        )
+        if entry is None or not hasattr(entry, "runtime_data"):
+            raise HomeAssistantError("SDR Hub is not loaded")
+        return entry.runtime_data.api
 
     async def _async_handle_add_receiver(call: ServiceCall) -> None:
         try:

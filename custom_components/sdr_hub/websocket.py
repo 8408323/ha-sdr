@@ -11,6 +11,7 @@ import logging
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 
 from .api import SdrHubApiError
@@ -20,8 +21,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _coordinator(hass: HomeAssistant):
-    entries = hass.config_entries.async_entries(DOMAIN)
-    return entries[0].runtime_data if entries else None
+    # async_entries() returns entries regardless of load state, and a disabled/unloaded
+    # entry has no runtime_data — checking both avoids an AttributeError in place of the
+    # clean "not_loaded" response every caller here already handles.
+    entry = next(
+        (e for e in hass.config_entries.async_entries(DOMAIN) if e.state is ConfigEntryState.LOADED),
+        None,
+    )
+    if entry is None or not hasattr(entry, "runtime_data"):
+        return None
+    return entry.runtime_data
 
 
 @websocket_api.websocket_command({vol.Required("type"): "sdr_hub/get_state"})
@@ -33,9 +42,11 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
         return
     # The panel calls this to reload authoritative state after a "status" event (e.g. a
     # receiver/sweep died) — the coordinator's cache is only refreshed on its own 30s poll
-    # interval otherwise, so without this the panel could show stale devices/receivers/sweeps
-    # for up to 30s after a change.
-    await coordinator.async_request_refresh()
+    # interval otherwise. Uses async_refresh() (not the debounced async_request_refresh())
+    # since a status event can arrive within another recent refresh's debounce cooldown
+    # (e.g. right after a mutating command), where the debounced call would be coalesced
+    # away and this would still serve pre-event stale data.
+    await coordinator.async_refresh()
     connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
 
 
