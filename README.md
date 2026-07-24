@@ -55,7 +55,39 @@ dongle — only time-sliced, or with a second dongle.
 The add-on models this as a pool of dongles, where **v1's actual behavior is
 strictly one owner (one receiver, or one sweep) per dongle at a time** —
 claiming an already-claimed dongle returns a 409 conflict. With N dongles
-attached, up to N receivers/sweeps can run concurrently, one per dongle.
+attached, up to N receivers/sweeps can run concurrently, one per dongle —
+this already covers the common "watch 433MHz and 868MHz at the same time"
+case as long as a second dongle is attached; see
+[#3](https://github.com/8408323/ha-sdr/issues/3) for what's still needed to
+use it in practice (multi-dongle passthrough, multi-brand support below).
+
+**Multiple brands:** device discovery isn't limited to RTL-SDR — any
+SoapySDR-supported device attached to the host is enumerated and can run a
+wideband sweep. The add-on image ships driver modules for RTL-SDR, HackRF,
+and Airspy out of the box (`addon/sdr_hub/Dockerfile`); other SoapySDR
+backends (BladeRF, USRP/UHD, ...) work too if you rebuild the image with
+their module added (`soapysdr-module-all` pulls in everything Debian
+packages). **SDRplay is not included** and can't be added the same way — its
+driver depends on a proprietary binary (`libsdrplay`) that isn't in Debian's
+archive at all, so it would need to be installed separately in the image.
+`rtl_433` receivers are the one exception regardless of what's installed:
+`rtl_433` talks to RTL-SDR hardware directly, not through SoapySDR, so
+receivers only work on a device whose driver is `rtlsdr` — the panel's
+receiver dongle picker only lists those; other devices show "(sweeps only)"
+in the dongles table.
+
+**Duplicate serials:** cheap RTL2832U clones commonly ship with an identical
+or blank factory serial. SoapySDR can't tell two such dongles apart by
+serial, and neither can this add-on — attaching two of them at once fails
+with "more than one attached dongle reports serial ... — can't disambiguate"
+rather than silently guessing which one a request meant. Fix it once per
+dongle (with only that one attached at a time):
+
+```sh
+rtl_eeprom -s <a-unique-serial>
+```
+
+then reattach and the pool will see it as a distinct device.
 
 **Roadmap (not yet implemented):** receivers that fall inside the same
 capture window sharing that window, and time-multiplexing receivers that

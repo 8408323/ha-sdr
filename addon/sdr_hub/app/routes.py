@@ -4,7 +4,12 @@ import logging
 
 from auth import verify_token
 from broadcaster import Broadcaster
-from device_manager import DongleBusyError, DongleNotFoundError, DuplicateDongleSerialError
+from device_manager import (
+    DongleBusyError,
+    DongleNotFoundError,
+    DuplicateDongleSerialError,
+    UnsupportedReceiverDriverError,
+)
 from fastapi import (
     APIRouter,
     Depends,
@@ -45,6 +50,8 @@ async def create_receiver(cfg: ReceiverCreate, request: Request) -> Receiver:
     except DongleNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
     except DuplicateDongleSerialError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except UnsupportedReceiverDriverError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
 

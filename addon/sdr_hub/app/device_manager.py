@@ -6,7 +6,7 @@ import uuid
 from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
-from devices import discover_dongles
+from devices import Dongle, discover_dongles
 from models import (
     EntityKind,
     EntityStatus,
@@ -38,7 +38,27 @@ class DuplicateDongleSerialError(Exception):
     """
 
     def __init__(self, serial: str) -> None:
-        super().__init__(f"more than one attached dongle reports serial {serial!r} — can't disambiguate")
+        super().__init__(
+            f"more than one attached dongle reports serial {serial!r} — can't disambiguate. "
+            "Cheap RTL2832U clones often ship with an identical or blank factory serial; "
+            "reprogram each dongle with a unique one via `rtl_eeprom -s <new_serial>` "
+            "(one dongle attached at a time) and reattach."
+        )
+
+
+class UnsupportedReceiverDriverError(Exception):
+    """rtl_433 talks to RTL-SDR hardware directly (via librtlsdr), not through SoapySDR - a
+    receiver can't be started on a dongle whose SoapySDR driver isn't "rtlsdr" (e.g. a HackRF
+    or Airspy discovered for wideband sweeps), even though sweeps work with any SoapySDR-
+    supported device. Surfacing this clearly here avoids a confusing failure deep inside the
+    rtl_433 subprocess once it can't find the device at all.
+    """
+
+    def __init__(self, serial: str, driver: str) -> None:
+        super().__init__(
+            f"dongle {serial} uses SoapySDR driver {driver!r}, not 'rtlsdr' - rtl_433 receivers "
+            "only work with actual RTL-SDR hardware; use a wideband sweep for this device instead"
+        )
 
 
 class DeviceManager:
@@ -60,7 +80,11 @@ class DeviceManager:
         self._on_row = on_row
         self._on_device = on_device
         self._on_status = on_status
-        self._dongle_owner: dict[str, str] = {}  # serial -> receiver/sweep id
+        # (driver, serial) -> receiver/sweep id. Keyed by the pair, not serial alone - two
+        # devices from *different* SoapySDR drivers (or two devices that both omit a serial,
+        # reporting "") can otherwise collide on the same key despite being genuinely distinct
+        # hardware, which would make claiming one incorrectly appear to also claim the other.
+        self._dongle_owner: dict[tuple[str, str], str] = {}
         self._decoders: dict[str, Rtl433Decoder] = {}
         self._receivers: dict[str, Receiver] = {}
         self._sweepers: dict[str, SoapySweeper] = {}
@@ -68,29 +92,47 @@ class DeviceManager:
 
     def list_dongles(self) -> list[dict]:
         return [
-            {"serial": d.serial, "label": d.label, "in_use_by": self._dongle_owner.get(d.serial)}
+            {
+                "serial": d.serial,
+                "label": d.label,
+                "driver": d.driver,
+                "in_use_by": self._dongle_owner.get((d.driver, d.serial)),
+            }
             for d in discover_dongles()
         ]
 
-    def _claim(self, serial: str, owner_id: str) -> None:
-        serials = [d.serial for d in discover_dongles()]
-        if serial not in serials:
+    def _claim(self, serial: str, owner_id: str, driver: str | None = None) -> Dongle:
+        """Claims the attached device matching `serial` (and `driver`, if given).
+
+        `driver` is normally omitted - a bare serial is unambiguous for the overwhelming
+        majority of setups (one attached device per serial). It only needs to be supplied
+        when multiple attached devices share that serial across *different* SoapySDR drivers
+        (or all report a blank one), which `serial` alone can't disambiguate.
+        """
+        dongles = discover_dongles()
+        matches = [d for d in dongles if d.serial == serial and (driver is None or d.driver == driver)]
+        if not matches:
             raise DongleNotFoundError(serial)
-        if serials.count(serial) > 1:
+        if len(matches) > 1:
             raise DuplicateDongleSerialError(serial)
-        current_owner = self._dongle_owner.get(serial)
+        dongle = matches[0]
+        key = (dongle.driver, dongle.serial)
+        current_owner = self._dongle_owner.get(key)
         if current_owner is not None:
             raise DongleBusyError(serial, current_owner)
-        self._dongle_owner[serial] = owner_id
+        self._dongle_owner[key] = owner_id
+        return dongle
 
-    def _release(self, serial: str, owner_id: str) -> None:
+    def _release(self, driver: str, serial: str, owner_id: str) -> None:
         """Only clears the claim if `owner_id` still holds it.
 
         Without this check, releasing an already-stale (e.g. errored-and-since-replaced)
-        entity could pop a *different*, currently-valid owner's claim on the same serial.
+        entity could pop a *different*, currently-valid owner's claim on the same
+        (driver, serial).
         """
-        if self._dongle_owner.get(serial) == owner_id:
-            self._dongle_owner.pop(serial, None)
+        key = (driver, serial)
+        if self._dongle_owner.get(key) == owner_id:
+            self._dongle_owner.pop(key, None)
 
     # -- Receivers (rtl_433) ----------------------------------------------
 
@@ -99,7 +141,10 @@ class DeviceManager:
 
     async def add_receiver(self, cfg: ReceiverCreate) -> Receiver:
         receiver_id = str(uuid.uuid4())
-        self._claim(cfg.dongle_serial, receiver_id)
+        dongle = self._claim(cfg.dongle_serial, receiver_id, cfg.dongle_driver)
+        if dongle.driver != "rtlsdr":
+            self._release(dongle.driver, cfg.dongle_serial, receiver_id)
+            raise UnsupportedReceiverDriverError(cfg.dongle_serial, dongle.driver)
         decoder = Rtl433Decoder(
             config=ReceiverConfig(
                 dongle_serial=cfg.dongle_serial,
@@ -113,10 +158,13 @@ class DeviceManager:
         try:
             await decoder.start()
         except Exception:
-            self._release(cfg.dongle_serial, receiver_id)
+            self._release(dongle.driver, cfg.dongle_serial, receiver_id)
             raise
         self._decoders[receiver_id] = decoder
-        receiver = Receiver(id=receiver_id, **cfg.model_dump())
+        # dongle.driver (the actually-resolved device), not cfg.dongle_driver (the caller's
+        # optional hint, usually None) - remove_receiver/_on_receiver_exit need the real value
+        # later to release the correct (driver, serial) claim, not whatever hint was or wasn't given.
+        receiver = Receiver(id=receiver_id, **{**cfg.model_dump(), "dongle_driver": dongle.driver})
         self._receivers[receiver_id] = receiver
         return receiver
 
@@ -127,7 +175,7 @@ class DeviceManager:
         decoder = self._decoders.pop(receiver_id, None)
         if decoder is not None:
             await decoder.stop()
-        self._release(receiver.dongle_serial, receiver_id)
+        self._release(receiver.dongle_driver, receiver.dongle_serial, receiver_id)
 
     def _on_receiver_exit(self, receiver_id: str, returncode: int | None) -> None:
         receiver = self._receivers.get(receiver_id)
@@ -136,7 +184,7 @@ class DeviceManager:
         _LOGGER.error("receiver %s (rtl_433) exited unexpectedly with code %s", receiver_id, returncode)
         receiver.status = EntityStatus.ERROR
         self._decoders.pop(receiver_id, None)
-        self._release(receiver.dongle_serial, receiver_id)
+        self._release(receiver.dongle_driver, receiver.dongle_serial, receiver_id)
         self._on_status(EntityKind.RECEIVER, receiver_id, EntityStatus.ERROR, f"rtl_433 exited with code {returncode}")
 
     # -- Sweeps (SoapySDR wideband) -----------------------------------------
@@ -146,7 +194,7 @@ class DeviceManager:
 
     async def add_sweep(self, cfg: SweepCreate) -> Sweep:
         sweep_id = str(uuid.uuid4())
-        self._claim(cfg.dongle_serial, sweep_id)
+        dongle = self._claim(cfg.dongle_serial, sweep_id, cfg.dongle_driver)
         sweeper = SoapySweeper(
             on_row=lambda row: self._loop.call_soon_threadsafe(self._on_row, sweep_id, row),
             on_error=lambda err: self._loop.call_soon_threadsafe(self._on_sweep_error, sweep_id, err),
@@ -160,13 +208,17 @@ class DeviceManager:
                     stop_hz=cfg.stop_hz,
                     sample_rate=cfg.sample_rate,
                     gain=cfg.gain,
+                    soapy_args=dongle.args,
                 )
             )
         except Exception:
-            self._release(cfg.dongle_serial, sweep_id)
+            self._release(dongle.driver, cfg.dongle_serial, sweep_id)
             raise
         self._sweepers[sweep_id] = sweeper
-        sweep = Sweep(id=sweep_id, **cfg.model_dump())
+        # dongle.driver (the actually-resolved device), not cfg.dongle_driver (the caller's
+        # optional hint, usually None) - the various release call sites below need the real
+        # value later, not whatever hint was or wasn't given at creation time.
+        sweep = Sweep(id=sweep_id, **{**cfg.model_dump(), "dongle_driver": dongle.driver})
         self._sweeps[sweep_id] = sweep
         return sweep
 
@@ -191,7 +243,7 @@ class DeviceManager:
             sweeper.stop()  # raises SweepStopTimeoutError if the thread is still alive
             self._sweepers.pop(sweep_id, None)
         self._sweeps.pop(sweep_id, None)
-        self._release(sweep.dongle_serial, sweep_id)
+        self._release(sweep.dongle_driver, sweep.dongle_serial, sweep_id)
 
     def _on_sweep_late_stop(self, sweep_id: str) -> None:
         """Cleans up a sweep whose stop() timed out earlier but whose thread has now exited.
@@ -208,7 +260,7 @@ class DeviceManager:
         self._sweepers.pop(sweep_id, None)
         if sweep is None:
             return
-        self._release(sweep.dongle_serial, sweep_id)
+        self._release(sweep.dongle_driver, sweep.dongle_serial, sweep_id)
         _LOGGER.info("sweep %s's capture thread exited after a delayed stop; dongle released", sweep_id)
         self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.STOPPED, "stopped after a delayed shutdown")
 
@@ -219,7 +271,7 @@ class DeviceManager:
         _LOGGER.error("sweep %s failed: %s", sweep_id, err)
         sweep.status = EntityStatus.ERROR
         self._sweepers.pop(sweep_id, None)
-        self._release(sweep.dongle_serial, sweep_id)
+        self._release(sweep.dongle_driver, sweep.dongle_serial, sweep_id)
         self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.ERROR, str(err))
 
     async def shutdown(self) -> None:

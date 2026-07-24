@@ -23,6 +23,10 @@ SERVICE_REMOVE_SWEEP = "remove_sweep"
 _ADD_RECEIVER_SCHEMA = vol.Schema(
     {
         vol.Required("dongle_serial"): str,
+        # See addon/sdr_hub/app/models.py's ReceiverCreate.dongle_driver - optional
+        # disambiguator, only needed when dongle_serial alone matches more than one attached
+        # device (different SoapySDR drivers, or both omitting a serial).
+        vol.Optional("dongle_driver"): vol.Any(str, None),
         vol.Required("frequencies_hz"): [vol.Coerce(float)],
         vol.Optional("protocols", default=[]): [int],
         # Same rationale as websocket.py's identical field: decode.py passes this straight
@@ -35,6 +39,8 @@ _REMOVE_RECEIVER_SCHEMA = vol.Schema({vol.Required("receiver_id"): str})
 _ADD_SWEEP_SCHEMA = vol.Schema(
     {
         vol.Required("dongle_serial"): str,
+        # See _ADD_RECEIVER_SCHEMA's dongle_driver above - same optional disambiguator.
+        vol.Optional("dongle_driver"): vol.Any(str, None),
         vol.Required("start_hz"): vol.Coerce(float),
         vol.Required("stop_hz"): vol.Coerce(float),
         # min_included=False rejects 0 too, not just negatives - a zero sample rate divides by
