@@ -1,0 +1,44 @@
+# Secrets / local config — never commit
+.env
+.env.*
+!.env.example
+secrets.yaml
+*.token
+
+# Raw SDR captures (large, IQ sample dumps)
+*.iq
+*.cu8
+*.cs8
+*.cfile
+*.wav
+captures/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node (frontend tooling, if added)
+node_modules/
+dist/
+
+# Editor
+.vscode/
+*.swp
+
+# Local AI session task tracking
+.todo
+plan.md
+
+# dotclaude:begin
+.claude/plans/
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+# dotclaude:end
