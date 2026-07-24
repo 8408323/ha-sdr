@@ -15,6 +15,7 @@ from constants import (
     DEFAULT_SAMPLE_RATE_HZ,
     FFT_SIZE,
     MAX_CONSECUTIVE_READ_ERRORS,
+    MAX_NATIVE_BINS,
     MAX_ROW_POINTS,
 )
 from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
@@ -194,6 +195,27 @@ class SoapySweeper:
                     config.sample_rate,
                     sample_rate,
                 )
+            # SweepCreate's model validator already checked these bounds in models.py, but only
+            # against the *requested* sample_rate - if this device snapped it to something else,
+            # that earlier check no longer reflects reality: a request valid only because it
+            # asked for an unsupported high rate (bin_hz shrinks, so a huge range's bin count
+            # stayed under MAX_NATIVE_BINS) can snap down to a much lower rate and balloon past
+            # the limit here instead - or a narrow range valid at a high rate can snap down and
+            # produce zero usable bins. Re-check with the rate actually in effect before
+            # allocating anything.
+            bin_hz = sample_rate / FFT_SIZE
+            if (config.stop_hz - config.start_hz) < bin_hz:
+                raise ValueError(
+                    f"range must be at least one bin wide ({bin_hz:.1f} Hz) at this device's actual "
+                    f"sample rate of {sample_rate:.0f} Hz ({config.sample_rate:.0f} Hz was requested)"
+                )
+            n_bins_total = int((config.stop_hz - config.start_hz) / bin_hz)
+            if n_bins_total > MAX_NATIVE_BINS:
+                raise ValueError(
+                    f"range too wide at this device's actual sample rate of {sample_rate:.0f} Hz "
+                    f"({config.sample_rate:.0f} Hz was requested): {n_bins_total} native bins exceeds "
+                    f"the {MAX_NATIVE_BINS} limit"
+                )
             sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
             sdr.setGain(SOAPY_SDR_RX, 0, config.gain)
             rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
@@ -204,8 +226,6 @@ class SoapySweeper:
                 self._on_error(err)
             return
 
-        bin_hz = sample_rate / FFT_SIZE
-        n_bins_total = int((config.stop_hz - config.start_hz) / bin_hz)
         half_span = sample_rate / 2
         window = np.hanning(FFT_SIZE)
         buf = np.zeros(FFT_SIZE, np.complex64)

@@ -319,7 +319,14 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _renderDongleOptions(select, { rtlsdrOnly = false } = {}) {
-    const current = select.value;
+    // Captures both serial and driver of the previously-selected option, not just its value -
+    // two devices from different SoapySDR drivers can share the same serial (or both omit
+    // one), so restoring by value alone would always land on the *first* matching option
+    // regardless of which one the user actually had selected, silently switching the target
+    // device on a later re-render (e.g. after an unrelated state_changed refresh).
+    const previousOption = select.selectedOptions[0];
+    const previousSerial = previousOption ? previousOption.value : "";
+    const previousDriver = previousOption ? previousOption.dataset.driver : "";
     // rtl_433 receivers only work with actual RTL-SDR hardware (see
     // UnsupportedReceiverDriverError) - filtering the receiver form's dropdown to just those
     // avoids the user picking e.g. a HackRF there and hitting a confusing rejection after
@@ -337,7 +344,16 @@ class SdrHubPanel extends HTMLElement {
     select.innerHTML = devices
       .map((d) => `<option value="${esc(d.serial)}" data-driver="${esc(d.driver || "")}">${esc(d.label || d.serial)}</option>`)
       .join("");
-    if (current) select.value = current;
+    if (previousSerial) {
+      const options = [...select.options];
+      // Prefer an exact (serial, driver) match; fall back to serial-only if that specific
+      // device is no longer listed (e.g. it was unplugged and a different-driver device
+      // happens to share its serial) - better to select *something* plausible than nothing.
+      const match =
+        options.find((o) => o.value === previousSerial && o.dataset.driver === previousDriver) ||
+        options.find((o) => o.value === previousSerial);
+      if (match) match.selected = true;
+    }
   }
 
   _renderDongles() {
