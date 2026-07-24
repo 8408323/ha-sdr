@@ -220,6 +220,7 @@ class SdrHubPanel extends HTMLElement {
     if (this._loadStateErrorShowing) this._showError("");
     this._state = state;
     this._renderDongles();
+    this._renderCoverage();
     this._renderSweeps(forceRebuildSweeps);
     this._renderReceivers();
   }
@@ -279,6 +280,11 @@ class SdrHubPanel extends HTMLElement {
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Dongles</h2>
           <div id="sdr-hub-dongles"></div>
+        </div>
+
+        <div style="${CARD}">
+          <h2 style="margin:0 0 8px;font-size:1.1rem;">Band coverage</h2>
+          <div id="sdr-hub-coverage"></div>
         </div>
 
         <div style="${CARD}">
@@ -358,6 +364,79 @@ class SdrHubPanel extends HTMLElement {
         options.find((o) => o.value === previousSerial);
       if (match) match.selected = true;
     }
+  }
+
+  // Sweeps have a real frequency *range* (start_hz-stop_hz); receivers instead have a list of
+  // discrete frequencies_hz they hop between (rtl_433 tunes a narrow window per frequency, not
+  // a continuous span) - drawn as thin point markers rather than filled segments so the two
+  // are visually distinct at a glance, which is the whole point of this view (issue #3 item
+  // #6: see all active captures' coverage together instead of mentally tracking N separate
+  // cards). Auto-scales to whatever is currently active, with padding, rather than a fixed
+  // "full tunable range" - different SoapySDR devices cover wildly different ranges (a
+  // few MHz for some, 6GHz for a HackRF), so there's no one sensible fixed span to show.
+  _renderCoverage() {
+    const el = this.querySelector("#sdr-hub-coverage");
+    if (!el) return;
+    const sweeps = this._state.sweeps || [];
+    const receivers = this._state.receivers || [];
+    const segments = sweeps.map((s) => ({
+      start: s.start_hz,
+      stop: s.stop_hz,
+      error: s.status === "error",
+      label: `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz sweep on ${s.dongle_serial}`,
+    }));
+    const points = [];
+    for (const r of receivers) {
+      for (const freq of r.frequencies_hz) {
+        points.push({ freq, error: r.status === "error", label: `${fmtMHz(freq)} MHz receiver on ${r.dongle_serial}` });
+      }
+    }
+    if (segments.length === 0 && points.length === 0) {
+      el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps or receivers.</p>`;
+      return;
+    }
+    const allHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
+    const minHz = Math.min(...allHz);
+    const maxHz = Math.max(...allHz);
+    // A floor on the considered span, not just (max-min), so a single sweep/receiver (span 0
+    // or narrow) still gets sensible padding instead of the bar being all padding.
+    const span = Math.max(maxHz - minHz, 1e6);
+    const pad = span * 0.08;
+    const rangeStart = Math.max(0, minHz - pad);
+    const rangeStop = maxHz + pad;
+    const rangeSpan = rangeStop - rangeStart;
+    const pct = (hz) => ((hz - rangeStart) / rangeSpan) * 100;
+    const SWEEP_COLOR = "var(--primary-color,#03a9f4)";
+    const ERROR_COLOR = "var(--error-color,#db4437)";
+    const segmentHtml = segments
+      .map((s) => {
+        const left = pct(s.start);
+        // Floors the drawn width so a very narrow sweep is still visible/hoverable rather than
+        // collapsing to a sliver at this bar's pixel scale.
+        const width = Math.max(pct(s.stop) - left, 0.4);
+        return `<div title="${esc(s.label)}" style="position:absolute;left:${left}%;width:${width}%;top:6px;bottom:6px;background:${s.error ? ERROR_COLOR : SWEEP_COLOR};border-radius:3px;opacity:${s.error ? 0.6 : 0.85};"></div>`;
+      })
+      .join("");
+    const pointHtml = points
+      .map((p) => {
+        const left = pct(p.freq);
+        return `<div title="${esc(p.label)}" style="position:absolute;left:${left}%;top:0;bottom:0;width:2px;margin-left:-1px;background:${p.error ? ERROR_COLOR : "var(--secondary-text-color,#727272)"};"></div>`;
+      })
+      .join("");
+    el.innerHTML = `
+      <div style="position:relative;height:32px;background:var(--secondary-background-color,#fafafa);border-radius:6px;margin-bottom:4px;">
+        ${segmentHtml}
+        ${pointHtml}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:.75rem;color:var(--secondary-text-color,#727272);">
+        <span>${fmtMHz(rangeStart)} MHz</span>
+        <span>${fmtMHz(rangeStop)} MHz</span>
+      </div>
+      <div style="display:flex;gap:12px;font-size:.75rem;color:var(--secondary-text-color,#727272);margin-top:4px;flex-wrap:wrap;">
+        <span><span style="display:inline-block;width:10px;height:10px;background:${SWEEP_COLOR};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Sweep range</span>
+        <span><span style="display:inline-block;width:2px;height:10px;background:var(--secondary-text-color,#727272);vertical-align:middle;margin-right:5px;"></span>Receiver frequency</span>
+      </div>
+    `;
   }
 
   _renderDongles() {
