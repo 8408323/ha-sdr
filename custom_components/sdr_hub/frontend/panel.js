@@ -97,6 +97,14 @@ class SdrHubPanel extends HTMLElement {
   connectedCallback() {
     if (!this._hass) return;
     if (!this.querySelector("#sdr-hub-root")) this._renderShell();
+    // hass's own "first assignment" branch only fires once ever, but HA can detach and
+    // reattach this same element (e.g. navigating away and back) without recreating it —
+    // disconnectedCallback already tore down the subscription, so without this a
+    // reconnected panel would silently show static (stale) state with no live updates.
+    if (!this._unsub) {
+      this._loadState();
+      this._subscribe();
+    }
   }
 
   disconnectedCallback() {

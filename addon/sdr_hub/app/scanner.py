@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 import SoapySDR
-from constants import DEFAULT_GAIN_DB, DEFAULT_SAMPLE_RATE_HZ, FFT_SIZE
+from constants import (
+    DEFAULT_GAIN_DB,
+    DEFAULT_SAMPLE_RATE_HZ,
+    FFT_SIZE,
+    MAX_CONSECUTIVE_READ_ERRORS,
+    MAX_ROW_POINTS,
+)
 from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +43,30 @@ class SweepRow:
     start_hz: float
     bin_hz: float
     power_db: list[float | None]  # None marks an unfilled gap (JSON null, not NaN)
+
+
+def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], float]:
+    """Converts a native-resolution row to JSON-safe output, downsampling if needed.
+
+    A row wider than MAX_ROW_POINTS is averaged down block-by-block (nanmean, so a
+    filled bin isn't dragged toward a neighboring gap) rather than delivered at native
+    resolution — native resolution scales with requested range width and a full-range
+    sweep is ~1.48M bins, which serializes into double-digit megabytes and silently
+    exceeds the WebSocket frame limit. Values are also rounded to 1 decimal place:
+    Python's float repr of a numpy float32 carries far more precision than a dB
+    reading needs, and unrounded is ~3x the JSON bytes for no real information gain.
+    """
+    n = len(row)
+    if n > MAX_ROW_POINTS:
+        factor = math.ceil(n / MAX_ROW_POINTS)
+        pad = (-n) % factor
+        if pad:
+            row = np.concatenate([row, np.full(pad, np.nan, dtype=row.dtype)])
+        with np.errstate(all="ignore"):  # nanmean warns on an all-NaN block; that's expected, not an error
+            row = np.nanmean(row.reshape(-1, factor), axis=1)
+        bin_hz = bin_hz * factor
+    power_db = [None if np.isnan(v) else round(float(v), 1) for v in row]
+    return power_db, bin_hz
 
 
 class SoapySweeper:
@@ -99,6 +130,7 @@ class SoapySweeper:
         half_span = config.sample_rate / 2
         window = np.hanning(FFT_SIZE)
         buf = np.zeros(FFT_SIZE, np.complex64)
+        consecutive_errors = 0
         try:
             while not self._stop_event.is_set():
                 row = np.full(n_bins_total, np.nan, dtype=np.float32)
@@ -112,6 +144,7 @@ class SoapySweeper:
                     sdr.setFrequency(SOAPY_SDR_RX, 0, center)
                     sr = sdr.readStream(rx, [buf], FFT_SIZE, timeoutUs=2_000_000)
                     if sr.ret > 0:
+                        consecutive_errors = 0
                         # A partial read still needs to produce an FFT_SIZE-bin spectrum so
                         # bin_hz/offset math stays valid — zero-pad rather than computing a
                         # shorter (and differently-spaced) FFT from just the samples we got.
@@ -130,18 +163,29 @@ class SoapySweeper:
                     elif sr.ret == 0:
                         _LOGGER.debug("readStream returned 0 (timeout) at %.3f MHz", center / 1e6)
                     else:
-                        # A negative return is a genuine SoapySDR error code (stream error,
-                        # overflow, corruption, ...), not a benign empty read — treat it as
-                        # fatal so the dongle claim gets released instead of spinning forever
-                        # on a stalled/unplugged device.
-                        raise RuntimeError(f"readStream error {sr.ret} at {center / 1e6:.3f} MHz")
+                        # A negative return is a genuine SoapySDR error code (timeout,
+                        # overflow, stream error, ...). Confirmed empirically that a single
+                        # OVERFLOW is a common, transient hiccup during a long sweep (USB/
+                        # scheduling jitter, not a dead device) — treat one as a gap in this
+                        # bin and move on. Only a *persistent* run of failures indicates the
+                        # dongle is actually gone, at which point release the claim rather
+                        # than silently spinning on it forever.
+                        consecutive_errors += 1
+                        _LOGGER.warning(
+                            "readStream error %d at %.3f MHz (%d consecutive)",
+                            sr.ret,
+                            center / 1e6,
+                            consecutive_errors,
+                        )
+                        if consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS:
+                            raise RuntimeError(
+                                f"readStream error {sr.ret} persisted for {consecutive_errors} "
+                                f"consecutive reads at {center / 1e6:.3f} MHz"
+                            )
                     center += config.sample_rate
                 if not self._stop_event.is_set():
-                    # NaN is not valid JSON (json.dumps emits a bare `NaN` token by default,
-                    # which a standards-compliant parser — e.g. the browser's JSON.parse —
-                    # rejects); represent an unfilled gap as null instead.
-                    power_db = [None if np.isnan(v) else float(v) for v in row]
-                    self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=bin_hz, power_db=power_db))
+                    power_db, out_bin_hz = _serialize_row(row, bin_hz)
+                    self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=out_bin_hz, power_db=power_db))
         except Exception as err:  # noqa: BLE001 - surface any runtime failure (e.g. dongle unplugged mid-sweep) to the caller
             _LOGGER.exception("sweep failed for dongle %s", config.dongle_serial)
             if self._on_error is not None:

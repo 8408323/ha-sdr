@@ -46,7 +46,7 @@ def async_register(hass: HomeAssistant) -> None:
     if hass.services.has_service(DOMAIN, SERVICE_ADD_RECEIVER):
         return
 
-    def _current_api():
+    def _current_coordinator():
         # async_entries() returns entries regardless of load state, and this integration
         # never unregisters these services on unload — a stale/unloaded entry has no
         # runtime_data, so both must be checked or a disabled/unloaded config entry turns
@@ -57,31 +57,45 @@ def async_register(hass: HomeAssistant) -> None:
         )
         if entry is None or not hasattr(entry, "runtime_data"):
             raise HomeAssistantError("SDR Hub is not loaded")
-        return entry.runtime_data.api
+        return entry.runtime_data
+
+    # A service call is a mutation from outside the panel's own WebSocket commands (which
+    # already refresh after a change) — an automation calling these otherwise leaves the
+    # status sensor and any open panel showing pre-change state until the next 30s poll or
+    # an unrelated status event. async_refresh() (not the debounced async_request_refresh())
+    # so it isn't coalesced away by a recent unrelated refresh.
 
     async def _async_handle_add_receiver(call: ServiceCall) -> None:
+        coordinator = _current_coordinator()
         try:
-            await _current_api().async_add_receiver(dict(call.data))
+            await coordinator.api.async_add_receiver(dict(call.data))
         except SdrHubApiError as err:
             raise HomeAssistantError(str(err)) from err
+        await coordinator.async_refresh()
 
     async def _async_handle_remove_receiver(call: ServiceCall) -> None:
+        coordinator = _current_coordinator()
         try:
-            await _current_api().async_remove_receiver(call.data["receiver_id"])
+            await coordinator.api.async_remove_receiver(call.data["receiver_id"])
         except SdrHubApiError as err:
             raise HomeAssistantError(str(err)) from err
+        await coordinator.async_refresh()
 
     async def _async_handle_add_sweep(call: ServiceCall) -> None:
+        coordinator = _current_coordinator()
         try:
-            await _current_api().async_add_sweep(dict(call.data))
+            await coordinator.api.async_add_sweep(dict(call.data))
         except SdrHubApiError as err:
             raise HomeAssistantError(str(err)) from err
+        await coordinator.async_refresh()
 
     async def _async_handle_remove_sweep(call: ServiceCall) -> None:
+        coordinator = _current_coordinator()
         try:
-            await _current_api().async_remove_sweep(call.data["sweep_id"])
+            await coordinator.api.async_remove_sweep(call.data["sweep_id"])
         except SdrHubApiError as err:
             raise HomeAssistantError(str(err)) from err
+        await coordinator.async_refresh()
 
     # These mutate hardware config (start/stop a sweep or receiver) — same admin-only bar as
     # the equivalent sdr_hub/* WebSocket commands the panel uses; a plain async_register would

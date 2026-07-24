@@ -55,7 +55,11 @@ class Broadcaster:
                 message = await queue.get()
                 await ws.send_json(message)
         except Exception:  # noqa: BLE001 - a broken client shouldn't affect others
-            _LOGGER.debug("WS writer failed, dropping client", exc_info=True)
+            # Visible by default (not debug-only): a send failure here means this client
+            # silently stops receiving all further data with no other signal anywhere -
+            # e.g. an oversized message being rejected previously surfaced only as a
+            # client stuck in a connect/disconnect loop with nothing to explain why.
+            _LOGGER.warning("WS writer failed, dropping client", exc_info=True)
         finally:
             # Self-cleanup on send failure/cancellation; harmless if discard() already
             # removed these entries (e.g. it triggered this task's cancellation).
