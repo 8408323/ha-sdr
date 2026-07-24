@@ -39,6 +39,9 @@ class ReceiverCreate(BaseModel):
     # and all report an empty one) - the panel always sends the driver of whichever specific
     # device it displayed, so a plain serial match is normally unambiguous and this is unset.
     dongle_driver: str | None = None
+    # User-given friendly name shown in the panel/coverage view instead of/alongside raw
+    # frequencies - purely cosmetic, never interpreted by the add-on itself.
+    label: str | None = None
     frequencies_hz: list[float] = Field(..., min_length=1)
     protocols: list[int] = Field(default_factory=list)
     hop_interval_s: int = DEFAULT_HOP_INTERVAL_S
@@ -53,6 +56,8 @@ class SweepCreate(BaseModel):
     dongle_serial: str
     # See ReceiverCreate.dongle_driver - same optional disambiguator, same reasoning.
     dongle_driver: str | None = None
+    # See ReceiverCreate.label - same purely-cosmetic friendly name.
+    label: str | None = None
     start_hz: float
     stop_hz: float
     sample_rate: float = DEFAULT_SAMPLE_RATE_HZ
