@@ -82,6 +82,7 @@ function sequentialColor(t) {
 // not something another client or an automation needs to see.
 const SWEEP_FORM_PREFS_KEY = "sdr_hub_sweep_form_prefs";
 const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
+const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 
 function loadFormPrefs(key) {
   try {
@@ -218,6 +219,7 @@ class SdrHubPanel extends HTMLElement {
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
+    this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._unsub = null;
     this._subscribing = false;
     this._loadStateRequestId = 0; // guards against overlapping _loadState() calls resolving out of order
@@ -391,9 +393,27 @@ class SdrHubPanel extends HTMLElement {
     this._renderedSweepStatusKey = null;
     const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
     const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
+    // "Dismissed" only skips showing it by default on load - the Help button in the header
+    // always reopens it, so dismissing is never a one-way door for a first-time user who
+    // dismissed too quickly or wants a refresher later.
+    const helpDismissed = localStorage.getItem(HELP_DISMISSED_KEY) === "true";
     this.innerHTML = `
       <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
-        <h1 style="font-size:1.4rem;margin:0 0 16px;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+          <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+          <button data-show-help style="${BTN_SECONDARY}">Help</button>
+        </div>
+        <div id="sdr-hub-help" style="${CARD};display:${helpDismissed ? "none" : "block"};">
+          <h2 style="margin:0 0 8px;font-size:1.1rem;">Getting started</h2>
+          <ul style="margin:0 0 12px;padding-left:20px;font-size:.9rem;line-height:1.6;">
+            <li><strong>Dongles</strong> — attached SDR hardware and what's currently using each one.</li>
+            <li><strong>Band coverage</strong> — an at-a-glance view of which frequencies are currently being watched.</li>
+            <li><strong>Wideband sweeps</strong> — a live spectrum waterfall across a frequency range you pick.</li>
+            <li><strong>Receivers (rtl_433)</strong> — decodes known device protocols (weather stations, sensors, remotes) at specific frequencies.</li>
+            <li><strong>Decoded devices</strong> — a log of what receivers have actually decoded.</li>
+          </ul>
+          <button data-dismiss-help style="${BTN}">Got it, don't show again</button>
+        </div>
         <div id="sdr-hub-error" style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
 
         <div style="${CARD}">
@@ -444,11 +464,24 @@ class SdrHubPanel extends HTMLElement {
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Decoded devices</h2>
+          <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
         </div>
       </div>
     `;
 
+    this.querySelector("#sdr-hub-decoded-filter").addEventListener("input", (ev) => {
+      this._decodedFilter = ev.target.value.trim().toLowerCase();
+      this._renderDecodedLog();
+    });
+    const helpEl = this.querySelector("#sdr-hub-help");
+    this.querySelector("[data-show-help]").addEventListener("click", () => {
+      helpEl.style.display = "block";
+    });
+    helpEl.querySelector("[data-dismiss-help]").addEventListener("click", () => {
+      localStorage.setItem(HELP_DISMISSED_KEY, "true");
+      helpEl.style.display = "none";
+    });
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
@@ -702,6 +735,7 @@ class SdrHubPanel extends HTMLElement {
           <span>${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
           <span style="display:flex;gap:8px;">
+            <button data-save-sweep-png="${esc(s.id)}" title="Save the current waterfall as a PNG image" style="${BTN_SECONDARY}">Save image</button>
             <button data-copy-sweep-yaml="${esc(s.id)}" title="Copy as an sdr_hub.add_sweep automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
             <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
           </span>
@@ -734,6 +768,9 @@ class SdrHubPanel extends HTMLElement {
         this._onRemoveSweep(s.id),
       );
       this._wireCopyButton(el.querySelector(`[data-copy-sweep-yaml="${CSS.escape(s.id)}"]`), () => this._sweepYaml(s));
+      el.querySelector(`[data-save-sweep-png="${CSS.escape(s.id)}"]`).addEventListener("click", () =>
+        this._saveSweepImage(s.id),
+      );
       const toggle = el.querySelector(`[data-scroll-toggle="${CSS.escape(s.id)}"]`);
       if (toggle) {
         toggle.addEventListener("change", () => {
@@ -802,8 +839,22 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No devices decoded yet.</p>`;
       return;
     }
+    // Matches against model and id specifically (not every field) - a substring match across
+    // the *entire* dump (including timestamps, checksums, etc.) would surface confusing false
+    // positives, whereas model/id is what a user actually means by "find this device".
+    const filtered = this._decodedFilter
+      ? this._decodedLog.filter((event) => {
+          const d = event.device || {};
+          const haystack = `${d.model || ""} ${d.id != null ? d.id : ""}`.toLowerCase();
+          return haystack.includes(this._decodedFilter);
+        })
+      : this._decodedLog;
+    if (filtered.length === 0) {
+      el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No decoded devices match "${esc(this._decodedFilter)}".</p>`;
+      return;
+    }
     const now = Date.now();
-    el.innerHTML = this._decodedLog
+    el.innerHTML = filtered
       .map((event) => {
         const d = event.device || {};
         const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
@@ -1214,6 +1265,28 @@ class SdrHubPanel extends HTMLElement {
     }
     document.body.removeChild(textarea);
     return ok;
+  }
+
+  // canvas.toBlob() (not toDataURL(), which base64-encodes the whole image in memory as a
+  // string first) generates the PNG bytes directly - meaningfully cheaper for a large scroll-
+  // mode waterfall, which can be many thousands of pixels tall.
+  _saveSweepImage(sweepId) {
+    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        this._showError("Could not save image: canvas produced no data");
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `sdr-hub-waterfall-${sweepId}-${Date.now()}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, "image/png");
   }
 
   async _onAddSweep(ev) {
