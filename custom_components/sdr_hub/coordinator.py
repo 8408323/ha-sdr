@@ -4,13 +4,16 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import SdrHubApiClient, SdrHubApiError
+
+if TYPE_CHECKING:
+    from . import SdrHubConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,8 +24,10 @@ _RECONNECT_DELAY_S = 5
 class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls the add-on's snapshot state and relays its live WebSocket events to listeners."""
 
-    def __init__(self, hass: HomeAssistant, api: SdrHubApiClient) -> None:
-        super().__init__(hass, _LOGGER, name="sdr_hub", update_interval=UPDATE_INTERVAL)
+    def __init__(self, hass: HomeAssistant, api: SdrHubApiClient, config_entry: "SdrHubConfigEntry") -> None:
+        super().__init__(
+            hass, _LOGGER, config_entry=config_entry, name="sdr_hub", update_interval=UPDATE_INTERVAL
+        )
         self.api = api
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
@@ -54,6 +59,23 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         refresh that will eventually consume it.
         """
         self._suppress_broadcast_count += 1
+
+    @callback
+    def cancel_pending_suppression(self) -> None:
+        """Undoes one suppress_next_broadcast() call that its own refresh will never consume.
+
+        DataUpdateCoordinator._async_refresh() skips calling update listeners entirely on a
+        repeated (non-recovering) failure - it returns early via
+        `if not self.last_update_success and not previous_update_success: return`, before it
+        would otherwise call async_update_listeners(). A refresh that hits that path never
+        fires _on_data_updated, so the suppression added for it would otherwise never be
+        consumed - leaking a "surplus" suppression that silently swallows the *next* genuine
+        state_changed broadcast once the add-on recovers. Callers that detect this exact
+        condition (no success before or after their forced refresh) must call this immediately
+        afterward to keep the count balanced.
+        """
+        if self._suppress_broadcast_count > 0:
+            self._suppress_broadcast_count -= 1
 
     @callback
     def _on_data_updated(self) -> None:

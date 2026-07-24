@@ -9,6 +9,19 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 _LOGGER = logging.getLogger(__name__)
 
 
+def _bracket_host(host: str) -> str:
+    """Brackets a bare IPv6 literal so it's a valid URL authority component.
+
+    An IPv6 address's own colons collide with the ":port" separator in scheme://host:port -
+    RFC 3986 requires (and every URL parser expects) an IPv6 literal wrapped in [...] as the
+    host component. A hostname or IPv4 address contains no colons, so this is a no-op for the
+    overwhelmingly common case; a host the user already bracketed is left alone too.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 class SdrHubApiError(Exception):
     """Raised on a non-2xx response from the add-on."""
 
@@ -23,6 +36,7 @@ class SdrHubApiClient:
 
     def __init__(self, hass: HomeAssistant, host: str, port: int, api_token: str) -> None:
         self._session = async_get_clientsession(hass)
+        host = _bracket_host(host)
         self._base_url = f"http://{host}:{port}"
         self._ws_url = f"ws://{host}:{port}/ws"
         self._headers = {"Authorization": f"Bearer {api_token}"}

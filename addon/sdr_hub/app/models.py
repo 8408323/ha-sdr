@@ -47,6 +47,14 @@ class SweepCreate(BaseModel):
 
     @model_validator(mode="after")
     def _validate_range(self) -> SweepCreate:
+        # Checked before any arithmetic on sample_rate below: a zero or negative rate reaches
+        # the scanner as a zero/negative bin_hz, which either raises ZeroDivisionError deriving
+        # n_bins_total or produces a nonsensical negative bin count/half_span - either way the
+        # sweep dies in the background thread well after the caller was told it started
+        # successfully. This is the shared model used by both the HA service call path and the
+        # panel's WS-command path, so it's the one place that actually guards every caller.
+        if self.sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
         if self.stop_hz <= self.start_hz:
             raise ValueError("stop_hz must be greater than start_hz")
         # A positive range narrower than one FFT bin (bin_hz = sample_rate/FFT_SIZE, e.g.

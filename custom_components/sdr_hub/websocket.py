@@ -52,8 +52,15 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
     # caller, re-trigger its _loadState() -> another get_state -> another forced refresh, an
     # unbounded feedback loop (confirmed live). Genuine external changes (the coordinator's
     # own poll, or another client's async_request_refresh()) are unaffected and still broadcast.
+    previously_failing = not coordinator.last_update_success
     coordinator.suppress_next_broadcast()
     await coordinator.async_refresh()
+    if previously_failing and not coordinator.last_update_success:
+        # A repeated (non-recovering) failure - the coordinator's own _async_refresh() skips
+        # notifying update listeners entirely in this case, so the suppression just added above
+        # will never be consumed by _on_data_updated. Undo it now or it leaks, silently
+        # swallowing the next genuine state_changed broadcast once the add-on recovers.
+        coordinator.cancel_pending_suppression()
     connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
 
 

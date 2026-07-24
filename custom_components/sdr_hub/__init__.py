@@ -24,7 +24,11 @@ _WS_REGISTERED = "sdr_hub_ws_registered"
 
 async def async_setup_entry(hass: HomeAssistant, entry: SdrHubConfigEntry) -> bool:
     api = SdrHubApiClient(hass, entry.data[CONF_HOST], entry.data[CONF_PORT], entry.data[CONF_API_TOKEN])
-    coordinator = SdrHubCoordinator(hass, api)
+    # async_config_entry_first_refresh() below is only supported for a coordinator constructed
+    # with its owning config entry - without this, current HA logs a deprecation warning and a
+    # near-future HA version raises ConfigEntryError instead, failing setup before the panel,
+    # services, or sensor can load.
+    coordinator = SdrHubCoordinator(hass, api, entry)
     entry.runtime_data = coordinator
 
     await coordinator.async_config_entry_first_refresh()

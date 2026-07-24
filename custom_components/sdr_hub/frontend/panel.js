@@ -188,6 +188,10 @@ class SdrHubPanel extends HTMLElement {
     try {
       state = await this._callWS({ type: "sdr_hub/get_state" });
     } catch (err) {
+      // The request-id guard below only runs on the success path - without checking it here
+      // too, an older call that fails *after* a newer call already succeeded would still show
+      // this error, even though the latest state is already rendered correctly.
+      if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
       this._showError(`Could not load SDR Hub state: ${err.message || err}`);
       return;
     }

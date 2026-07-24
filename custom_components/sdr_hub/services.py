@@ -34,7 +34,11 @@ _ADD_SWEEP_SCHEMA = vol.Schema(
         vol.Required("dongle_serial"): str,
         vol.Required("start_hz"): vol.Coerce(float),
         vol.Required("stop_hz"): vol.Coerce(float),
-        vol.Optional("sample_rate", default=2.4e6): vol.Coerce(float),
+        # min_included=False rejects 0 too, not just negatives - a zero sample rate divides by
+        # zero deriving the FFT bin width in the scanner. This only gives a fast, clear error at
+        # the HA service boundary; addon/sdr_hub/app/models.py's SweepCreate is the actual
+        # source of truth enforcing this for every caller (panel WS commands included).
+        vol.Optional("sample_rate", default=2.4e6): vol.All(vol.Coerce(float), vol.Range(min=0, min_included=False)),
         vol.Optional("gain", default=30.0): vol.Coerce(float),
     }
 )
