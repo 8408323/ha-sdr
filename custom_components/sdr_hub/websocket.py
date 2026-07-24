@@ -31,6 +31,11 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
     if coordinator is None:
         connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
         return
+    # The panel calls this to reload authoritative state after a "status" event (e.g. a
+    # receiver/sweep died) — the coordinator's cache is only refreshed on its own 30s poll
+    # interval otherwise, so without this the panel could show stale devices/receivers/sweeps
+    # for up to 30s after a change.
+    await coordinator.async_request_refresh()
     connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
 
 

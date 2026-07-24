@@ -75,7 +75,7 @@ class SdrHubPanel extends HTMLElement {
   constructor() {
     super();
     this._state = { devices: [], receivers: [], sweeps: [] };
-    this._sweepRowHistory = {}; // sweep_id -> most recent SweepRow, for hover lookups
+    this._sweepRowHistory = {}; // sweep_id -> [SweepRow, ...] newest-first, capped at WATERFALL_HEIGHT (index = canvas row = hover Y), for hover lookups
     this._decodedLog = []; // most-recent-first
     this._unsub = null;
   }
@@ -135,7 +135,9 @@ class SdrHubPanel extends HTMLElement {
 
   _handleEvent(event) {
     if (event.type === "sweep_row") {
-      this._sweepRowHistory[event.sweep_id] = event;
+      const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
+      rows.unshift(event);
+      if (rows.length > WATERFALL_HEIGHT) rows.length = WATERFALL_HEIGHT;
       this._drawWaterfallRow(event);
     } else if (event.type === "decoded_device") {
       this._decodedLog.unshift(event);
@@ -270,8 +272,8 @@ class SdrHubPanel extends HTMLElement {
         this._onRemoveSweep(s.id),
       );
       this._wireCanvasHover(s.id);
-      const last = this._sweepRowHistory[s.id];
-      if (last) this._drawWaterfallRow(last);
+      const rows = this._sweepRowHistory[s.id];
+      if (rows && rows.length > 0) this._drawWaterfallRow(rows[0]);
     }
   }
 
@@ -325,10 +327,19 @@ class SdrHubPanel extends HTMLElement {
     const readout = this.querySelector(`[data-sweep-hover="${CSS.escape(sweepId)}"]`);
     if (!canvas || !readout) return;
     canvas.addEventListener("mousemove", (ev) => {
-      const row = this._sweepRowHistory[sweepId];
-      if (!row) return;
+      const rows = this._sweepRowHistory[sweepId];
+      if (!rows || rows.length === 0) return;
       const rect = canvas.getBoundingClientRect();
+      // Row 0 is newest and drawn at canvas y=0; each older row is one pixel further down
+      // (the scroll-down in _drawWaterfallRow) — map the cursor's Y back to that same index
+      // so hovering an older band of the waterfall reads that row's data, not the newest.
+      const rowIndex = Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * canvas.height));
+      const row = rows[rowIndex];
       const frac = (ev.clientX - rect.left) / rect.width;
+      if (!row) {
+        readout.textContent = "";
+        return;
+      }
       const bin = Math.max(0, Math.min(row.power_db.length - 1, Math.round(frac * row.power_db.length)));
       const freqHz = row.start_hz + bin * row.bin_hz;
       const db = row.power_db[bin];

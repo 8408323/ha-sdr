@@ -7,6 +7,7 @@ import logging
 import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.service import async_register_admin_service
 
 from .api import SdrHubApiError
 from .const import DOMAIN
@@ -74,9 +75,14 @@ def async_register(hass: HomeAssistant) -> None:
         except SdrHubApiError as err:
             raise HomeAssistantError(str(err)) from err
 
-    hass.services.async_register(DOMAIN, SERVICE_ADD_RECEIVER, _async_handle_add_receiver, schema=_ADD_RECEIVER_SCHEMA)
-    hass.services.async_register(
-        DOMAIN, SERVICE_REMOVE_RECEIVER, _async_handle_remove_receiver, schema=_REMOVE_RECEIVER_SCHEMA
+    # These mutate hardware config (start/stop a sweep or receiver) — same admin-only bar as
+    # the equivalent sdr_hub/* WebSocket commands the panel uses; a plain async_register would
+    # let any authenticated non-admin call them directly via call_service.
+    async_register_admin_service(hass, DOMAIN, SERVICE_ADD_RECEIVER, _async_handle_add_receiver, schema=_ADD_RECEIVER_SCHEMA)
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_REMOVE_RECEIVER, _async_handle_remove_receiver, schema=_REMOVE_RECEIVER_SCHEMA
     )
-    hass.services.async_register(DOMAIN, SERVICE_ADD_SWEEP, _async_handle_add_sweep, schema=_ADD_SWEEP_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_REMOVE_SWEEP, _async_handle_remove_sweep, schema=_REMOVE_SWEEP_SCHEMA)
+    async_register_admin_service(hass, DOMAIN, SERVICE_ADD_SWEEP, _async_handle_add_sweep, schema=_ADD_SWEEP_SCHEMA)
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_REMOVE_SWEEP, _async_handle_remove_sweep, schema=_REMOVE_SWEEP_SCHEMA
+    )
