@@ -7,7 +7,14 @@ from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
 from devices import discover_dongles
-from models import Receiver, ReceiverCreate, Sweep, SweepCreate
+from models import (
+    EntityKind,
+    EntityStatus,
+    Receiver,
+    ReceiverCreate,
+    Sweep,
+    SweepCreate,
+)
 from scanner import SoapySweeper, SweepConfig, SweepRow
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,7 +43,7 @@ class DeviceManager:
         loop: asyncio.AbstractEventLoop,
         on_row: Callable[[str, SweepRow], None],
         on_device: Callable[[str, dict], None],
-        on_status: Callable[[str, str, str, str | None], None],
+        on_status: Callable[[EntityKind, str, EntityStatus, str | None], None],
     ) -> None:
         self._loop = loop
         self._on_row = on_row
@@ -108,10 +115,10 @@ class DeviceManager:
         if receiver is None:
             return
         _LOGGER.error("receiver %s (rtl_433) exited unexpectedly with code %s", receiver_id, returncode)
-        receiver.status = "error"
+        receiver.status = EntityStatus.ERROR
         self._decoders.pop(receiver_id, None)
         self._release(receiver.dongle_serial)
-        self._on_status("receiver", receiver_id, "error", f"rtl_433 exited with code {returncode}")
+        self._on_status(EntityKind.RECEIVER, receiver_id, EntityStatus.ERROR, f"rtl_433 exited with code {returncode}")
 
     # -- Sweeps (SoapySDR wideband) -----------------------------------------
 
@@ -144,12 +151,21 @@ class DeviceManager:
         return sweep
 
     async def remove_sweep(self, sweep_id: str) -> None:
-        sweep = self._sweeps.pop(sweep_id, None)
+        """Stops and removes a sweep.
+
+        If the sweeper's capture thread doesn't exit in time, SweepStopTimeoutError
+        propagates to the caller and the sweep/dongle claim are left in place - the
+        thread may still hold the device open, so it would be unsafe to let another
+        receiver/sweep claim the same dongle.
+        """
+        sweep = self._sweeps.get(sweep_id)
         if sweep is None:
             return
-        sweeper = self._sweepers.pop(sweep_id, None)
+        sweeper = self._sweepers.get(sweep_id)
         if sweeper is not None:
-            sweeper.stop()
+            sweeper.stop()  # raises SweepStopTimeoutError if the thread is still alive
+            self._sweepers.pop(sweep_id, None)
+        self._sweeps.pop(sweep_id, None)
         self._release(sweep.dongle_serial)
 
     def _on_sweep_error(self, sweep_id: str, err: Exception) -> None:
@@ -157,10 +173,10 @@ class DeviceManager:
         if sweep is None:
             return
         _LOGGER.error("sweep %s failed: %s", sweep_id, err)
-        sweep.status = "error"
+        sweep.status = EntityStatus.ERROR
         self._sweepers.pop(sweep_id, None)
         self._release(sweep.dongle_serial)
-        self._on_status("sweep", sweep_id, "error", str(err))
+        self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.ERROR, str(err))
 
     async def shutdown(self) -> None:
         for receiver_id in list(self._receivers):

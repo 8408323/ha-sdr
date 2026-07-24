@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
+from constants import DEFAULT_HOP_INTERVAL_S
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -14,7 +16,7 @@ class ReceiverConfig:
     dongle_serial: str
     frequencies_hz: list[float]
     protocols: list[int] = field(default_factory=list)
-    hop_interval_s: int = 10
+    hop_interval_s: int = DEFAULT_HOP_INTERVAL_S
 
 
 class Rtl433Decoder:
@@ -66,6 +68,9 @@ class Rtl433Decoder:
             await asyncio.wait_for(self._process.wait(), timeout=5)
         except asyncio.TimeoutError:
             self._process.kill()
+            # SIGKILL can't be blocked, but the OS still needs a moment to reap the
+            # process - wait for it so the dongle is genuinely free before we return.
+            await self._process.wait()
         self._process = None
 
     async def _read_loop(self) -> None:
