@@ -1459,12 +1459,28 @@ class SdrHubPanel extends HTMLElement {
   // the storage listener was torn down and change notifications were therefore missed.
   _reconcilePreferences() {
     const hadShell = !!this.querySelector("#sdr-hub-root");
-    // Reloaded before the shell-rebuild branch below, which returns early. If another tab both
-    // renamed a device and changed a shell-rendered preference while this panel was detached,
-    // that branch fired and returned without ever picking the rename up - and this method is the
-    // only recovery path for changes missed while detached, so the stale alias persisted until
-    // an unrelated alias storage event or a second detach/reattach.
+    // Snapshotted before either path below can replace DOM - the shell-rebuild branch calls
+    // _renderShell(), which discards the whole root including a live rename editor. Only
+    // _renderDecodedLog() used to snapshot, so reattaching with an unsaved rename *and* a
+    // shell-preference change lost the text and selection outright.
+    this._snapshotAliasEditor();
+    // Every persisted preference is re-read here, before the branch, and both paths below only
+    // differ in how they *apply* them. The rebuild branch used to return before this block, so it
+    // reconciled the shell-rendered values while leaving the sound toggle, time mode, favorites,
+    // colormap and dB range at whatever this tab last had in memory - and it then rebuilt the
+    // shell *from* those stale values. Two rounds of review each found one symptom of that split
+    // (aliases, then the editor snapshot); the split itself was the defect.
+    const previousColormap = this._colormap;
+    const previousMin = this._dbMin;
+    const previousMax = this._dbMax;
     this._deviceAliases = loadDeviceAliases();
+    this._batterySoundEnabled = loadBatterySoundEnabled();
+    this._decodedTimeMode = loadDecodedTimeMode();
+    this._favoriteDevices = loadFavoriteDevices();
+    this._colormap = loadColormap();
+    const dbRange = loadDbRange();
+    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
+    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
     // The sweep/receiver form defaults and the help card's visibility are rendered *into* the
     // shell rather than driven from live state, so no amount of updating existing controls can
     // reconcile them - a stale form would also re-persist the reset-away values on its next
@@ -1478,16 +1494,6 @@ class SdrHubPanel extends HTMLElement {
       this._loadState(true);
       return;
     }
-    const previousColormap = this._colormap;
-    const previousMin = this._dbMin;
-    const previousMax = this._dbMax;
-    this._batterySoundEnabled = loadBatterySoundEnabled();
-    this._decodedTimeMode = loadDecodedTimeMode();
-    this._favoriteDevices = loadFavoriteDevices();
-    this._colormap = loadColormap();
-    const dbRange = loadDbRange();
-    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
-    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
     if (!hadShell) return;
     // Keep the visible controls in step with what was just re-read, and repaint the waterfall
     // only when something it actually depends on changed.
@@ -3890,7 +3896,17 @@ class SdrHubPanel extends HTMLElement {
         // earlier getImageData/putImageData round-trip forced a full framebuffer readback on
         // every single row once the cap was reached - not the shift itself, but that readback,
         // was the freeze risk (~100MB copied per row for a narrow/fast sweep at the 200MB cap).
+        // "copy" rather than the default source-over. The rows being shifted contain
+        // transparent pixels now that non-finite bins are drawn that way, and under source-over
+        // a transparent source pixel leaves the destination untouched - so stale coloured signal
+        // would show through wherever a gap moved, and accumulate as the window slid. copy
+        // replaces the destination outright, alpha included. Only this path composites after
+        // _paintRow; the growth branch below draws onto a freshly-cleared bitmap, and
+        // putImageData already replaces alpha.
+        ctx.save();
+        ctx.globalCompositeOperation = "copy";
         ctx.drawImage(canvas, 0, -1);
+        ctx.restore();
         y = canvas.height - 1;
       } else {
         // Still growing (no pre-allocation): canvas resize clears its bitmap, so blit the
