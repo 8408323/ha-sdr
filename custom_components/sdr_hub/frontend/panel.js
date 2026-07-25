@@ -75,19 +75,6 @@ const BROADCAST_CHANNEL_NAME = "sdr_hub_panel_sync";
 // heartbeat. A claim older than LEADER_TTL_MS is treated as abandoned (tab closed/crashed/
 // suspended) and may be taken over.
 const SOUND_LEADER_KEY = "sdr_hub_sound_leader";
-// Owner of *writes* to the battery state. Deliberately a separate role from the sound leader:
-// only audio-capable tabs may own the sound, but any attached tab can own the state - if the two
-// were merged, a browser with no audio-capable tab open would have nobody writing state at all.
-//
-// Why a single writer: localStorage offers no compare-and-swap, so "read the generation, then
-// write it back" is a read-modify-write that another document can interleave with - the stored
-// generation could regress and a new tab would then load exactly the low-battery assertions an
-// invalidation had discarded. Web Locks would serialize it, but it is [SecureContext] and so
-// unavailable on the plain-HTTP origins Home Assistant is usually reached over. Funnelling every
-// write through one elected tab removes the concurrency instead of trying to guard it: with a
-// single writer there is no interleaving to lose. The LWW entry merge is retained underneath as
-// defence in depth for the brief windows around a leadership handover.
-const STATE_LEADER_KEY = "sdr_hub_state_leader";
 const LEADER_TTL_MS = 5000;
 const LEADER_HEARTBEAT_MS = 2000;
 
@@ -130,6 +117,133 @@ function releaseLeadership(key, tabId) {
   } catch {
     // Unavailable storage - the claim (if any) simply expires on its own.
   }
+}
+
+// ── shared persistent state (IndexedDB) ──────────────────────────────────────
+//
+// The decoded log and battery state live here rather than in localStorage because they are
+// mutated by read-modify-write from every open tab, and localStorage offers no way to make that
+// atomic: `getItem` then `setItem` is two operations another document can interleave with, so a
+// lagging tab can clobber a newer value. Successive attempts to work around that - a pre-write
+// generation re-read, then a single-writer leader election - each narrowed the window without
+// closing it, because neither localStorage nor BroadcastChannel provides mutual exclusion and
+// Web Locks is [SecureContext], hence unavailable on the plain-HTTP origins Home Assistant is
+// usually reached over.
+//
+// IndexedDB does provide it: a `readwrite` transaction is genuinely atomic across tabs, so
+// get-merge-put inside one transaction cannot interleave with another tab's. That makes the
+// coordination correct by construction instead of by convention. Note the mutator passed to
+// idbMutate must be synchronous - awaiting inside it would let the transaction auto-commit.
+//
+// localStorage is still used for the small single-writer values (plain preferences, leader
+// leases) where last-writer-wins is the desired semantics anyway.
+const IDB_NAME = "sdr_hub_panel";
+const IDB_STORE = "state";
+const IDB_KEY_BATTERY = "battery_state";
+const IDB_KEY_DECODED = "decoded_log";
+let _idbPromise = null;
+
+function openIdb() {
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = indexedDB.open(IDB_NAME, 1);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error("indexedDB blocked"));
+  }).catch((err) => {
+    // Private browsing or a disabled store. Persistence degrades to in-memory for this session -
+    // a convenience feature going away is much better than the panel refusing to work, and
+    // crucially it degrades to *no sharing* rather than to unsynchronized sharing, so it cannot
+    // reintroduce the clobbering this exists to prevent.
+    _idbPromise = null;
+    throw err;
+  });
+  return _idbPromise;
+}
+
+// Atomic get-merge-put. `mutate` receives the stored value (or undefined) and returns the value
+// to store; returning undefined leaves it untouched. Resolves with whatever is authoritative
+// afterwards, so callers never have to guess whether their write won.
+async function idbMutate(key, mutate) {
+  const db = await openIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    const store = tx.objectStore(IDB_STORE);
+    const getReq = store.get(key);
+    let outcome;
+    getReq.onsuccess = () => {
+      outcome = mutate(getReq.result);
+      if (outcome !== undefined) store.put(outcome, key);
+      else outcome = getReq.result;
+    };
+    tx.oncomplete = () => resolve(outcome);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await openIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbDelete(keys) {
+  const db = await openIdb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    const store = tx.objectStore(IDB_STORE);
+    for (const k of keys) store.delete(k);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Normalizes whatever came out of the store into the shapes the merge helpers expect. Guards the
+// same corrupt/hand-edited cases the localStorage loaders did.
+function normalizeBatteryRecord(raw) {
+  const gen = raw && Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0;
+  const entries = raw && raw.entries && typeof raw.entries === "object" ? raw.entries : {};
+  return {
+    gen,
+    map: new Map(
+      Object.entries(entries).filter(
+        ([, v]) => v && typeof v === "object" && Number.isFinite(v.ord) && typeof v.low === "boolean",
+      ),
+    ),
+  };
+}
+
+function serializeBatteryRecord(gen, map) {
+  return { gen, entries: Object.fromEntries(map) };
+}
+
+function normalizeDecodedRecord(raw) {
+  const gen = raw && Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0;
+  const list = raw && Array.isArray(raw.entries) ? raw.entries : [];
+  return {
+    gen,
+    log: list
+      .filter(
+        (e) =>
+          e && typeof e === "object" && e.device && typeof e.device === "object" && isConvergentEvent(e) && e._gen === gen,
+      )
+      .sort(compareDecodedEvents)
+      .slice(0, MAX_DECODED_LOG),
+  };
 }
 
 function generateId() {
@@ -344,48 +458,7 @@ function batteryStateKey(d) {
   return `${d.model || ""}|${d.id != null ? d.id : ""}|${d.channel != null ? d.channel : ""}`;
 }
 
-// Loads the canonical, cross-tab-shared low-battery-devices map (see BATTERY_LOW_KEY) as a
-// batteryStateKey -> {model, id, channel} Map.
-// Returns {gen, map}. The generation lives *inside* the stored value rather than in a separate
-// key so that every write is self-describing: a peer still processing a pre-gap event writes its
-// whole value stamped with the generation it knew about, and a reader can then tell that write
-// is superseded and discard it wholesale. Splitting them across two keys couldn't do that - the
-// stale write would carry no generation at all and merge straight back in.
-function loadBatteryState() {
-  try {
-    const raw = localStorage.getItem(BATTERY_LOW_KEY);
-    if (!raw) return { gen: 0, map: new Map() };
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { gen: 0, map: new Map() };
-    const gen = Number.isInteger(parsed.gen) && parsed.gen >= 0 ? parsed.gen : 0;
-    const entries = parsed.entries && typeof parsed.entries === "object" ? parsed.entries : {};
-    return {
-      gen,
-      map: new Map(
-        Object.entries(entries).filter(
-          ([, v]) => v && typeof v === "object" && Number.isFinite(v.ord) && typeof v.low === "boolean",
-        ),
-      ),
-    };
-  } catch {
-    return { gen: 0, map: new Map() };
-  }
-}
 
-// Reconciles a local (gen, map) against a stored one. A higher generation means a stream_gap
-// invalidated everything older, so it replaces rather than merges; equal generations merge
-// normally; a lower one is a superseded write and is ignored outright.
-// `invalidationPending` means this document invalidated its state but couldn't persist the
-// generation bump (see _invalidateBatteryState). Until that clear lands, stored entries at the
-// same generation are exactly the ones it discarded, so merging them back would undo the
-// invalidation on the very next event. A higher stored generation still wins - someone else
-// published a clear, which supersedes this one either way.
-function reconcileBatteryState(local, remote, invalidationPending = false) {
-  if (remote.gen > local.gen) return remote;
-  if (remote.gen < local.gen) return local;
-  if (invalidationPending) return local;
-  return { gen: local.gen, map: mergeBatteryLowState(local.map, remote.map) };
-}
 
 // Per-key last-writer-wins by the *server* event order (see eventOrder), which is what makes
 // this map genuinely convergent rather than merely "usually the same".
@@ -434,29 +507,6 @@ function mergeBatteryLowState(current, incoming) {
   return new Map([...low, ...dead]);
 }
 
-// Re-reads the stored generation immediately before writing and never lowers it. A tab that
-// read generation 0, then had another tab clear at generation 1 underneath it, would otherwise
-// write its own stale envelope back at generation 0 - regressing storage, so a *newly opened*
-// tab would load exactly the pre-gap low-battery assertions the clear existed to invalidate.
-// (Peers already holding the higher generation ignore such a write, which is precisely why it
-// can sit there unnoticed.) If the stored generation is ahead, this tab's map is superseded and
-// its entries are dropped rather than merged back in.
-function saveBatteryState(gen, map) {
-  try {
-    const stored = loadBatteryState();
-    if (stored.gen > gen) return { gen: stored.gen, map: stored.map, persisted: true };
-    localStorage.setItem(BATTERY_LOW_KEY, JSON.stringify({ gen, entries: Object.fromEntries(map) }));
-    return { gen, map, persisted: true };
-  } catch {
-    // Unavailable/quota-exceeded storage. `persisted` tells the caller the write never landed,
-    // which matters for a generation *bump*: adopting a generation that only exists in memory
-    // would have this tab believe it holds authority it never recorded, and reattach (which
-    // adopts storage) would then pull storage's pre-invalidation entries back in *under* that
-    // higher generation - letting exactly the entries an invalidation discarded dominate peers
-    // that cleared correctly. Callers that bump must therefore only commit on a real write.
-    return { gen, map, persisted: false };
-  }
-}
 
 function loadFavoriteDevices() {
   try {
@@ -493,23 +543,7 @@ function saveDecodedTimeMode(mode) {
   }
 }
 
-function loadDecodedLogGen() {
-  try {
-    const raw = localStorage.getItem(DECODED_LOG_GEN_KEY);
-    const n = Number(raw);
-    return Number.isInteger(n) && n >= 0 ? n : 0;
-  } catch {
-    return 0;
-  }
-}
 
-function saveDecodedLogGen(gen) {
-  try {
-    localStorage.setItem(DECODED_LOG_GEN_KEY, String(gen));
-  } catch {
-    // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
-  }
-}
 
 // The single value every cross-tab merge and sort orders on. Prefers the add-on's monotonic
 // `seq` over its wall-clock `received_at`: a host clock can move backwards (NTP correction,
@@ -544,42 +578,7 @@ function isConvergentEvent(e) {
   return !!e && typeof e.event_id === "string" && Number.isFinite(eventOrder(e));
 }
 
-// Only entries tagged with the given generation are returned - one stamped with an older
-// generation belongs to a log a "Clear log" click (this tab's or another's) has since
-// superseded, and should be treated as already cleared rather than resurrected.
-function loadDecodedLog(gen) {
-  try {
-    const raw = localStorage.getItem(DECODED_LOG_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Only entries that still look like a real decoded_device event - a corrupted or
-    // hand-edited value here would otherwise flow straight into _renderDecodedLog and blow up
-    // on fields it assumes are always present.
-    return parsed
-      .filter(
-        (e) =>
-          e &&
-          typeof e === "object" &&
-          e.device &&
-          typeof e.device === "object" &&
-          isConvergentEvent(e) &&
-          e._gen === gen,
-      )
-      .sort(compareDecodedEvents)
-      .slice(0, MAX_DECODED_LOG);
-  } catch {
-    return [];
-  }
-}
 
-function saveDecodedLogRaw(log) {
-  try {
-    localStorage.setItem(DECODED_LOG_KEY, JSON.stringify(log.slice(0, MAX_DECODED_LOG)));
-  } catch {
-    // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
-  }
-}
 
 // Dedups by the *server-assigned* event_id and re-sorts into the canonical total order, so the
 // result depends only on the set of events seen - not on which tab computed it or in what order
@@ -774,8 +773,9 @@ class SdrHubPanel extends HTMLElement {
     // most-recent-first - restored from localStorage so a page reload doesn't lose recent
     // activity. Filtered to the current clear-generation on load (see DECODED_LOG_GEN_KEY) so a
     // stale, already-superseded entry can't resurface.
-    this._decodedLogGen = loadDecodedLogGen();
-    this._decodedLog = loadDecodedLog(this._decodedLogGen);
+    // Start empty and hydrate from IndexedDB asynchronously (see _hydratePersistedState).
+    this._decodedLogGen = 0;
+    this._decodedLog = [];
     // batteryStateKey(device) -> {model, id, channel, low, at, alertedAt?} - the canonical,
     // cross-tab-shared low-battery state (see BATTERY_LOW_KEY and mergeBatteryLowState).
     //
@@ -791,11 +791,8 @@ class SdrHubPanel extends HTMLElement {
     //
     // The exception is a stream_gap/reconnect, where the loss is upstream of every tab so no
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
-    const seededBattery = loadBatteryState();
-    this._deviceBatteryOk = seededBattery.map;
-    this._batteryGen = seededBattery.gen;
-    this._batteryInvalidationPending = false;
-    this._pendingInvalidatePublish = false;
+    this._deviceBatteryOk = new Map();
+    this._batteryGen = 0;
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -828,7 +825,6 @@ class SdrHubPanel extends HTMLElement {
     // lifetime.
     this._tabId = generateId();
     this._soundLeaderTimer = null;
-    this._stateLeaderTimer = null;
     this._broadcastChannel = null;
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
@@ -847,6 +843,8 @@ class SdrHubPanel extends HTMLElement {
     this._hass = hass;
     if (first) {
       this._renderShell();
+      this._hydrateDecodedLog();
+      this._hydrateBatteryState();
       this._loadState();
       this._subscribe();
       this._wireConnectionStatus();
@@ -884,10 +882,7 @@ class SdrHubPanel extends HTMLElement {
       // shared storage instead, which is exactly what a still-connected peer has been keeping
       // up to date, and don't touch the generation.
       if (wasDisconnected) {
-        const resynced = loadBatteryState();
-        this._batteryGen = Math.max(this._batteryGen, resynced.gen);
-        this._deviceBatteryOk = resynced.map;
-        this._renderBatteryAlerts();
+        this._hydrateBatteryState();
       }
     };
     this._onConnDisconnected = () => {
@@ -958,34 +953,8 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
-      // Union what the peer wrote with what this tab already holds - deliberately NOT a plain
-      // adopt/replace. A peer can legitimately write a value that lacks events this tab has
-      // already seen (it may be lagging, or have been over quota), and replacing would discard
-      // them here too. Merging keeps the grow-only-set semantics the whole design rests on.
-      // A generation bump is the one case that *is* a replace: it means the log was cleared, so
-      // older entries are meant to disappear rather than be preserved.
-      if (ev.key === DECODED_LOG_KEY || ev.key === DECODED_LOG_GEN_KEY) {
-        const gen = loadDecodedLogGen();
-        const carried = gen === this._decodedLogGen ? this._decodedLog.filter((e) => isConvergentEvent(e)) : [];
-        this._decodedLogGen = gen;
-        this._decodedLog = mergeDecodedLog(carried, loadDecodedLog(gen));
-        this._renderDecodedLog();
-      }
       // Same reasoning for the battery map, using its own LWW merge so a lagging peer's write
       // can't resurrect a device this tab already saw recover.
-      if (ev.key === BATTERY_LOW_KEY) {
-        // reconcileBatteryState handles all three cases: a peer that processed a stream_gap
-        // (higher generation) replaces, a peer at the same generation merges, and a superseded
-        // pre-gap write (lower generation) is discarded rather than resurrecting stale entries.
-        const next = reconcileBatteryState(
-          { gen: this._batteryGen, map: this._deviceBatteryOk },
-          loadBatteryState(),
-          this._batteryInvalidationPending,
-        );
-        this._batteryGen = next.gen;
-        this._deviceBatteryOk = next.map;
-        this._renderBatteryAlerts();
-      }
       // The sound preference is a single user choice, not per-tab - keep the checkbox and the
       // in-memory flag in step when it's toggled elsewhere, so a tab left open doesn't keep
       // contending for (or ignoring) the alert based on a setting the user has since changed.
@@ -1018,28 +987,13 @@ class SdrHubPanel extends HTMLElement {
       this._broadcastChannel.onmessage = (ev) => {
         const msg = ev.data;
         if (!msg) return;
-        if (msg.kind === "log_cleared") {
-          if (!Number.isInteger(msg.gen) || msg.gen <= this._decodedLogGen) return;
-          this._decodedLogGen = msg.gen;
-          this._decodedLog = loadDecodedLog(msg.gen);
-          this._renderDecodedLog();
+        if (msg.kind === "decoded_changed") {
+          this._hydrateDecodedLog();
           return;
         }
-        // A peer forwarded a battery transition for the state leader to persist. Ignored unless
-        // this tab currently holds that role - if the leader has since gone away, the next
-        // transition in any tab re-elects one and republishes, so nothing is stuck.
-        if (msg.kind === "battery_transition" && msg.key && msg.entry) {
-          if (!this._isStateLeader()) return;
-          // Discard anything observed under a generation an invalidation has since superseded.
-          if (Number.isInteger(msg.gen) && msg.gen < loadBatteryState().gen) return;
-          this._leaderWriteBattery(new Map([[msg.key, msg.entry]]));
+        if (msg.kind === "battery_changed") {
+          this._hydrateBatteryState();
           return;
-        }
-        // A peer observed a stream gap. Only the leader publishes the generation bump, so the
-        // clear can't race several tabs writing it at once.
-        if (msg.kind === "battery_invalidate") {
-          if (!this._isStateLeader()) return;
-          this._leaderInvalidateBattery();
         }
       };
     } catch {
@@ -1083,26 +1037,10 @@ class SdrHubPanel extends HTMLElement {
     // reasoning as the storage handler. A detach/reattach doesn't discard in-memory state, and
     // that state can legitimately be ahead of storage (a peer wrote a staler value, or this
     // tab's own writes were blocked by quota), so replacing would lose it.
-    // Battery state is *adopted* from storage here, not merged with the detached cache - the
-    // opposite of the decoded log below, and deliberately so. While detached this element
-    // received no events, so its map can hold nothing storage lacks; meanwhile tombstones can be
-    // evicted (see MAX_TRACKED_BATTERY_TOMBSTONES), and once a device's recovery tombstone is
-    // gone there is nothing left to defeat an older low entry. Merging an arbitrarily stale
-    // detached cache back in could therefore resurrect a recovered device as low indefinitely.
-    // The log has no such hazard: it's a grow-only set whose entries are never contradicted,
-    // only superseded wholesale by a generation bump.
-    const reattachBattery = loadBatteryState();
-    this._batteryGen = Math.max(this._batteryGen, reattachBattery.gen);
-    this._deviceBatteryOk = reattachBattery.map;
+    // Both are re-read from IndexedDB, which is authoritative - see the storage-layer comment.
+    this._hydrateBatteryState();
     this._renderBatteryAlerts();
-    // Same for the decoded log - except that a *generation* change means the log was cleared
-    // while detached, which is the one case where replacing is the correct behaviour.
-    const reattachGen = loadDecodedLogGen();
-    const carriedOnReattach =
-      reattachGen === this._decodedLogGen ? this._decodedLog.filter((e) => isConvergentEvent(e)) : [];
-    this._decodedLogGen = reattachGen;
-    this._decodedLog = mergeDecodedLog(carriedOnReattach, loadDecodedLog(reattachGen));
-    this._renderDecodedLog();
+    this._hydrateDecodedLog();
     if (!this._unsub && !this._subscribing) {
       this._loadState();
       this._subscribe();
@@ -1169,10 +1107,6 @@ class SdrHubPanel extends HTMLElement {
     // longer play anything, and holding the claim until it expires would leave alerts unplayed
     // by any tab for up to LEADER_TTL_MS.
     this._releaseSoundLeadership();
-    // Same for the state-writer role: hand it back immediately so another open tab can take
-    // over writes now rather than after the TTL, during which nothing would be persisted.
-    this._stopStateLeaderHeartbeat();
-    releaseLeadership(STATE_LEADER_KEY, this._tabId);
     // _deviceBatteryOk is just a cache of the canonical, cross-tab-shared BATTERY_LOW_KEY - a
     // detach doesn't need to (and shouldn't) wipe it, since connectedCallback reloads it fresh
     // from storage on reattach regardless, picking up whatever the shared source of truth has
@@ -1298,9 +1232,32 @@ class SdrHubPanel extends HTMLElement {
   // here without any lock. The generation is re-read from storage at write time (not stamped
   // when the event arrived) so a "Clear log" that lands in between is always observed, never
   // raced past.
-  _persistDecodedEvent(event) {
-    const gen = loadDecodedLogGen();
-    this._decodedLogGen = gen;
+  // Re-reads the authoritative decoded log from IndexedDB. Used on first load, on reattach, and
+  // whenever a peer signals a change - IndexedDB has no cross-document change event of its own,
+  // so BroadcastChannel carries the notification while the database remains the source of truth.
+  async _hydrateDecodedLog() {
+    try {
+      const settled = normalizeDecodedRecord(await idbGet(IDB_KEY_DECODED));
+      this._decodedLogGen = settled.gen;
+      this._decodedLog = settled.log;
+      this._renderDecodedLog();
+    } catch {
+      // No usable store - whatever is in memory stands.
+    }
+  }
+
+  async _hydrateBatteryState() {
+    try {
+      const settled = normalizeBatteryRecord(await idbGet(IDB_KEY_BATTERY));
+      this._batteryGen = settled.gen;
+      this._deviceBatteryOk = settled.map;
+      this._renderBatteryAlerts();
+    } catch {
+      // No usable store - whatever is in memory stands.
+    }
+  }
+
+  async _persistDecodedEvent(event) {
     // Pre-add-on-upgrade events have no shared identity to converge on - show them in this tab
     // (so a newer panel against an older add-on still works) but never persist them, since a
     // fabricated client-side id would duplicate the same decode once per open tab.
@@ -1309,17 +1266,26 @@ class SdrHubPanel extends HTMLElement {
       this._renderDecodedLog();
       return;
     }
-    // Merges storage, this tab's own in-memory log, and the new event. Including the in-memory
-    // side matters for two independent reasons: a peer that wrote a staler/truncated value
-    // between this tab's own read and write can't erase what this tab already knew (the read and
-    // write are not atomic across documents - there is no reliable storage mutex), and if
-    // localStorage is unavailable or over quota, loadDecodedLog() returns [] and the log would
-    // otherwise collapse to just the newest entry on every event.
-    const carried = this._decodedLog.filter((e) => isConvergentEvent(e) && e._gen === gen);
-    const next = mergeDecodedLog(mergeDecodedLog(carried, loadDecodedLog(gen)), [{ ...event, _gen: gen }]);
-    saveDecodedLogRaw(next);
-    this._decodedLog = next;
+    // Show it immediately, then reconcile against the authoritative store.
+    this._decodedLog = mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event]);
     this._renderDecodedLog();
+    try {
+      // The whole get-merge-put happens inside one readwrite transaction, so a concurrent tab
+      // cannot interleave and clobber this with a shorter prefix of the same log. The generation
+      // is read *within* the transaction too, so a clear that lands first is always observed.
+      const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
+        const current = normalizeDecodedRecord(raw);
+        const merged = mergeDecodedLog(current.log, [{ ...event, _gen: current.gen }]);
+        return { gen: current.gen, entries: merged };
+      });
+      const settled = normalizeDecodedRecord(record);
+      this._decodedLogGen = settled.gen;
+      this._decodedLog = settled.log;
+      this._renderDecodedLog();
+      this._postSync({ kind: "decoded_changed" });
+    } catch {
+      // No usable store - the optimistic in-memory update above stands for this session.
+    }
   }
 
   // Discards all low-battery state and bumps the generation so the clear *dominates* rather
@@ -1328,52 +1294,27 @@ class SdrHubPanel extends HTMLElement {
   // leaving a banner nothing can contradict. Used for both stream_gap/stream_reconnected and an
   // HA-side WebSocket reconnect - in every one of those the loss is upstream of all tabs, so no
   // peer holds a better copy and re-reading shared state would just re-adopt the same staleness.
-  _invalidateBatteryState() {
-    // Routed through the single writer like every other mutation. A non-leader clears its own
-    // view immediately (the banner shouldn't keep asserting state this tab knows is stale) and
-    // asks the leader to publish the generation bump.
-    if (!this._isStateLeader()) {
-      this._deviceBatteryOk = new Map();
-      // Held until some tab actually publishes the generation bump. If the leader crashed with a
-      // still-fresh lease, this message has no live recipient and nothing else would ever retry -
-      // storage would keep the old generation and a later transition would equal-generation-merge
-      // the stale assertions straight back in. _retryPendingInvalidation drains this once the
-      // lease expires and this tab can take over.
-      this._pendingInvalidatePublish = true;
-      this._renderBatteryAlerts();
-      this._postSync({ kind: "battery_invalidate" });
-      return;
-    }
-    this._leaderInvalidateBattery();
-  }
-
-  // Called before every leader-path write: if an invalidation was requested while this tab
-  // couldn't publish it, publish it now that leadership is obtainable.
-  _retryPendingInvalidation() {
-    if (!this._pendingInvalidatePublish) return;
-    if (!this._isStateLeader()) return;
-    this._pendingInvalidatePublish = false;
-    this._leaderInvalidateBattery();
-  }
-
-  _leaderInvalidateBattery() {
-    this._pendingInvalidatePublish = false;
-    const nextGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
-    const cleared = saveBatteryState(nextGen, new Map());
-    // Only claim the bumped generation once it has actually reached storage - see
-    // saveBatteryState's `persisted`. If the write failed, still clear locally (the banner
-    // shouldn't keep asserting state this tab knows is untrustworthy) but leave the generation
-    // alone, so this tab can't later present un-persisted authority to its peers.
-    this._batteryGen = cleared.persisted ? cleared.gen : this._batteryGen;
-    this._deviceBatteryOk = cleared.persisted ? cleared.map : new Map();
-    // A failed invalidation leaves this tab at the old generation with an empty map - but
-    // storage still holds the pre-invalidation entries at that *same* generation, so the next
-    // event's equal-generation merge would pull every stale assertion straight back in and a
-    // quiet device's obsolete warning could reappear indefinitely. Remember that this tab has
-    // locally invalidated but couldn't publish it, and stop merging stored entries until a
-    // clear actually lands. Retried on the next write, so it self-heals once storage recovers.
-    this._batteryInvalidationPending = !cleared.persisted;
+  // Discards all low-battery state and bumps the generation, atomically. Used for stream_gap /
+  // stream_reconnected, where the loss is upstream of every tab so no peer holds a better copy.
+  // The bump happens inside the transaction, so a concurrent transition either lands before it
+  // (and is discarded by the bump) or after it (and is correctly attributed to the new
+  // generation) - there is no interleaving that can resurrect pre-gap state.
+  async _invalidateBatteryState() {
+    this._deviceBatteryOk = new Map();
     this._renderBatteryAlerts();
+    try {
+      const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
+        const current = normalizeBatteryRecord(raw);
+        return serializeBatteryRecord(current.gen + 1, new Map());
+      });
+      const settled = normalizeBatteryRecord(record);
+      this._batteryGen = settled.gen;
+      this._deviceBatteryOk = settled.map;
+      this._renderBatteryAlerts();
+      this._postSync({ kind: "battery_changed" });
+    } catch {
+      // No usable store - the local clear above stands for this session.
+    }
   }
 
   // Merges this transition into the shared map as an LWW-register keyed on the server's own
@@ -1386,7 +1327,7 @@ class SdrHubPanel extends HTMLElement {
   // actually have played it. Instead the transition carries its own timestamp and only the sound
   // leader records `alertedAt`, so a playable tab still sees an un-alerted transition regardless
   // of how many silent tabs processed it first.
-  _updateBatteryState(event) {
+  async _updateBatteryState(event) {
     const decodedDevice = event.device || {};
     const key = batteryStateKey(decodedDevice);
     const isLow = !decodedDevice.battery_ok;
@@ -1396,11 +1337,10 @@ class SdrHubPanel extends HTMLElement {
     const ord = Number.isFinite(eventOrder(event)) ? eventOrder(event) : Date.now();
     const previous = this._deviceBatteryOk.get(key);
     const entry = { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, ord };
-    // Every tab receives this same broadcast, so every tab would otherwise perform its own
-    // read-modify-write. Funnel the write through the elected state leader instead - see
-    // STATE_LEADER_KEY. Non-leaders hand the transition over and let the leader's write come
-    // back via the storage event.
-    const applied = this._applyBatteryTransition(key, entry);
+    // Every tab receives this same broadcast and applies it, but each does so inside its own
+    // IndexedDB transaction, so the concurrent updates serialize at the database rather than
+    // racing. Awaited so the alert decision below reads the settled state, not a guess.
+    const applied = await this._applyBatteryTransition(key, entry);
     // Only a transition that is genuinely newer than whatever has already been alerted for this
     // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
     // Reads alertedAt off the resulting entry rather than `previous`, since the merge carries it
@@ -1413,86 +1353,29 @@ class SdrHubPanel extends HTMLElement {
     this._maybePlayLeaderAlert(key, ord);
   }
 
-  // Applies one transition to the shared battery state. The *write* only happens in the tab
-  // holding STATE_LEADER_KEY; any other tab forwards the transition to it over BroadcastChannel
-  // and updates its own view optimistically, which the leader's authoritative write then
-  // corrects via the storage event. Returns the map this tab should reason about right now.
-  _applyBatteryTransition(key, entry) {
-    this._retryPendingInvalidation();
-    const incoming = new Map([[key, entry]]);
-    if (!this._isStateLeader()) {
-      // The observed generation travels with the message. BroadcastChannel delivery can lag
-      // behind the leader's own ordered HA subscription, so the leader may process a stream_gap
-      // and bump the generation before this older message arrives - without the tag it would
-      // republish a pre-gap assertion as post-gap state, which could then survive indefinitely
-      // if that device stays silent.
-      this._postSync({ kind: "battery_transition", key, entry, gen: this._batteryGen });
-      // Optimistic local update so this tab's own banner and alert decision don't lag a
-      // round-trip behind. Never persisted - the leader owns storage.
-      this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, incoming);
+  // Applies one transition to the shared battery state inside a single IndexedDB transaction.
+  // No leader election is involved: the transaction *is* the mutual exclusion, so concurrent
+  // tabs serialize at the database rather than racing a lease. Returns the map this tab should
+  // reason about (used for the alert decision).
+  async _applyBatteryTransition(key, entry) {
+    // Optimistic local update so the banner and alert decision don't lag a round-trip.
+    this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]));
+    this._renderBatteryAlerts();
+    try {
+      const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
+        const current = normalizeBatteryRecord(raw);
+        const merged = mergeBatteryLowState(current.map, new Map([[key, entry]]));
+        return serializeBatteryRecord(current.gen, merged);
+      });
+      const settled = normalizeBatteryRecord(record);
+      this._batteryGen = settled.gen;
+      this._deviceBatteryOk = settled.map;
       this._renderBatteryAlerts();
+      this._postSync({ kind: "battery_changed" });
+      return settled.map;
+    } catch {
       return this._deviceBatteryOk;
     }
-    return this._leaderWriteBattery(incoming);
-  }
-
-  // Leader-only. Safe to read-modify-write without further guarding precisely because exactly
-  // one tab reaches here at a time.
-  _leaderWriteBattery(incoming) {
-    // Re-read the generation at write time (not at event arrival) so a stream_gap that landed in
-    // between is always observed. If it was bumped, everything this tab held is invalidated and
-    // only the post-gap storage state plus this transition survive.
-    const reconciled = reconcileBatteryState(
-      { gen: this._batteryGen, map: this._deviceBatteryOk },
-      loadBatteryState(),
-      this._batteryInvalidationPending,
-    );
-    this._batteryGen = reconciled.gen;
-    const merged = mergeBatteryLowState(reconciled.map, incoming);
-    // saveBatteryState returns the authoritative state: normally what was just written, but the
-    // stored value instead if it already held a higher generation.
-    const written = saveBatteryState(this._batteryGen, merged);
-    this._batteryGen = written.gen;
-    this._deviceBatteryOk = written.map;
-    // A successful write means the local view is published again, so the pending-invalidation
-    // hold (see _invalidateBatteryState) is no longer needed.
-    if (written.persisted) this._batteryInvalidationPending = false;
-    this._renderBatteryAlerts();
-    return written.map;
-  }
-
-  // Claims the role opportunistically rather than campaigning for it up front: whichever tab
-  // next needs to write takes it if it's free or stale, so there is no window where a browser
-  // has open panels but nobody willing to persist.
-  _isStateLeader() {
-    if (holdsLeadership(STATE_LEADER_KEY, this._tabId)) {
-      this._startStateLeaderHeartbeat();
-      return true;
-    }
-    if (claimLeadership(STATE_LEADER_KEY, this._tabId)) {
-      this._startStateLeaderHeartbeat();
-      return true;
-    }
-    return false;
-  }
-
-  _startStateLeaderHeartbeat() {
-    if (this._stateLeaderTimer) return;
-    this._stateLeaderTimer = setInterval(() => {
-      // Step down rather than stomp if another tab has legitimately taken over (e.g. this one
-      // was suspended past the TTL) - re-claiming would recreate the split we're avoiding.
-      if (!holdsLeadership(STATE_LEADER_KEY, this._tabId)) {
-        this._stopStateLeaderHeartbeat();
-        return;
-      }
-      claimLeadership(STATE_LEADER_KEY, this._tabId);
-    }, LEADER_HEARTBEAT_MS);
-  }
-
-  _stopStateLeaderHeartbeat() {
-    if (!this._stateLeaderTimer) return;
-    clearInterval(this._stateLeaderTimer);
-    this._stateLeaderTimer = null;
   }
 
   // Plays the alert only in the tab currently holding sound leadership. Only tabs that can
@@ -1776,7 +1659,7 @@ class SdrHubPanel extends HTMLElement {
       ev.target.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
       this._renderDecodedLog();
     });
-    this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", () => {
+    this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", async () => {
       // Only clears the *displayed* log, not the low-battery state - a device that's genuinely
       // still reporting low battery should keep showing in the alert banner even after the user
       // clears this view, since that's a real hardware condition independent of what's on screen.
@@ -1786,13 +1669,24 @@ class SdrHubPanel extends HTMLElement {
       // still carrying the old one is filtered out on load. Unlike the array itself, this is a
       // genuine user action rather than convergent derived state, so it's also announced over
       // BroadcastChannel for tabs to pick up immediately. See DECODED_LOG_GEN_KEY.
-      const nextGen = loadDecodedLogGen() + 1;
-      saveDecodedLogGen(nextGen);
-      saveDecodedLogRaw([]);
-      this._decodedLogGen = nextGen;
       this._decodedLog = [];
       this._renderDecodedLog();
-      this._postSync({ kind: "log_cleared", gen: nextGen });
+      try {
+        // Bumping the generation and emptying the log happen in one transaction, so a decode
+        // being persisted concurrently either lands before the bump (and is discarded with the
+        // old generation) or after it (and is kept) - never half-applied.
+        const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
+          const current = normalizeDecodedRecord(raw);
+          return { gen: current.gen + 1, entries: [] };
+        });
+        const settled = normalizeDecodedRecord(record);
+        this._decodedLogGen = settled.gen;
+        this._decodedLog = settled.log;
+        this._renderDecodedLog();
+        this._postSync({ kind: "decoded_changed" });
+      } catch {
+        // No usable store - the local clear stands for this session.
+      }
     });
     const helpEl = this.querySelector("#sdr-hub-help");
     this.querySelector("[data-show-help]").addEventListener("click", () => {
@@ -1865,18 +1759,15 @@ class SdrHubPanel extends HTMLElement {
   // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
   // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
   _onResetPreferences() {
-    // The two leader keys are cleared here but deliberately kept *out* of ALL_PREF_KEYS - see
-    // that list's own comment. Releasing leadership removes them on every ordinary detach, and
+    // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see
+    // that list's own comment. Releasing leadership removes it on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
-    // listing them there would make every open tab reload each time any one tab navigated away.
-    // Bump the clear-generation *before* removing anything. Reset and the reload it triggers
-    // aren't instantaneous, so another tab (or this one) can persist an in-flight decode in
-    // between and resurrect log entries the reset was meant to remove. Entries carrying the
-    // pre-reset generation are filtered out on load, so anything that slips through that window
-    // is ignored rather than reappearing.
-    const supersededGen = loadDecodedLogGen() + 1;
-    saveDecodedLogGen(supersededGen);
-    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY, STATE_LEADER_KEY]) {
+    // listing it there would make every open tab reload each time any one tab navigated away.
+    // The shared state lives in IndexedDB; clearing it is a separate (async) delete. Fired
+    // without awaiting because the reload below is what actually re-reads everything, and a
+    // failed delete simply leaves the old value to be superseded normally.
+    idbDelete([IDB_KEY_BATTERY, IDB_KEY_DECODED]).catch(() => {});
+    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
       if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
       try {
         localStorage.removeItem(key);
