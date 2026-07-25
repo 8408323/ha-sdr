@@ -383,13 +383,19 @@ function mergeBatteryLowState(current, incoming) {
 // its entries are dropped rather than merged back in.
 function saveBatteryState(gen, map) {
   try {
-    const storedGen = loadBatteryState().gen;
-    if (storedGen > gen) return { gen: storedGen, map: loadBatteryState().map };
+    const stored = loadBatteryState();
+    if (stored.gen > gen) return { gen: stored.gen, map: stored.map, persisted: true };
     localStorage.setItem(BATTERY_LOW_KEY, JSON.stringify({ gen, entries: Object.fromEntries(map) }));
+    return { gen, map, persisted: true };
   } catch {
-    // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
+    // Unavailable/quota-exceeded storage. `persisted` tells the caller the write never landed,
+    // which matters for a generation *bump*: adopting a generation that only exists in memory
+    // would have this tab believe it holds authority it never recorded, and reattach (which
+    // adopts storage) would then pull storage's pre-invalidation entries back in *under* that
+    // higher generation - letting exactly the entries an invalidation discarded dominate peers
+    // that cleared correctly. Callers that bump must therefore only commit on a real write.
+    return { gen, map, persisted: false };
   }
-  return { gen, map };
 }
 
 function loadFavoriteDevices() {
@@ -1224,10 +1230,14 @@ class SdrHubPanel extends HTMLElement {
   // HA-side WebSocket reconnect - in every one of those the loss is upstream of all tabs, so no
   // peer holds a better copy and re-reading shared state would just re-adopt the same staleness.
   _invalidateBatteryState() {
-    this._batteryGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
-    const cleared = saveBatteryState(this._batteryGen, new Map());
-    this._batteryGen = cleared.gen;
-    this._deviceBatteryOk = cleared.map;
+    const nextGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
+    const cleared = saveBatteryState(nextGen, new Map());
+    // Only claim the bumped generation once it has actually reached storage - see
+    // saveBatteryState's `persisted`. If the write failed, still clear locally (the banner
+    // shouldn't keep asserting state this tab knows is untrustworthy) but leave the generation
+    // alone, so this tab can't later present un-persisted authority to its peers.
+    this._batteryGen = cleared.persisted ? cleared.gen : this._batteryGen;
+    this._deviceBatteryOk = cleared.persisted ? cleared.map : new Map();
     this._renderBatteryAlerts();
   }
 
