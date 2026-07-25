@@ -456,6 +456,14 @@ class SdrHubPanel extends HTMLElement {
       clearInterval(this._decodedAgeInterval);
       this._decodedAgeInterval = null;
     }
+    // _deviceBatteryOk is populated purely from the decoded_device event stream - there's no
+    // authoritative server-side battery snapshot in get_state to reconcile against on
+    // reconnect. A device can recover while this subscription is torn down, and that missed
+    // recovery would otherwise leave a stale low-battery entry (and banner) showing
+    // indefinitely until, by chance, that exact device reports again. Clearing here means a
+    // reconnect starts from a clean slate instead of asserting possibly-stale state.
+    this._deviceBatteryOk.clear();
+    this._renderBatteryAlerts();
   }
 
   async _callWS(message) {
@@ -551,7 +559,12 @@ class SdrHubPanel extends HTMLElement {
           // the end of the Map's iteration order, so the eviction below reliably drops the
           // *oldest* still-low device first when the bound is exceeded.
           this._deviceBatteryOk.delete(key);
-          this._deviceBatteryOk.set(key, { ok: false, model: decodedDevice.model, id: decodedDevice.id });
+          this._deviceBatteryOk.set(key, {
+            ok: false,
+            model: decodedDevice.model,
+            id: decodedDevice.id,
+            channel: decodedDevice.channel,
+          });
           while (this._deviceBatteryOk.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
             this._deviceBatteryOk.delete(this._deviceBatteryOk.keys().next().value);
           }
@@ -1274,9 +1287,17 @@ class SdrHubPanel extends HTMLElement {
     // MAX_DECODED_LOG and a weakening sensor that stops transmitting after reporting low
     // battery would otherwise have its record evicted by newer events from other devices,
     // silently clearing an alert that never actually recovered.
-    const low = [...this._deviceBatteryOk.values()].map(({ model, id }) =>
-      id != null ? `${model || "Unknown device"} (id ${id})` : model || "Unknown device",
-    );
+    // Sorted by key (not Map iteration order) for a presentation order that's stable regardless
+    // of which device most recently reported - the eviction logic above deliberately reorders
+    // the map's *insertion* order on every refresh (delete-then-set, to track LRU recency), and
+    // rendering that order directly would change "A, B" to "B, A" on a no-op refresh, defeating
+    // the _lastBatteryAlertMessage dedup below and re-triggering the live-region announcement.
+    const low = [...this._deviceBatteryOk.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, { model, id, channel }]) => {
+        const parts = [id != null ? `id ${id}` : null, channel != null ? `ch ${channel}` : null].filter(Boolean);
+        return parts.length ? `${model || "Unknown device"} (${parts.join(", ")})` : model || "Unknown device";
+      });
     const message = low.length === 0 ? "" : `⚠️ Low battery: ${low.map(esc).join(", ")}`;
     // Every unrelated decoded_device event (and the 30s poll, via _loadState -> _renderDecodedLog
     // -> here) calls this while any device remains low. This is an aria-live="assertive" region,
