@@ -1161,6 +1161,12 @@ class SdrHubPanel extends HTMLElement {
     this._aliasDraft = null;
     this._aliasDraftSelection = null;
     this._aliasHadFocus = false;
+    // True between compositionstart and compositionend on the alias editor. A composition session
+    // belongs to the *DOM node*, so replacing the input destroys it however carefully the value
+    // and selection are snapshotted - the candidate is cancelled or committed early. Ignoring
+    // composing key events was not enough; the rebuild itself has to wait.
+    this._aliasComposing = false;
+    this._decodedRenderDeferred = false;
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
     // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
     // favorite only flashes once per new decode rather than on every unrelated re-render.
@@ -1453,6 +1459,12 @@ class SdrHubPanel extends HTMLElement {
   // the storage listener was torn down and change notifications were therefore missed.
   _reconcilePreferences() {
     const hadShell = !!this.querySelector("#sdr-hub-root");
+    // Reloaded before the shell-rebuild branch below, which returns early. If another tab both
+    // renamed a device and changed a shell-rendered preference while this panel was detached,
+    // that branch fired and returned without ever picking the rename up - and this method is the
+    // only recovery path for changes missed while detached, so the stale alias persisted until
+    // an unrelated alias storage event or a second detach/reattach.
+    this._deviceAliases = loadDeviceAliases();
     // The sweep/receiver form defaults and the help card's visibility are rendered *into* the
     // shell rather than driven from live state, so no amount of updating existing controls can
     // reconcile them - a stale form would also re-persist the reset-away values on its next
@@ -1472,7 +1484,6 @@ class SdrHubPanel extends HTMLElement {
     this._batterySoundEnabled = loadBatterySoundEnabled();
     this._decodedTimeMode = loadDecodedTimeMode();
     this._favoriteDevices = loadFavoriteDevices();
-    this._deviceAliases = loadDeviceAliases();
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -3008,7 +3019,11 @@ class SdrHubPanel extends HTMLElement {
           <span>weaker → stronger</span>
           <span style="display:flex;align-items:center;gap:4px;">
             <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgb(255,0,0);"></span>
-            strongest bin in each row
+            peak ≥${PEAK_MIN_DELTA_DB} dB above the row median
+          </span>
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;border:1px solid var(--divider-color,#e0e0e0);background:transparent;"></span>
+            no data
           </span>
         </div>
       </div>`;
@@ -3293,13 +3308,23 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _renderDecodedLog() {
+    // Independent of the filter text/results below - battery state should stay visible even
+    // while a user has the log filtered down to something else entirely, and it is not affected
+    // by the composition deferral below.
+    this._renderBatteryAlerts();
+    // Deferred while an IME composition is active. Rebuilding replaces the input node the
+    // composition is attached to, which no amount of value/selection snapshotting can survive.
+    // Decodes arriving meanwhile are already in _decodedLog; only the repaint waits, and it runs
+    // on compositionend. Composition is a short, user-driven window, so this cannot stall the log
+    // indefinitely - and the editor closing clears the flag either way.
+    if (this._aliasComposing) {
+      this._decodedRenderDeferred = true;
+      return;
+    }
     // Snapshot the open editor before anything below can replace it. Every path out of this
     // method rewrites the log's markup, and the rebuild is usually triggered by something the
     // user did not do - an incoming decode, or the 30s age tick.
     this._snapshotAliasEditor();
-    // Independent of the filter text/results below - battery state should stay visible even
-    // while a user has the log filtered down to something else entirely.
-    this._renderBatteryAlerts();
     const el = this.querySelector("#sdr-hub-decoded");
     if (!el) return;
     if (this._decodedLog.length === 0) {
@@ -3457,6 +3482,9 @@ class SdrHubPanel extends HTMLElement {
     this._aliasDraft = null;
     this._aliasDraftSelection = null;
     this._aliasHadFocus = false;
+    // Cleared with the editor: the input that owned any composition is going away, so leaving
+    // this set would defer every subsequent log render forever.
+    this._aliasComposing = false;
   }
 
   // Reads the live editor's text, selection and focus state. This is the *only* writer of
@@ -3554,6 +3582,17 @@ class SdrHubPanel extends HTMLElement {
       btn.addEventListener("click", () => commitAlias(btn.dataset.aliasSave));
     });
     el.querySelectorAll("[data-alias-input]").forEach((input) => {
+      input.addEventListener("compositionstart", () => {
+        this._aliasComposing = true;
+      });
+      input.addEventListener("compositionend", () => {
+        this._aliasComposing = false;
+        // Flush whatever arrived while composing, so the log is not left stale afterwards.
+        if (this._decodedRenderDeferred) {
+          this._decodedRenderDeferred = false;
+          this._renderDecodedLog();
+        }
+      });
       input.addEventListener("keydown", (ev) => {
         // An IME emits Enter to accept the current candidate, and Escape to cancel composition,
         // both with isComposing set. Acting on them here would save or close the editor instead
@@ -3888,6 +3927,15 @@ class SdrHubPanel extends HTMLElement {
       rowImage.data[i * 4 + 1] = g;
       rowImage.data[i * 4 + 2] = b;
       rowImage.data[i * 4 + 3] = 255;
+    }
+    // Non-finite bins are made transparent rather than painted at t=0. Mapping them to 0 drew
+    // them at the *weakest* end of the ramp, so a gap in the data was indistinguishable from a
+    // genuinely quiet frequency - and the colour legend made that worse, because it explicitly
+    // tells the user the left end means "weaker". Transparency reads as "nothing here" against
+    // the card background in either theme and belongs to no colormap, so it cannot be confused
+    // with a signal level. See issue #16; why the scanner emits them at all is still open.
+    for (let i = 0; i < width; i++) {
+      if (!Number.isFinite(row.power_db[i])) rowImage.data[i * 4 + 3] = 0;
     }
     if (peak) {
       // Overwrite the peak bin's pixel with a stark, unmistakable color - baked directly into
