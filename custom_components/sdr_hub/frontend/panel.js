@@ -415,6 +415,21 @@ const COLORMAPS = {
   grayscale: { label: "Grayscale", fn: grayscaleColor },
 };
 
+// CSS gradient sampled from the same colormap function the waterfall painter uses, so the legend
+// cannot drift from what is actually drawn - a hand-written gradient would silently disagree the
+// moment a ramp changed. Sampled rather than exact: ten stops is visually indistinguishable from
+// a continuous ramp at legend size.
+function colormapGradientCss(name) {
+  const fn = (COLORMAPS[name] || COLORMAPS.sequential).fn;
+  const stops = [];
+  const steps = 10;
+  for (let i = 0; i <= steps; i++) {
+    const [r, g, b] = fn(i / steps);
+    stops.push(`rgb(${r},${g},${b}) ${((i / steps) * 100).toFixed(0)}%`);
+  }
+  return `linear-gradient(to right, ${stops.join(", ")})`;
+}
+
 // Remembers the last values a user actually submitted in the add-sweep/add-receiver forms
 // (start/stop/gain/frequencies/hop-interval/scroll-mode/dongle), so reopening the panel - or a
 // page reload, which resets all in-memory JS state - doesn't reset a user's typical settings
@@ -681,18 +696,12 @@ function loadFavoriteDevices() {
 
 function loadDeviceAliases() {
   const out = new Map();
-  try {
-    // Legacy single-map layout first, so anything written before the per-key split is still
-    // honoured; a per-key entry for the same device overrides it below.
-    const legacy = JSON.parse(localStorage.getItem(DEVICE_ALIASES_KEY) || "null");
-    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
-      for (const [k, v] of Object.entries(legacy)) {
-        if (typeof v === "string" && v.trim() !== "") out.set(k, v);
-      }
-    }
-  } catch {
-    // Corrupt or hand-edited legacy value - ignore it rather than losing the per-key entries.
-  }
+  // The legacy single-map layout is *converted*, not merely read as a fallback. Keeping it as a
+  // fallback made deletions impossible to express: removing the per-device key left the legacy
+  // entry behind, and the next load resurrected it - so a migrated alias could never be cleared,
+  // and one edited under the new layout reverted to its old value when later cleared. Converting
+  // once and removing the old key means there is exactly one place a given alias can live.
+  migrateLegacyDeviceAliases();
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const storageKey = localStorage.key(i);
@@ -708,6 +717,32 @@ function loadDeviceAliases() {
     // Unavailable storage - whatever was read so far stands.
   }
   return out;
+}
+
+// One-time conversion of the pre-per-key alias map. Each entry is written to its own key unless
+// one already exists (a newer per-device edit wins), then the old map is removed so nothing can
+// read from it again. A failure here is not fatal: the entries simply stay in the old key and the
+// next load retries.
+function migrateLegacyDeviceAliases() {
+  let legacy = null;
+  try {
+    legacy = JSON.parse(localStorage.getItem(DEVICE_ALIASES_KEY) || "null");
+  } catch {
+    // Corrupt or hand-edited - drop it below rather than letting it block the per-key entries.
+  }
+  try {
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      for (const [k, v] of Object.entries(legacy)) {
+        if (typeof v !== "string" || v.trim() === "") continue;
+        if (localStorage.getItem(DEVICE_ALIAS_KEY_PREFIX + k) === null) {
+          localStorage.setItem(DEVICE_ALIAS_KEY_PREFIX + k, v);
+        }
+      }
+    }
+    if (localStorage.getItem(DEVICE_ALIASES_KEY) !== null) localStorage.removeItem(DEVICE_ALIASES_KEY);
+  } catch {
+    // Unavailable storage - retried on the next load.
+  }
 }
 
 // Writes exactly one device's alias. Passing null removes it, which is how reverting to the
@@ -2962,6 +2997,20 @@ class SdrHubPanel extends HTMLElement {
           <div data-sweep-hover="${esc(s.id)}" style="height:1.2em;"></div>
           <div data-sweep-peak="${esc(s.id)}" style="height:1.2em;"></div>
         </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:.7rem;color:var(--secondary-text-color,#727272);margin-top:2px;">
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span>${esc(String(this._dbMin))} dB</span>
+            <span data-sweep-scale="${esc(s.id)}" aria-hidden="true"
+              style="display:inline-block;width:110px;height:9px;border-radius:2px;border:1px solid var(--divider-color,#e0e0e0);
+              background:${colormapGradientCss(this._colormap)};"></span>
+            <span>${esc(String(this._dbMax))} dB</span>
+          </span>
+          <span>weaker → stronger</span>
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgb(255,0,0);"></span>
+            strongest bin in each row
+          </span>
+        </div>
       </div>`;
       })
       .join("");
@@ -3422,8 +3471,18 @@ class SdrHubPanel extends HTMLElement {
   // claim focus for an editor that does not have it.
   _snapshotAliasEditor() {
     if (!this._editingAlias) return;
+    // Scoped to the panel rather than the log container because this runs *before* the log's
+    // markup is rebuilt, when the container reference the wiring code uses is not in hand. The
+    // log lives inside this element either way, so both lookups resolve the same node.
     const input = this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
-    if (!input) return;
+    if (!input) {
+      // The editor is gone - the device was evicted from the capped log, or another tab cleared
+      // it. Focus ownership must be dropped with it: leaving the flag set meant that if the
+      // device reported again later, its editor would silently reappear and steal focus from
+      // whatever the user had moved on to.
+      this._aliasHadFocus = false;
+      return;
+    }
     this._aliasDraft = input.value;
     this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
     this._aliasHadFocus = input.getRootNode().activeElement === input;
@@ -3496,6 +3555,11 @@ class SdrHubPanel extends HTMLElement {
     });
     el.querySelectorAll("[data-alias-input]").forEach((input) => {
       input.addEventListener("keydown", (ev) => {
+        // An IME emits Enter to accept the current candidate, and Escape to cancel composition,
+        // both with isComposing set. Acting on them here would save or close the editor instead
+        // of confirming the character the user is in the middle of choosing, which makes the
+        // field unusable for Japanese, Chinese and Korean input.
+        if (ev.isComposing) return;
         if (ev.key === "Enter") {
           ev.preventDefault();
           commitAlias(input.dataset.aliasInput);
