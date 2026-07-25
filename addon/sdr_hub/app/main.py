@@ -28,6 +28,11 @@ SEQ_HIGH_WATER_PATH = Path("/data/event_seq")
 # gap-free - checkpointing every Nth value and seeding from (checkpoint + N) after a restart
 # keeps that guarantee while writing ~1/N as often. Gaps in the sequence are harmless.
 SEQ_CHECKPOINT_INTERVAL = 100
+# How far beyond the issued sequence each checkpoint reserves. Deliberately larger than the
+# checkpoint interval so a renewal can be started while headroom remains and complete
+# asynchronously, instead of the reservation only ever being renewed at the exact boundary where
+# it is already exhausted.
+SEQ_RESERVE_AHEAD = 2 * SEQ_CHECKPOINT_INTERVAL
 # What is actually on disk is a *reservation*: every checkpoint stores `seq + INTERVAL`, i.e. a
 # value strictly above anything that can be handed out before the next checkpoint. Storing the
 # issued seq instead left a window where a value was broadcast but not yet durable - a kill
@@ -71,17 +76,17 @@ def _write_seq_checkpoint(seq: int) -> None:
     with _seq_checkpoint_lock:
         # Re-checked *inside* the lock: executor jobs can complete out of order, and only holding
         # the check, the write and the mark update together prevents a lower job landing last.
-        # Compared as reservations (both sides + INTERVAL), since that is what is actually stored -
-        # comparing the raw seq against a stored reservation would skip a genuinely needed write.
-        if seq + SEQ_CHECKPOINT_INTERVAL <= _seq_high_water_written:
+        # Compared as reservations, since that is what is actually stored - comparing the raw seq
+        # against a stored reservation would skip a genuinely needed write.
+        if seq + SEQ_RESERVE_AHEAD <= _seq_high_water_written:
             return
         _write_seq_checkpoint_locked(seq)
 
 
 def _write_seq_checkpoint_locked(seq: int) -> None:
     global _seq_high_water_written, _seq_scheduled_high_water
-    # Reserve ahead of the issued value - see SEQ_CHECKPOINT_INTERVAL's comment.
-    reserved = seq + SEQ_CHECKPOINT_INTERVAL
+    # Reserve ahead of the issued value - see SEQ_RESERVE_AHEAD's comment.
+    reserved = seq + SEQ_RESERVE_AHEAD
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
@@ -125,18 +130,33 @@ def _write_seq_checkpoint_locked(seq: int) -> None:
 
 
 def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:
-    """Schedules a durable checkpoint if enough sequence numbers have been issued.
+    """Ensures `seq` is covered by a durable reservation before its caller broadcasts it.
 
-    The write plus two fsyncs are deliberately pushed to a worker thread. on_device is called
-    straight from Rtl433Decoder._read_loop, which is an asyncio task on the main loop - doing
-    blocking file I/O there would stall everything else the loop is running, including the
-    WebSocket writers and the HTTP API, for as long as /data takes to sync.
+    The write plus two fsyncs are normally pushed to a worker thread. on_device is called straight
+    from Rtl433Decoder._read_loop, which is an asyncio task on the main loop - doing blocking file
+    I/O there would stall everything else the loop is running, including the WebSocket writers and
+    the HTTP API, for as long as /data takes to sync.
     """
     global _seq_scheduled_high_water
-    if seq - _seq_scheduled_high_water < SEQ_CHECKPOINT_INTERVAL:
+    # Hard invariant, checked first: never hand out a sequence the durable reservation does not
+    # already *strictly* cover. Renewing asynchronously at the boundary was not enough - the
+    # on-disk reservation is then merely equal to the value being issued, so a kill after the
+    # broadcast but before the executor's fsync completes leaves that sequence observed by clients
+    # yet uncovered, and a restart with a backward-adjusted clock reseeds at it and reissues it.
+    # Blocking the loop here is the correct trade: it only happens if the early renewal below has
+    # not landed in time, and stalling briefly is strictly better than reissuing a sequence.
+    if seq >= _seq_high_water_written:
+        _write_seq_checkpoint(seq)
+        _seq_scheduled_high_water = seq
+        return
+    # Renewed *early*, while a full interval of headroom remains, so in the normal case the write
+    # completes well before the reservation is reached and the branch above never fires.
+    if _seq_high_water_written - seq > SEQ_CHECKPOINT_INTERVAL:
         return
     # Tracked separately from _seq_high_water_written (which only advances on a *successful*
     # write) so a slow or failing disk can't queue an executor job per decode.
+    if seq - _seq_scheduled_high_water < SEQ_CHECKPOINT_INTERVAL:
+        return
     _seq_scheduled_high_water = seq
     loop.run_in_executor(None, _write_seq_checkpoint, seq)
 

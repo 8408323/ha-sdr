@@ -1045,12 +1045,17 @@ class SdrHubPanel extends HTMLElement {
       this._broadcastChannel.onmessage = (ev) => {
         const msg = ev.data;
         if (!msg) return;
+        // Tracked with the barrier, exactly like initial and reconnect hydration: a peer's clear
+        // or invalidation advances the generation, so an untracked read here leaves a decode
+        // arriving mid-read free to capture the old generation, no-op against the bumped one, and
+        // then lose its optimistic entry when the empty record is applied. If the peer that
+        // cleared has since closed, nothing else would ever persist that event.
         if (msg.kind === "decoded_changed") {
-          this._hydrateDecodedLog();
+          this._trackBarrier("decoded", this._hydrateDecodedLog());
           return;
         }
         if (msg.kind === "battery_changed") {
-          this._hydrateBatteryState();
+          this._trackBarrier("battery", this._hydrateBatteryState());
           return;
         }
         if (msg.kind === "state_reset") {
@@ -1578,7 +1583,14 @@ class SdrHubPanel extends HTMLElement {
   // reason about (used for the alert decision).
   async _applyBatteryTransition(key, entry) {
     // Optimistic local update so the banner and alert decision don't lag a round-trip.
-    this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]), this._batteryFloor).map;
+    // Both halves of the merge result are kept. Taking only the map left the cached floor stale
+    // when a 51st recovery evicted a tombstone, so a delayed low for the evicted device was
+    // accepted into memory; the durable transaction still rejected it, but the settled merge
+    // never deletes local-only keys, so this tab could show a false low-battery banner until an
+    // adopting rehydrate or reattach happened to clear it.
+    const optimistic = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]), this._batteryFloor);
+    this._deviceBatteryOk = optimistic.map;
+    this._batteryFloor = optimistic.floor;
     this._renderBatteryAlerts();
     // See _persistDecodedEvent - the generation is only meaningful once no clear/invalidation
     // is still in flight.
