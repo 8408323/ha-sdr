@@ -432,10 +432,18 @@ const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
 // direct user choice with no derivation from the event stream, so last-writer-wins is the right
 // semantics *for concurrent edits to the same device*.
 //
-// It is NOT right for the map as a whole: two tabs renaming two different devices are not in
-// conflict, and writing a whole stale snapshot would drop one of them. Writes therefore re-read
-// and update a single entry rather than serializing the in-memory map - see commitAlias.
+// It is NOT right for the collection as a whole: two tabs renaming two different devices are not
+// in conflict, and any shared-slot write would drop one of them. Each alias therefore lives under
+// its own storage key - see DEVICE_ALIAS_KEY_PREFIX - so independent renames are independent
+// writes rather than a race that has merely been narrowed.
 const DEVICE_ALIASES_KEY = "sdr_hub_device_aliases";
+// Each alias is stored under its own key, "sdr_hub_device_alias:<deviceInstanceKey>". Two tabs
+// renaming two different devices then write to two different storage slots and cannot conflict at
+// all - which a single shared map cannot achieve, because read-modify-write is not atomic across
+// browsing contexts: both tabs can complete their read before either writes, and the later write
+// still drops the other's rename. Re-reading first narrows that window; it does not close it.
+// DEVICE_ALIASES_KEY above is retained only to migrate and clear the earlier single-map layout.
+const DEVICE_ALIAS_KEY_PREFIX = "sdr_hub_device_alias:";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 // Monotonic "generation" counter, bumped by every "Clear log" click (locally or in another
@@ -672,25 +680,60 @@ function loadFavoriteDevices() {
 }
 
 function loadDeviceAliases() {
+  const out = new Map();
   try {
-    const raw = localStorage.getItem(DEVICE_ALIASES_KEY);
-    if (!raw) return new Map();
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
-    // Values are filtered to non-empty strings: a blank alias would render as a nameless device,
-    // and the editor deletes rather than stores empty, so anything else is corrupt/hand-edited.
-    return new Map(Object.entries(parsed).filter(([, v]) => typeof v === "string" && v.trim() !== ""));
+    // Legacy single-map layout first, so anything written before the per-key split is still
+    // honoured; a per-key entry for the same device overrides it below.
+    const legacy = JSON.parse(localStorage.getItem(DEVICE_ALIASES_KEY) || "null");
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      for (const [k, v] of Object.entries(legacy)) {
+        if (typeof v === "string" && v.trim() !== "") out.set(k, v);
+      }
+    }
   } catch {
-    return new Map();
+    // Corrupt or hand-edited legacy value - ignore it rather than losing the per-key entries.
   }
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const storageKey = localStorage.key(i);
+      if (!storageKey || !storageKey.startsWith(DEVICE_ALIAS_KEY_PREFIX)) continue;
+      const value = localStorage.getItem(storageKey);
+      // Blank values are treated as absent: a nameless device is worse than the model name, and
+      // the editor removes rather than stores empty, so anything blank is corrupt/hand-edited.
+      if (typeof value === "string" && value.trim() !== "") {
+        out.set(storageKey.slice(DEVICE_ALIAS_KEY_PREFIX.length), value);
+      }
+    }
+  } catch {
+    // Unavailable storage - whatever was read so far stands.
+  }
+  return out;
 }
 
-function saveDeviceAliases(map) {
+// Writes exactly one device's alias. Passing null removes it, which is how reverting to the
+// decoder's own model name is expressed.
+function saveDeviceAlias(deviceKey, alias) {
   try {
-    localStorage.setItem(DEVICE_ALIASES_KEY, JSON.stringify(Object.fromEntries(map)));
+    if (alias) localStorage.setItem(DEVICE_ALIAS_KEY_PREFIX + deviceKey, alias);
+    else localStorage.removeItem(DEVICE_ALIAS_KEY_PREFIX + deviceKey);
   } catch {
     // See saveColormap above.
   }
+}
+
+// Every per-device alias key currently in storage. Used by the reset action, which cannot simply
+// list them in ALL_PREF_KEYS because the set is open-ended.
+function deviceAliasStorageKeys() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const storageKey = localStorage.key(i);
+      if (storageKey && storageKey.startsWith(DEVICE_ALIAS_KEY_PREFIX)) keys.push(storageKey);
+    }
+  } catch {
+    // Unavailable storage - nothing to enumerate.
+  }
+  return keys;
 }
 
 // Numeric readings for one device, oldest first, grouped by field. Derived entirely from the
@@ -1072,14 +1115,17 @@ class SdrHubPanel extends HTMLElement {
     this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
     this._deviceAliases = loadDeviceAliases(); // deviceInstanceKey -> user-assigned friendly name
-    this._expandedDevice = null; // deviceFavoriteKey whose history detail is open, if any
+    this._expandedDevice = null; // deviceInstanceKey whose history detail is open, if any
     this._editingAlias = null; // deviceInstanceKey whose rename editor is open, if any
-    // The in-progress rename text and caret. Held in state rather than read from the DOM because
-    // _renderDecodedLog() rebuilds the whole log on every decoded event and on the 30s age tick -
-    // on an active receiver that replaced the editor mid-typing, discarding the draft and the
-    // focus before the user could reach Save.
+    // The in-progress rename text, caret, and whether the editor actually held focus. All three
+    // are snapshotted from the live input immediately before the log markup is rebuilt, rather
+    // than accumulated from `input` events: an input event fires only when the *text* changes, so
+    // caret moves via arrow keys, Home/End, a mouse click or a selection gesture were invisible
+    // to it and the restored selection came from the previous edit - putting the next character
+    // in the wrong place, or replacing the whole name when nothing had been recorded yet.
     this._aliasDraft = null;
     this._aliasDraftSelection = null;
+    this._aliasHadFocus = false;
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
     // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
     // favorite only flashes once per new decode rather than on every unrelated re-render.
@@ -1278,7 +1324,7 @@ class SdrHubPanel extends HTMLElement {
       // Aliases and favorites are plain preferences: adopt whatever the other tab wrote and
       // re-render. No merge is needed (and none would be correct) - the last edit wins, which is
       // what a user changing a name in one tab expects to see in another.
-      if (ev.key === DEVICE_ALIASES_KEY) {
+      if (ev.key === DEVICE_ALIASES_KEY || (ev.key && ev.key.startsWith(DEVICE_ALIAS_KEY_PREFIX))) {
         this._deviceAliases = loadDeviceAliases();
         this._renderDecodedLog();
         return;
@@ -2515,7 +2561,9 @@ class SdrHubPanel extends HTMLElement {
     // list's own comment. Releasing leadership removes it on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
     // listing it there would make every open tab reload each time any one tab navigated away.
-    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
+    // deviceAliasStorageKeys() is enumerated rather than listed: aliases live under one key per
+    // device, so the set is open-ended and cannot appear in ALL_PREF_KEYS.
+    for (const key of [...ALL_PREF_KEYS, ...deviceAliasStorageKeys(), SOUND_LEADER_KEY]) {
       try {
         localStorage.removeItem(key);
       } catch {
@@ -3196,6 +3244,10 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _renderDecodedLog() {
+    // Snapshot the open editor before anything below can replace it. Every path out of this
+    // method rewrites the log's markup, and the rebuild is usually triggered by something the
+    // user did not do - an incoming decode, or the 30s age tick.
+    this._snapshotAliasEditor();
     // Independent of the filter text/results below - battery state should stay visible even
     // while a user has the log filtered down to something else entirely.
     this._renderBatteryAlerts();
@@ -3355,6 +3407,26 @@ class SdrHubPanel extends HTMLElement {
     this._editingAlias = null;
     this._aliasDraft = null;
     this._aliasDraftSelection = null;
+    this._aliasHadFocus = false;
+  }
+
+  // Reads the live editor's text, selection and focus state. This is the *only* writer of
+  // _aliasHadFocus besides opening the editor, deliberately: an earlier version also tracked it
+  // from focus/blur listeners, and that broke the restore outright - replacing the log's markup
+  // removes the focused input, which fires `blur`, so the listener cleared the flag after the
+  // snapshot had taken it and before the restore could use it. A live check at snapshot time
+  // needs no listeners and cannot be raced by the teardown it is trying to survive.
+  //
+  // Focus is compared against the input's own root, not `document.activeElement`: this panel
+  // renders inside a shadow tree, so document-level activeElement reports the host and would
+  // claim focus for an editor that does not have it.
+  _snapshotAliasEditor() {
+    if (!this._editingAlias) return;
+    const input = this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+    if (!input) return;
+    this._aliasDraft = input.value;
+    this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
+    this._aliasHadFocus = input.getRootNode().activeElement === input;
   }
 
   _wireDecodedLogControls(el) {
@@ -3373,6 +3445,7 @@ class SdrHubPanel extends HTMLElement {
         // Starts from the stored value; subsequent renders reuse the draft instead.
         this._aliasDraft = null;
         this._aliasDraftSelection = null;
+        this._aliasHadFocus = true;
         this._renderDecodedLog();
         const input = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
         if (input) {
@@ -3381,12 +3454,14 @@ class SdrHubPanel extends HTMLElement {
         }
       });
     });
-    // Restores the editor after any re-render that happened while it was open - a decoded event
-    // or the age tick, neither of which the user initiated. Without this the field reverted and
-    // lost focus mid-typing, which on a busy receiver made renaming effectively impossible.
-    if (this._editingAlias) {
+    // Restores the editor after a re-render it did not initiate - a decoded event or the age
+    // tick. Gated on the editor having actually held focus beforehand: the user may deliberately
+    // be typing somewhere else (the decoded-device filter re-renders this log on every
+    // keystroke), and stealing focus back would send the rest of their typing into the rename
+    // field. An open-but-unfocused editor keeps its draft, just not the caret.
+    if (this._editingAlias && this._aliasHadFocus) {
       const active = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
-      if (active && document.activeElement !== active) {
+      if (active && active.getRootNode().activeElement !== active) {
         active.focus();
         const sel = this._aliasDraftSelection;
         if (sel) active.setSelectionRange(sel[0], sel[1]);
@@ -3408,16 +3483,10 @@ class SdrHubPanel extends HTMLElement {
       // map doesn't accumulate no-op entries.
       const event = this._decodedLog.find((e) => deviceInstanceKey(e.device || {}) === key);
       const model = event?.device?.model || "";
-      // Re-read before writing, and change only this device's entry. Serializing the whole
-      // in-memory map would carry a snapshot taken before another tab renamed a *different*
-      // device, and the write would silently remove that unrelated edit. Last-writer-wins is the
-      // right semantics for two tabs renaming the same device; it is not right for independent
-      // keys that merely share a storage slot.
-      const stored = loadDeviceAliases();
-      if (value === "" || value === model) stored.delete(key);
-      else stored.set(key, value);
-      saveDeviceAliases(stored);
-      this._deviceAliases = stored;
+      // Writes only this device's own storage key, so a concurrent rename of a different device
+      // in another tab cannot be affected at all - see DEVICE_ALIAS_KEY_PREFIX.
+      saveDeviceAlias(key, value === "" || value === model ? null : value);
+      this._deviceAliases = loadDeviceAliases();
       this._closeAliasEditor();
       this._renderDecodedLog();
       this._renderBatteryAlerts();
@@ -3426,10 +3495,6 @@ class SdrHubPanel extends HTMLElement {
       btn.addEventListener("click", () => commitAlias(btn.dataset.aliasSave));
     });
     el.querySelectorAll("[data-alias-input]").forEach((input) => {
-      input.addEventListener("input", () => {
-        this._aliasDraft = input.value;
-        this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
-      });
       input.addEventListener("keydown", (ev) => {
         if (ev.key === "Enter") {
           ev.preventDefault();
