@@ -275,6 +275,16 @@ function fmtDecodedField(key, value) {
   return `${key.replace(/_/g, " ")}: ${value}`;
 }
 
+// True only when `field` is actually present on `obj` (own key, so a plain-object backup from
+// JSON.parse) but holds something other than a finite number - e.g. a hand-edited sample_rate
+// stored as a string, or null. An *absent* field is fine (the add-on applies its own default);
+// a present-but-wrong-type one is a sign the entry doesn't mean what it looks like it means, so
+// callers should reject the whole entry rather than silently dropping just this field and
+// letting the default paper over the difference.
+function invalidOptionalNumber(obj, field) {
+  return Object.hasOwn(obj, field) && !Number.isFinite(obj[field]);
+}
+
 // Builds a copy-pasteable HA automation/script action snippet for a running sweep/receiver -
 // bridges "ad-hoc thing I started from the panel" to "permanent thing an automation manages",
 // without the user needing to look up the service's field names themselves.
@@ -1638,12 +1648,25 @@ class SdrHubPanel extends HTMLElement {
       this._showError(`Could not read config file: ${err.message || err}`);
       return;
     }
-    if (!config || typeof config !== "object") {
+    // Requires the actual shape _exportConfig() writes (a numeric version marker plus real
+    // sweeps/receivers arrays), not just "any object" - a random unrelated JSON file (e.g. a
+    // package.json picked by mistake) would otherwise sail through this check, have its missing
+    // sweeps/receivers default to empty arrays below, and report a successful no-op import,
+    // misleading the user into thinking their actual backup was restored. Empty arrays are
+    // still accepted here (a backup with nothing active is legitimate) - only their absence, or
+    // an unrecognized version, is rejected.
+    if (
+      !config ||
+      typeof config !== "object" ||
+      config.version !== 1 ||
+      !Array.isArray(config.sweeps) ||
+      !Array.isArray(config.receivers)
+    ) {
       this._showError("Config file is not a valid SDR Hub backup");
       return;
     }
-    const sweeps = Array.isArray(config.sweeps) ? config.sweeps : [];
-    const receivers = Array.isArray(config.receivers) ? config.receivers : [];
+    const sweeps = config.sweeps;
+    const receivers = config.receivers;
     const errors = [];
     // Sequential (not Promise.all) so a busy/duplicate dongle rejection on one entry doesn't
     // race the add-on's per-dongle ownership check against another entry targeting the same
@@ -1658,6 +1681,15 @@ class SdrHubPanel extends HTMLElement {
         errors.push(`Skipped an invalid sweep entry (missing dongle_serial/start_hz/stop_hz)`);
         continue;
       }
+      // A present-but-malformed optional value (e.g. a hand-edited sample_rate stored as a
+      // string or null) must reject the entry, not silently fall through to add_sweep's
+      // default - _sweepImportPayload only forwards optionals that are already valid numbers,
+      // so without this check a materially different sweep gets created while import still
+      // reports success.
+      if (invalidOptionalNumber(s, "gain") || invalidOptionalNumber(s, "sample_rate")) {
+        errors.push(`Skipped sweep entry ${s.label || s.dongle_serial}: gain/sample_rate must be a number if present`);
+        continue;
+      }
       try {
         await this._callWS(this._sweepImportPayload(s));
       } catch (err) {
@@ -1669,6 +1701,11 @@ class SdrHubPanel extends HTMLElement {
       // device reasoning applies here.
       if (!r || typeof r.dongle_serial !== "string" || !Array.isArray(r.frequencies_hz) || r.frequencies_hz.length === 0) {
         errors.push(`Skipped an invalid receiver entry (missing dongle_serial/frequencies_hz)`);
+        continue;
+      }
+      // See the matching gain/sample_rate check in the sweep loop above.
+      if (invalidOptionalNumber(r, "hop_interval_s")) {
+        errors.push(`Skipped receiver entry ${r.label || r.dongle_serial}: hop_interval_s must be a number if present`);
         continue;
       }
       try {
