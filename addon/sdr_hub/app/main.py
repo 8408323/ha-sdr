@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from auth import resolve_api_token
 from broadcaster import Broadcaster
@@ -17,6 +18,46 @@ from routes import router
 from scanner import SweepRow
 
 _LOGGER = logging.getLogger("sdr_hub")
+
+# Highest event `seq` handed out, persisted so the counter can be seeded above it after a
+# restart. Alongside /data/api_token (see auth.py) - the add-on's existing durable-state path.
+SEQ_HIGH_WATER_PATH = Path("/data/event_seq")
+# Persisting on literally every decode would mean a file write per received packet. Events are
+# only ever compared against *other* events, so the sequence needs to be non-decreasing, not
+# gap-free - checkpointing every Nth value and seeding from (checkpoint + N) after a restart
+# keeps that guarantee while writing ~1/N as often. Gaps in the sequence are harmless.
+SEQ_CHECKPOINT_INTERVAL = 100
+_seq_high_water_written = 0
+
+
+def resolve_seq_seed() -> int:
+    """Seeds the event counter above both the wall clock and anything already handed out."""
+    now_ms = int(time.time() * 1000)
+    stored = 0
+    try:
+        if SEQ_HIGH_WATER_PATH.exists():
+            stored = int(SEQ_HIGH_WATER_PATH.read_text().strip() or 0)
+    except (OSError, ValueError):
+        # Unreadable/corrupt checkpoint - fall back to the clock alone. Worst case is the
+        # pre-existing behaviour, not a crash on startup.
+        stored = 0
+    # +SEQ_CHECKPOINT_INTERVAL covers values issued since the last checkpoint but before the
+    # restart, which by construction can't exceed one interval.
+    return max(now_ms, stored + SEQ_CHECKPOINT_INTERVAL)
+
+
+def record_seq_high_water(seq: int) -> None:
+    global _seq_high_water_written
+    if seq - _seq_high_water_written < SEQ_CHECKPOINT_INTERVAL:
+        return
+    _seq_high_water_written = seq
+    try:
+        SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SEQ_HIGH_WATER_PATH.write_text(str(seq))
+    except OSError:
+        # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
+        # rather than taking the decoder thread down over a checkpoint write.
+        pass
 
 
 @asynccontextmanager
@@ -35,13 +76,15 @@ async def lifespan(app: FastAPI):
     broadcaster = Broadcaster()
     app.state.broadcaster = broadcaster
 
-    # Seeded from the current wall clock (in ms) rather than 0 so that values keep increasing
-    # across add-on restarts too - a client's persisted events survive a restart, and a counter
-    # restarting at 0 would make every new event sort behind them. Within a run it only ever
-    # increments, so it is immune to the clock corrections that motivated it in the first place.
+    # Monotonic across restarts, not just within a run. Seeding purely from the wall clock was
+    # not enough: if the clock is moved *backwards* and the add-on then restarts, the new seed
+    # can land below values clients have already persisted, so every subsequent decode sorts
+    # behind their existing log (and gets truncated as "old") while newer battery transitions
+    # are rejected as lower-ordered - a recovery could stay hidden indefinitely. Seeding from
+    # max(last issued, now) makes the sequence non-decreasing regardless of what the clock does.
     # next() on an itertools.count is atomic under the GIL, which matters because on_device is
     # invoked from the decoder threads rather than the event loop.
-    event_seq = itertools.count(int(time.time() * 1000))
+    event_seq = itertools.count(resolve_seq_seed())
 
     def on_row(sweep_id: str, row: SweepRow) -> None:
         broadcaster.broadcast(
@@ -68,11 +111,13 @@ async def lifespan(app: FastAPI):
         # low-battery entry could never be superseded by its own recovery. `seq` is strictly
         # increasing for the life of this process, so ordering can't invert. received_at is kept
         # alongside it for display/diagnostics only.
+        seq = next(event_seq)
+        record_seq_high_water(seq)
         broadcaster.broadcast(
             {
                 "type": "decoded_device",
                 "event_id": uuid.uuid4().hex,
-                "seq": next(event_seq),
+                "seq": seq,
                 "received_at": time.time(),
                 "receiver_id": receiver_id,
                 "device": device,

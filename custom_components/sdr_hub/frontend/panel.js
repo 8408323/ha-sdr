@@ -352,6 +352,13 @@ function mergeBatteryLowState(current, incoming) {
       // single transmission, rather than once when it first went low.
       const keepAlerted = existing && existing.low && entry.low ? existing.alertedAt : undefined;
       out.set(key, keepAlerted !== undefined ? { ...entry, alertedAt: keepAlerted } : entry);
+    } else if (entry.ord === existing.ord && Number.isFinite(entry.alertedAt) && !Number.isFinite(existing.alertedAt)) {
+      // Same transition, but the incoming copy is marked as alerted and this one isn't - that's
+      // the sound leader's marker propagating. The greater-than test above rejects it (equal
+      // ord), so without adopting it here a tab holding the unmarked copy would carry no marker
+      // into the next low->low refresh and re-play the alert once the original leader closed,
+      // even though the device never recovered.
+      out.set(key, { ...existing, alertedAt: entry.alertedAt });
     }
   }
   // Bound low entries and tombstones *separately*. A single shared cap let healthy devices push
@@ -367,12 +374,22 @@ function mergeBatteryLowState(current, incoming) {
   return new Map([...low, ...dead]);
 }
 
+// Re-reads the stored generation immediately before writing and never lowers it. A tab that
+// read generation 0, then had another tab clear at generation 1 underneath it, would otherwise
+// write its own stale envelope back at generation 0 - regressing storage, so a *newly opened*
+// tab would load exactly the pre-gap low-battery assertions the clear existed to invalidate.
+// (Peers already holding the higher generation ignore such a write, which is precisely why it
+// can sit there unnoticed.) If the stored generation is ahead, this tab's map is superseded and
+// its entries are dropped rather than merged back in.
 function saveBatteryState(gen, map) {
   try {
+    const storedGen = loadBatteryState().gen;
+    if (storedGen > gen) return { gen: storedGen, map: loadBatteryState().map };
     localStorage.setItem(BATTERY_LOW_KEY, JSON.stringify({ gen, entries: Object.fromEntries(map) }));
   } catch {
     // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
   }
+  return { gen, map };
 }
 
 function loadFavoriteDevices() {
@@ -783,8 +800,17 @@ class SdrHubPanel extends HTMLElement {
   // duplicate listeners that never get removed.
   _wireConnectionStatus() {
     this._onConnReady = () => {
+      const wasDisconnected = this._connectionStatus === "disconnected";
       this._connectionStatus = "connected";
       this._renderConnectionStatus();
+      // An HA-side restart or integration reload drops this WebSocket and the client silently
+      // resubscribes, without ever detaching this element. Decoded events can be missed in that
+      // window, and coordinator.py deliberately emits stream_reconnected only *after* its first
+      // connection - so on the HA-restart path no stream_gap/stream_reconnected ever arrives and
+      // nothing would otherwise invalidate the restored map. If the missed event was a recovery,
+      // the banner would keep asserting a low battery indefinitely. Treat a reconnect as
+      // equivalent to a gap: the loss is upstream of every tab, so no peer's copy is better.
+      if (wasDisconnected) this._invalidateBatteryState();
     };
     this._onConnDisconnected = () => {
       this._connectionStatus = "disconnected";
@@ -956,8 +982,16 @@ class SdrHubPanel extends HTMLElement {
     // reasoning as the storage handler. A detach/reattach doesn't discard in-memory state, and
     // that state can legitimately be ahead of storage (a peer wrote a staler value, or this
     // tab's own writes were blocked by quota), so replacing would lose it.
-    const reattachBattery = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
-    this._batteryGen = reattachBattery.gen;
+    // Battery state is *adopted* from storage here, not merged with the detached cache - the
+    // opposite of the decoded log below, and deliberately so. While detached this element
+    // received no events, so its map can hold nothing storage lacks; meanwhile tombstones can be
+    // evicted (see MAX_TRACKED_BATTERY_TOMBSTONES), and once a device's recovery tombstone is
+    // gone there is nothing left to defeat an older low entry. Merging an arbitrarily stale
+    // detached cache back in could therefore resurrect a recovered device as low indefinitely.
+    // The log has no such hazard: it's a grow-only set whose entries are never contradicted,
+    // only superseded wholesale by a generation bump.
+    const reattachBattery = loadBatteryState();
+    this._batteryGen = Math.max(this._batteryGen, reattachBattery.gen);
     this._deviceBatteryOk = reattachBattery.map;
     this._renderBatteryAlerts();
     // Same for the decoded log - except that a *generation* change means the log was cleared
@@ -1147,14 +1181,7 @@ class SdrHubPanel extends HTMLElement {
       // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
-      // Bump the battery generation so this clear *dominates* rather than merges. A peer still
-      // processing a pre-gap event would otherwise persist its stale low entry after this write,
-      // and the union in the storage handler would pull it straight back in - leaving a banner
-      // asserting a low battery that nothing can now contradict.
-      this._batteryGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
-      this._deviceBatteryOk = new Map();
-      saveBatteryState(this._batteryGen, this._deviceBatteryOk);
-      this._renderBatteryAlerts();
+      this._invalidateBatteryState();
       this._loadState();
     }
   }
@@ -1190,6 +1217,20 @@ class SdrHubPanel extends HTMLElement {
     this._renderDecodedLog();
   }
 
+  // Discards all low-battery state and bumps the generation so the clear *dominates* rather
+  // than merges. A peer still processing a pre-gap event would otherwise persist its stale low
+  // entry afterwards and the union in the storage handler would pull it straight back in,
+  // leaving a banner nothing can contradict. Used for both stream_gap/stream_reconnected and an
+  // HA-side WebSocket reconnect - in every one of those the loss is upstream of all tabs, so no
+  // peer holds a better copy and re-reading shared state would just re-adopt the same staleness.
+  _invalidateBatteryState() {
+    this._batteryGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
+    const cleared = saveBatteryState(this._batteryGen, new Map());
+    this._batteryGen = cleared.gen;
+    this._deviceBatteryOk = cleared.map;
+    this._renderBatteryAlerts();
+  }
+
   // Merges this transition into the shared map as an LWW-register keyed on the server's own
   // received_at (see mergeBatteryLowState), so tabs at different positions in the event stream
   // reconcile correctly instead of overwriting each other.
@@ -1221,15 +1262,19 @@ class SdrHubPanel extends HTMLElement {
     // Merge against both storage *and* this tab's own in-memory view, so a peer's concurrent
     // write can't erase knowledge this tab already had.
     const merged = mergeBatteryLowState(base, incoming);
-    this._deviceBatteryOk = merged;
-    saveBatteryState(this._batteryGen, merged);
+    // saveBatteryState returns the authoritative state: normally what was just written, but the
+    // post-gap storage value instead if a peer's clear landed mid-write. Everything below reads
+    // from that rather than `merged`, so a superseded transition can't still trigger an alert.
+    const written = saveBatteryState(this._batteryGen, merged);
+    this._batteryGen = written.gen;
+    this._deviceBatteryOk = written.map;
     this._renderBatteryAlerts();
     // Only a transition that is genuinely newer than whatever has already been alerted for this
     // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
-    // Reads alertedAt off the *merged* entry rather than `previous`, since the merge carries it
+    // Reads alertedAt off the merged entry rather than `previous`, since the merge carries it
     // forward across a low->low refresh (see mergeBatteryLowState); using `previous` alone would
     // miss a marker another tab had already written.
-    const winner = merged.get(key);
+    const winner = written.map.get(key);
     if (!winner || !winner.low || winner.ord !== ord) return;
     const priorAlert = winner.alertedAt ?? previous?.alertedAt;
     if (Number.isFinite(priorAlert)) return;
@@ -1252,7 +1297,9 @@ class SdrHubPanel extends HTMLElement {
       const marked = new Map(this._deviceBatteryOk);
       marked.set(key, { ...entry, alertedAt: ord });
       this._deviceBatteryOk = marked;
-      saveBatteryState(this._batteryGen, marked);
+      const markWrite = saveBatteryState(this._batteryGen, marked);
+      this._batteryGen = markWrite.gen;
+      this._deviceBatteryOk = markWrite.map;
     }
     this._playBatteryAlertSound();
   }
@@ -1576,7 +1623,16 @@ class SdrHubPanel extends HTMLElement {
       // direct user gesture. Waiting until the *later*, gesture-less decoded_device WS event
       // that actually plays the alert would construct/resume the context outside that window,
       // leaving it "running" in name but producing no audible sound - see _playBatteryAlertSound.
-      if (this._batterySoundEnabled) this._ensureAudioContextRunning();
+      if (this._batterySoundEnabled) {
+        this._ensureAudioContextRunning();
+      } else {
+        // Hand the claim back immediately. A "storage" event never fires in the tab that made
+        // the change, so nothing else here would notice, and the heartbeat merely stops without
+        // removing the claim - leaving other playable tabs refusing alerts for up to
+        // LEADER_TTL_MS while this now-muted tab still nominally owns the role. A sensor that
+        // sends no repeat low report in that window would produce no sound at all.
+        this._releaseSoundLeadership();
+      }
     });
     this._wireConfirmButton(this.querySelector("#sdr-hub-reset-prefs"), () => this._onResetPreferences(), "Confirm reset?");
     // #sdr-hub-decoded above is created empty (just like every other container in this
