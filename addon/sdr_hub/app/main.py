@@ -28,6 +28,12 @@ SEQ_HIGH_WATER_PATH = Path("/data/event_seq")
 # gap-free - checkpointing every Nth value and seeding from (checkpoint + N) after a restart
 # keeps that guarantee while writing ~1/N as often. Gaps in the sequence are harmless.
 SEQ_CHECKPOINT_INTERVAL = 100
+# What is actually on disk is a *reservation*: every checkpoint stores `seq + INTERVAL`, i.e. a
+# value strictly above anything that can be handed out before the next checkpoint. Storing the
+# issued seq instead left a window where a value was broadcast but not yet durable - a kill
+# between the two, with a backward-adjusted clock, reseeded at the same point and reissued
+# sequence numbers clients already held. An equal-ordered recovery loses to the stored low in
+# mergeBatteryLowState, so a stale low-battery warning could persist indefinitely.
 _seq_high_water_written = 0
 _seq_scheduled_high_water = 0
 # Serializes the whole check-write-mark sequence. The guard alone was not enough: two executor
@@ -48,9 +54,15 @@ def resolve_seq_seed() -> int:
         # Unreadable/corrupt checkpoint - fall back to the clock alone. Worst case is the
         # pre-existing behaviour, not a crash on startup.
         stored = 0
-    # +SEQ_CHECKPOINT_INTERVAL covers values issued since the last checkpoint but before the
-    # restart, which by construction can't exceed one interval.
-    return max(now_ms, stored + SEQ_CHECKPOINT_INTERVAL)
+    # `stored` is already a reservation above every issued value, so it is used directly rather
+    # than with another interval added on top.
+    seed = max(now_ms, stored)
+    # Reserved *synchronously, before the first sequence is handed out* - startup is not on the
+    # hot path, so the blocking write is fine here and is what closes the kill-before-checkpoint
+    # window. Any later restart seeds at or above this, so a reissue is impossible even if the
+    # process dies before its first runtime checkpoint completes.
+    _write_seq_checkpoint(seed)
+    return seed
 
 
 def _write_seq_checkpoint(seq: int) -> None:
@@ -59,13 +71,17 @@ def _write_seq_checkpoint(seq: int) -> None:
     with _seq_checkpoint_lock:
         # Re-checked *inside* the lock: executor jobs can complete out of order, and only holding
         # the check, the write and the mark update together prevents a lower job landing last.
-        if seq <= _seq_high_water_written:
+        # Compared as reservations (both sides + INTERVAL), since that is what is actually stored -
+        # comparing the raw seq against a stored reservation would skip a genuinely needed write.
+        if seq + SEQ_CHECKPOINT_INTERVAL <= _seq_high_water_written:
             return
         _write_seq_checkpoint_locked(seq)
 
 
 def _write_seq_checkpoint_locked(seq: int) -> None:
     global _seq_high_water_written, _seq_scheduled_high_water
+    # Reserve ahead of the issued value - see SEQ_CHECKPOINT_INTERVAL's comment.
+    reserved = seq + SEQ_CHECKPOINT_INTERVAL
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
@@ -81,7 +97,7 @@ def _write_seq_checkpoint_locked(seq: int) -> None:
         # never have reached disk, leaving the checkpoint missing or full of zeros. That degrades
         # to clock-seeding, which is exactly the case this checkpoint exists to survive.
         with open(tmp, "w") as fh:
-            fh.write(str(seq))
+            fh.write(str(reserved))
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, SEQ_HIGH_WATER_PATH)
@@ -95,15 +111,17 @@ def _write_seq_checkpoint_locked(seq: int) -> None:
         # became writable again - so the last durable checkpoint could fall further behind than
         # one interval, and the `stored + INTERVAL` seed would then overlap sequence values
         # clients had already persisted.
-        _seq_high_water_written = seq
+        _seq_high_water_written = reserved
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
-        # rather than failing the decode over a checkpoint write. Roll the *scheduled* mark back
-        # to what is actually durable, so the next interval retries instead of being suppressed:
-        # otherwise a single transient failure could let the durable checkpoint fall arbitrarily
-        # far behind the issued sequence, and a restart with a rolled-back clock would then seed
-        # from it and reissue values clients already hold.
-        _seq_scheduled_high_water = _seq_high_water_written
+        # rather than failing the decode over a checkpoint write. The retry baseline is advanced
+        # to this attempt, NOT rolled back to the durable mark: rolling back made the very next
+        # decode satisfy the interval test again (after a failure at written+100 the next seq is
+        # already written+101), so a persistently failing /data had a high-rate receiver
+        # submitting a fresh executor job per packet. Advancing it keeps retries to one per
+        # interval, and the startup reservation above - not this write - is what guarantees no
+        # sequence is ever reissued while the failure persists.
+        _seq_scheduled_high_water = seq
 
 
 def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:

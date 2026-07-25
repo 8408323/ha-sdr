@@ -218,8 +218,15 @@ async function idbGet(key) {
 function normalizeBatteryRecord(raw) {
   const gen = raw && Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0;
   const entries = raw && raw.entries && typeof raw.entries === "object" ? raw.entries : {};
+  // Highest transition order whose recovery tombstone has been evicted by the cap. A count-limited
+  // tombstone set cannot by itself dominate an arbitrarily delayed writer: a tab suspended mid-write
+  // can resume long after its device's tombstone was pushed out, find the key absent, and have its
+  // stale `low` accepted as new - resurrecting a warning for a device that already recovered and may
+  // never report again. The floor is the durable memory of what those evicted tombstones knew.
+  const floor = raw && Number.isFinite(raw.floor) ? raw.floor : 0;
   return {
     gen,
+    floor,
     map: new Map(
       Object.entries(entries).filter(
         ([, v]) => v && typeof v === "object" && Number.isFinite(v.ord) && typeof v.low === "boolean",
@@ -228,8 +235,8 @@ function normalizeBatteryRecord(raw) {
   };
 }
 
-function serializeBatteryRecord(gen, map) {
-  return { gen, entries: Object.fromEntries(map) };
+function serializeBatteryRecord(gen, map, floor = 0) {
+  return { gen, floor, entries: Object.fromEntries(map) };
 }
 
 function normalizeDecodedRecord(raw) {
@@ -475,10 +482,16 @@ function batteryStateKey(d) {
 // Recoveries are kept as tombstones (low:false) rather than deleted for exactly the same reason:
 // an absent key carries no order, so a stale "still low" write would otherwise win over a newer
 // recovery simply by being present.
-function mergeBatteryLowState(current, incoming) {
+function mergeBatteryLowState(current, incoming, floor = 0) {
   const out = new Map(current);
   for (const [key, entry] of incoming) {
     const existing = out.get(key);
+    // No surviving record for this key *and* the write predates an evicted recovery: this is a
+    // delayed writer (a suspended tab resuming) whose contradicting tombstone is gone. Accepting
+    // it would reinstate a warning for a device that already recovered. Deliberately narrow -
+    // only when nothing is present to compare against, so a device still legitimately tracked as
+    // low is never dropped by a floor raised on some unrelated device's recovery.
+    if (!existing && entry.low && entry.ord <= floor) continue;
     if (!existing || entry.ord > existing.ord) {
       // Carry the alert marker forward across a low->low refresh. Each repeat low report from a
       // still-low sensor has a newer ord, so replacing outright would drop alertedAt and make
@@ -513,10 +526,14 @@ function mergeBatteryLowState(current, incoming) {
   // reinstate itself. Eviction orders by transition order, not Map insertion order, so it stays
   // deterministic across tabs.
   const byRecency = (entries) => entries.sort(([, a], [, b]) => b.ord - a.ord);
+  const allDead = byRecency([...out.entries()].filter(([, e]) => !e.low));
   const low = byRecency([...out.entries()].filter(([, e]) => e.low)).slice(0, MAX_TRACKED_LOW_BATTERY_DEVICES);
-  const dead = byRecency([...out.entries()].filter(([, e]) => !e.low)).slice(0, MAX_TRACKED_BATTERY_TOMBSTONES);
-  if (low.length + dead.length === out.size) return out;
-  return new Map([...low, ...dead]);
+  const dead = allDead.slice(0, MAX_TRACKED_BATTERY_TOMBSTONES);
+  // Every tombstone about to be dropped raises the floor to its own order, so the knowledge it
+  // carried ("this device had recovered by ord N") survives its eviction as a single number.
+  const evictedFloor = allDead.slice(MAX_TRACKED_BATTERY_TOMBSTONES).reduce((m, [, e]) => Math.max(m, e.ord), floor);
+  if (low.length + dead.length === out.size) return { map: out, floor: evictedFloor };
+  return { map: new Map([...low, ...dead]), floor: evictedFloor };
 }
 
 
@@ -793,6 +810,8 @@ class SdrHubPanel extends HTMLElement {
     // can't cover this, since it only advances once the clear's transaction commits, leaving a
     // window in which an older equal-generation result would repopulate what was just cleared.
     this._clearEpoch = 0;
+    // In-flight generation-changing operations, per state domain - see _trackBarrier.
+    this._barriers = { decoded: null, battery: null };
     // batteryStateKey(device) -> {model, id, channel, low, at, alertedAt?} - the canonical,
     // cross-tab-shared low-battery state (see BATTERY_LOW_KEY and mergeBatteryLowState).
     //
@@ -810,6 +829,7 @@ class SdrHubPanel extends HTMLElement {
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
     this._deviceBatteryOk = new Map();
     this._batteryGen = 0;
+    this._batteryFloor = 0;
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -865,7 +885,7 @@ class SdrHubPanel extends HTMLElement {
       // stream, so a decode arriving in that window captured generation 0, no-opped against a
       // higher stored generation, and then had its own optimistic update overwritten by the
       // empty settled record it read back - the event vanished from the tab that saw it.
-      this._hydrated = Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState()]);
+      this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState()]));
       this._loadState();
       this._subscribe();
       this._wireConnectionStatus();
@@ -903,7 +923,12 @@ class SdrHubPanel extends HTMLElement {
       // shared storage instead, which is exactly what a still-connected peer has been keeping
       // up to date, and don't touch the generation.
       if (wasDisconnected) {
-        this._hydrateBatteryState({ adopt: true });
+        // The decoded log is re-read too. While this tab's socket was down a still-connected
+        // peer could have persisted events it never saw, and nothing else would pull them in:
+        // peer notifications are one-shot, so if decoding then goes quiet the log stays missing
+        // that history indefinitely. Merged rather than adopted - this tab stayed attached and
+        // its own in-memory log is not stale, just incomplete.
+        this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]));
       }
     };
     this._onConnDisconnected = () => {
@@ -1041,7 +1066,7 @@ class SdrHubPanel extends HTMLElement {
           this._deviceBatteryOk = new Map();
           this._renderDecodedLog();
           this._renderBatteryAlerts();
-          this._hydrated = Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState({ adopt: true })]);
+          this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState({ adopt: true })]));
           return;
         }
       };
@@ -1099,7 +1124,7 @@ class SdrHubPanel extends HTMLElement {
     // tab's own writes were blocked by quota), so replacing would lose it.
     // Both are re-read from IndexedDB, which is authoritative - see the storage-layer comment.
     // adopt:true because a detached element's battery cache is strictly stale (see the method).
-    this._hydrated = Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]);
+    this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]));
     this._renderBatteryAlerts();
     if (!this._unsub && !this._subscribing) {
       this._loadState();
@@ -1317,16 +1342,30 @@ class SdrHubPanel extends HTMLElement {
   // Re-reads the authoritative decoded log from IndexedDB. Used on first load, on reattach, and
   // whenever a peer signals a change - IndexedDB has no cross-document change event of its own,
   // so BroadcastChannel carries the notification while the database remains the source of truth.
-  // Resolves once the in-flight hydration has settled, so callers read a generation that came
-  // from storage rather than the constructor's 0. Never rejects and never blocks indefinitely:
-  // the hydrate methods swallow their own failures, and if hydration has not been started (an
-  // element mutating before its hass setter ran) there is simply nothing to wait for.
-  async _awaitHydration() {
-    try {
-      await this._hydrated;
-    } catch {
-      // Hydration failing means storage is unusable - the mutation below will fail too and fall
-      // back to its optimistic in-memory state. Not a reason to drop the event here.
+  // Registers an operation that will change a generation, so mutations can wait for it rather
+  // than racing it. Hydration alone was too narrow a gate: a clear or a gap invalidation opens
+  // its transaction first, so a mutation starting afterwards still reads the *pre-bump*
+  // generation, no-ops when its own transaction observes the bumped one, and then has its
+  // optimistic update erased by the empty settled record. Every generation-changing operation
+  // has to be part of the barrier, not just the initial load.
+  _trackBarrier(kind, promise) {
+    const guarded = Promise.resolve(promise).catch(() => {});
+    for (const k of kind === "both" ? ["decoded", "battery"] : [kind]) this._barriers[k] = guarded;
+    return promise;
+  }
+
+  // Waits until no generation-changing operation for `kind` is in flight. Loops because awaiting
+  // yields, during which another operation can register - re-checking until the barrier is
+  // unchanged is what makes the generation read afterwards actually current. Bounded so a
+  // pathological stream of clears can't starve a decode forever; the generation guard inside the
+  // transaction remains the correctness backstop either way. Never rejects: the tracked
+  // operations swallow their own storage failures.
+  async _awaitBarrier(kind) {
+    for (let i = 0; i < 8; i++) {
+      const barrier = this._barriers[kind];
+      if (!barrier) return;
+      await barrier;
+      if (this._barriers[kind] === barrier) return;
     }
   }
 
@@ -1352,12 +1391,34 @@ class SdrHubPanel extends HTMLElement {
       const settled = normalizeBatteryRecord(await idbGet(IDB_KEY_BATTERY));
       this._deviceBatteryOk =
         !adopt && settled.gen === this._batteryGen
-          ? mergeBatteryLowState(this._deviceBatteryOk, settled.map)
+          ? mergeBatteryLowState(this._deviceBatteryOk, settled.map, settled.floor).map
           : settled.map;
       this._batteryGen = settled.gen;
+      this._batteryFloor = settled.floor;
       this._renderBatteryAlerts();
     } catch {
       // No usable store - whatever is in memory stands.
+    }
+  }
+
+  // The Clear-log transaction, split out so it can be published as a barrier before its first
+  // await (see _trackBarrier). Bumping the generation and emptying the log happen in one
+  // transaction, so a decode being persisted concurrently either lands before the bump (and is
+  // discarded with the old generation) or after it (and is kept) - never half-applied.
+  async _runDecodedClear(previous) {
+    if (previous) await previous;
+    try {
+      const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
+        const current = normalizeDecodedRecord(raw);
+        return { gen: current.gen + 1, entries: [] };
+      });
+      const settled = normalizeDecodedRecord(record);
+      this._decodedLogGen = settled.gen;
+      this._decodedLog = settled.log;
+      this._renderDecodedLog();
+      this._postSync({ kind: "decoded_changed" });
+    } catch {
+      // No usable store - the local clear stands for this session.
     }
   }
 
@@ -1382,7 +1443,7 @@ class SdrHubPanel extends HTMLElement {
     // Read *after* hydration settles. The optimistic render above is deliberately kept ahead of
     // it so the card still appears immediately; only the generation the write is stamped with
     // has to wait, since a generation read before hydration is a guess (0) rather than a fact.
-    await this._awaitHydration();
+    await this._awaitBarrier("decoded");
     const epoch = this._clearEpoch;
     const expectedGen = this._decodedLogGen;
     try {
@@ -1421,10 +1482,21 @@ class SdrHubPanel extends HTMLElement {
   // The bump happens inside the transaction, so a concurrent transition either lands before it
   // (and is discarded by the bump) or after it (and is correctly attributed to the new
   // generation) - there is no interleaving that can resurrect pre-gap state.
-  async _invalidateBatteryState() {
+  // Deliberately NOT async: the barrier must be published *synchronously*, before this function
+  // can yield. An earlier attempt awaited the existing barrier first and published afterwards,
+  // which left the very window this is meant to close - a transition starting in the same tick
+  // ran its own barrier check before the invalidation had registered, read the pre-bump
+  // generation, and was discarded. Chaining is done by handing the previous barrier to the
+  // worker instead, which also avoids it awaiting its own promise and deadlocking.
+  _invalidateBatteryState() {
     this._deviceBatteryOk = new Map();
     this._renderBatteryAlerts();
-    await this._awaitHydration();
+    const previous = this._barriers.battery;
+    return this._trackBarrier("battery", this._runBatteryInvalidation(previous));
+  }
+
+  async _runBatteryInvalidation(previous) {
+    if (previous) await previous;
     const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
@@ -1436,10 +1508,13 @@ class SdrHubPanel extends HTMLElement {
         // wins and the rest see a generation they did not expect and no-op, while a genuinely
         // later gap observes the newer generation and bumps correctly.
         if (current.gen !== expectedGen) return undefined;
-        return serializeBatteryRecord(current.gen + 1, new Map());
+        // The floor carries across the bump: it describes writers that may still be in flight,
+        // which a generation change does not retract.
+        return serializeBatteryRecord(current.gen + 1, new Map(), current.floor);
       });
       const settled = normalizeBatteryRecord(record);
       this._batteryGen = settled.gen;
+      this._batteryFloor = settled.floor;
       this._deviceBatteryOk = settled.map;
       this._renderBatteryAlerts();
       this._postSync({ kind: "battery_changed" });
@@ -1503,10 +1578,11 @@ class SdrHubPanel extends HTMLElement {
   // reason about (used for the alert decision).
   async _applyBatteryTransition(key, entry) {
     // Optimistic local update so the banner and alert decision don't lag a round-trip.
-    this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]));
+    this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]), this._batteryFloor).map;
     this._renderBatteryAlerts();
-    // See _persistDecodedEvent - the generation is only meaningful once hydration has settled.
-    await this._awaitHydration();
+    // See _persistDecodedEvent - the generation is only meaningful once no clear/invalidation
+    // is still in flight.
+    await this._awaitBarrier("battery");
     const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
@@ -1515,15 +1591,18 @@ class SdrHubPanel extends HTMLElement {
         // invalidation must not be merged into the generation that invalidation created, or a
         // delayed transaction in any tab could recreate the banner the bump was meant to discard.
         if (current.gen !== expectedGen) return undefined;
-        const merged = mergeBatteryLowState(current.map, new Map([[key, entry]]));
-        return serializeBatteryRecord(current.gen, merged);
+        const merged = mergeBatteryLowState(current.map, new Map([[key, entry]]), current.floor);
+        return serializeBatteryRecord(current.gen, merged.map, merged.floor);
       });
       const settled = normalizeBatteryRecord(record);
       // Same overlapping-transaction reasoning as _persistDecodedEvent - merge unless the
       // generation moved, which means an invalidation that is meant to discard entries.
       this._deviceBatteryOk =
-        settled.gen === this._batteryGen ? mergeBatteryLowState(this._deviceBatteryOk, settled.map) : settled.map;
+        settled.gen === this._batteryGen
+          ? mergeBatteryLowState(this._deviceBatteryOk, settled.map, settled.floor).map
+          : settled.map;
       this._batteryGen = settled.gen;
+      this._batteryFloor = settled.floor;
       this._renderBatteryAlerts();
       this._postSync({ kind: "battery_changed" });
       return this._deviceBatteryOk;
@@ -1810,22 +1889,12 @@ class SdrHubPanel extends HTMLElement {
       // happened and discard its now-pre-clear result instead of repopulating the list.
       this._clearEpoch++;
       this._renderDecodedLog();
-      try {
-        // Bumping the generation and emptying the log happen in one transaction, so a decode
-        // being persisted concurrently either lands before the bump (and is discarded with the
-        // old generation) or after it (and is kept) - never half-applied.
-        const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
-          const current = normalizeDecodedRecord(raw);
-          return { gen: current.gen + 1, entries: [] };
-        });
-        const settled = normalizeDecodedRecord(record);
-        this._decodedLogGen = settled.gen;
-        this._decodedLog = settled.log;
-        this._renderDecodedLog();
-        this._postSync({ kind: "decoded_changed" });
-      } catch {
-        // No usable store - the local clear stands for this session.
-      }
+      // Published as a barrier so a decode arriving after the click waits for the bump. Without
+      // it that decode read the pre-clear generation, its transaction (opened second) saw the
+      // bumped one and no-opped, and the settled empty record then removed its optimistic card -
+      // losing an event the surrounding comment promises is retained.
+      const previousClear = this._barriers.decoded;
+      await this._trackBarrier("decoded", this._runDecodedClear(previousClear));
     });
     const helpEl = this.querySelector("#sdr-hub-help");
     this.querySelector("[data-show-help]").addEventListener("click", () => {
@@ -1916,7 +1985,10 @@ class SdrHubPanel extends HTMLElement {
       // generation is durable and observable: a pending mutation sees the higher generation and
       // its result is discarded, and peers hydrate into a replace rather than a merge.
       await idbMutate(IDB_KEY_DECODED, (raw) => ({ gen: normalizeDecodedRecord(raw).gen + 1, entries: [] }));
-      await idbMutate(IDB_KEY_BATTERY, (raw) => serializeBatteryRecord(normalizeBatteryRecord(raw).gen + 1, new Map()));
+      await idbMutate(IDB_KEY_BATTERY, (raw) => {
+        const cur = normalizeBatteryRecord(raw);
+        return serializeBatteryRecord(cur.gen + 1, new Map(), cur.floor);
+      });
     } catch {
       // No usable store - nothing persisted to clear.
     }
@@ -1925,7 +1997,6 @@ class SdrHubPanel extends HTMLElement {
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
     // listing it there would make every open tab reload each time any one tab navigated away.
     for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
-      if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
       try {
         localStorage.removeItem(key);
       } catch {
