@@ -1279,8 +1279,16 @@ class SdrHubPanel extends HTMLElement {
         return { gen: current.gen, entries: merged };
       });
       const settled = normalizeDecodedRecord(record);
+      // Merged with the current in-memory view rather than replacing it. Transactions for two
+      // events overlap, and the earlier one's authoritative result predates the later one's
+      // optimistic entry - assigning it directly would make that newer entry vanish until its
+      // own transaction settled a moment later, a visible flicker. A generation change is the
+      // exception: that means a clear, where dropping entries is the point.
+      this._decodedLog =
+        settled.gen === this._decodedLogGen
+          ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
+          : settled.log;
       this._decodedLogGen = settled.gen;
-      this._decodedLog = settled.log;
       this._renderDecodedLog();
       this._postSync({ kind: "decoded_changed" });
     } catch {
@@ -1368,11 +1376,14 @@ class SdrHubPanel extends HTMLElement {
         return serializeBatteryRecord(current.gen, merged);
       });
       const settled = normalizeBatteryRecord(record);
+      // Same overlapping-transaction reasoning as _persistDecodedEvent - merge unless the
+      // generation moved, which means an invalidation that is meant to discard entries.
+      this._deviceBatteryOk =
+        settled.gen === this._batteryGen ? mergeBatteryLowState(this._deviceBatteryOk, settled.map) : settled.map;
       this._batteryGen = settled.gen;
-      this._deviceBatteryOk = settled.map;
       this._renderBatteryAlerts();
       this._postSync({ kind: "battery_changed" });
-      return settled.map;
+      return this._deviceBatteryOk;
     } catch {
       return this._deviceBatteryOk;
     }
