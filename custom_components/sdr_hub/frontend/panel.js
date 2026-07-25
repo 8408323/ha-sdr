@@ -185,9 +185,11 @@ const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 // own subscription and derives an identical map, so concurrent writers store the same value and
 // this needs no locking - see _updateBatteryState.
 const BATTERY_LOW_KEY = "sdr_hub_battery_low_state";
-// Every localStorage key this panel ever writes - used solely by _onResetPreferences() to wipe
-// them all in one action, so that list and this one can't silently drift apart the way two
-// independently-maintained copies could.
+// Keys whose *removal* by another tab means this tab's state is stale enough to warrant a
+// reload - so this doubles as both the reset list (_onResetPreferences) and the
+// reload-on-external-removal trigger (_onStorageEvent). SOUND_LEADER_KEY is deliberately absent
+// despite also being reset: it's removed on every ordinary detach as leadership is handed over,
+// which would otherwise reload every other open tab each time any one tab navigated away.
 const ALL_PREF_KEYS = [
   SWEEP_FORM_PREFS_KEY,
   RECEIVER_FORM_PREFS_KEY,
@@ -1419,7 +1421,11 @@ class SdrHubPanel extends HTMLElement {
   // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
   // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
   _onResetPreferences() {
-    for (const key of ALL_PREF_KEYS) {
+    // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see that
+    // list's own comment. Releasing leadership removes it on every ordinary detach, and
+    // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
+    // listing it there would make every open tab reload each time any one tab navigated away.
+    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
       try {
         localStorage.removeItem(key);
       } catch {
