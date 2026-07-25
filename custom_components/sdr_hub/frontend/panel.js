@@ -415,6 +415,42 @@ const COLORMAPS = {
   grayscale: { label: "Grayscale", fn: grayscaleColor },
 };
 
+// Contrast bounds derived from what the hardware is actually producing, rather than a fixed
+// default. The static -95..-15 dB range suits a scale where 0 dB is a strong signal, but this
+// add-on's power_db runs well above 0 for ordinary noise on an RTL-SDR at typical gain - measured
+// live, 96% of bins clamped to the maximum and the waterfall showed no structure at all (see
+// issue #15). The correct range depends on gain, antenna and band, so no static default can suit
+// every setup; deriving it is the only thing that generalises.
+//
+// Percentiles, not min/max: a single blanked-adjacent outlier or one strong carrier would
+// otherwise stretch the range and flatten everything else. The low percentile sits near the noise
+// floor and the high one just above the strongest routine signal, which is the span worth
+// spending colour on.
+const AUTO_CONTRAST_LOW_PCT = 0.05;
+const AUTO_CONTRAST_HIGH_PCT = 0.995;
+// Widened slightly so the extremes aren't sitting exactly on the clamp boundary, and floored so a
+// nearly-flat spectrum still gets a usable (not degenerate) span.
+const AUTO_CONTRAST_MARGIN_DB = 3;
+const AUTO_CONTRAST_MIN_SPAN_DB = 10;
+
+function autoContrastRange(rows) {
+  const values = [];
+  for (const row of rows) {
+    for (const v of row.power_db) if (Number.isFinite(v)) values.push(v);
+  }
+  if (values.length < 2) return null;
+  values.sort((a, b) => a - b);
+  const at = (q) => values[Math.min(values.length - 1, Math.max(0, Math.floor(values.length * q)))];
+  let min = at(AUTO_CONTRAST_LOW_PCT) - AUTO_CONTRAST_MARGIN_DB;
+  let max = at(AUTO_CONTRAST_HIGH_PCT) + AUTO_CONTRAST_MARGIN_DB;
+  if (max - min < AUTO_CONTRAST_MIN_SPAN_DB) {
+    const mid = (min + max) / 2;
+    min = mid - AUTO_CONTRAST_MIN_SPAN_DB / 2;
+    max = mid + AUTO_CONTRAST_MIN_SPAN_DB / 2;
+  }
+  return { min: Math.round(min), max: Math.round(max) };
+}
+
 // CSS gradient sampled from the same colormap function the waterfall painter uses, so the legend
 // cannot drift from what is actually drawn - a hand-written gradient would silently disagree the
 // moment a ramp changed. Sampled rather than exact: ten stops is visually indistinguishable from
@@ -1742,6 +1778,7 @@ class SdrHubPanel extends HTMLElement {
       if (rows.length > cap) rows.length = cap;
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
+      this._renderFrequencyAxis(event.sweep_id);
     } else if (event.type === "decoded_device") {
       // Purely for this tab's own relative-age labels. Ordering and identity come from the
       // add-on's event_id/received_at instead (see compareDecodedEvents) - those are identical
@@ -1886,6 +1923,64 @@ class SdrHubPanel extends HTMLElement {
     } catch {
       // No usable store - whatever is in memory stands.
     }
+  }
+
+  // One CSV cell. Quoted whenever it contains a delimiter, quote or newline, with embedded quotes
+  // doubled - RFC 4180. rtl_433 emits free-form model strings and users choose their own aliases,
+  // so a comma or quote in a field is entirely plausible and would otherwise shift every
+  // subsequent column on that row.
+  //
+  // A leading =, +, - or @ is prefixed with a single quote: spreadsheet applications interpret
+  // those as formulas, so a device model beginning with one could execute on open. This is data
+  // from the air, and it is written to a file the user is likely to open in Excel.
+  _csvCell(value) {
+    if (value === null || value === undefined) return "";
+    let text = String(value);
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  // Exports what the log actually holds. Columns are the union of every device field present
+  // across the retained events, so a mixed set of sensor types produces one table with blanks
+  // rather than a ragged file - and the fixed columns come first so the useful ones are readable
+  // without scrolling.
+  _exportDecodedCsv() {
+    if (this._decodedLog.length === 0) {
+      this._showError("Nothing to export - no devices have been decoded yet.");
+      return;
+    }
+    const fixed = ["received_at", "name", "model", "id", "channel"];
+    const extras = new Set();
+    for (const event of this._decodedLog) {
+      for (const key of Object.keys(event.device || {})) {
+        if (!DECODED_HIDDEN_FIELDS.has(key) && !fixed.includes(key)) extras.add(key);
+      }
+    }
+    const columns = [...fixed, ...[...extras].sort()];
+    const rows = [columns.map((c) => this._csvCell(c)).join(",")];
+    // Oldest first: the in-memory log is newest-first for display, but a time series read in a
+    // spreadsheet or plotted from a file is expected to run forwards.
+    for (const event of [...this._decodedLog].reverse()) {
+      const d = event.device || {};
+      const shownAt = decodedDisplayTime(event);
+      const values = columns.map((col) => {
+        if (col === "received_at") return shownAt ? new Date(shownAt).toISOString() : "";
+        if (col === "name") return deviceDisplayName(d, this._deviceAliases);
+        return d[col];
+      });
+      rows.push(values.map((v) => this._csvCell(v)).join(","));
+    }
+    // CRLF and a UTF-8 BOM: RFC 4180 specifies CRLF, and without the BOM Excel misreads non-ASCII
+    // device names and aliases as the local codepage.
+    const blob = new Blob(["\ufeff" + rows.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sdr-hub-decoded-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   // The Clear-log transaction, split out so it can be published as a barrier before its first
@@ -2391,6 +2486,8 @@ class SdrHubPanel extends HTMLElement {
             </select></label>
             <label style="${LABEL}">Contrast min dB<input id="sdr-hub-db-min" type="number" step="1" value="${esc(this._dbMin)}" style="${INPUT};width:90px"></label>
             <label style="${LABEL}">Contrast max dB<input id="sdr-hub-db-max" type="number" step="1" value="${esc(this._dbMax)}" style="${INPUT};width:90px"></label>
+            <button id="sdr-hub-db-auto" type="button" title="Set the contrast range from the signal levels currently being received"
+              style="${BTN_SECONDARY};align-self:end;">Auto</button>
           </div>
           <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
@@ -2439,6 +2536,8 @@ class SdrHubPanel extends HTMLElement {
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
             <button id="sdr-hub-decoded-time-toggle" type="button" title="Toggle between relative and absolute timestamps" style="${BTN_SECONDARY};white-space:nowrap;">${this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time"}</button>
+            <button id="sdr-hub-export-decoded" type="button" title="Download the decoded log as a CSV file"
+              style="${BTN_SECONDARY};white-space:nowrap;">Export CSV</button>
             <button id="sdr-hub-clear-decoded" type="button" style="${BTN_SECONDARY};white-space:nowrap;">Clear log</button>
           </div>
           <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
@@ -2489,6 +2588,7 @@ class SdrHubPanel extends HTMLElement {
       ev.target.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
       this._renderDecodedLog();
     });
+    this.querySelector("#sdr-hub-export-decoded")?.addEventListener("click", () => this._exportDecodedCsv());
     this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", async () => {
       // Only clears the *displayed* log, not the low-battery state - a device that's genuinely
       // still reporting low battery should keep showing in the alert banner even after the user
@@ -2678,6 +2778,26 @@ class SdrHubPanel extends HTMLElement {
     };
     dbMinInput.addEventListener("change", applyDbRange);
     dbMaxInput.addEventListener("change", applyDbRange);
+    const autoBtn = this.querySelector("#sdr-hub-db-auto");
+    if (autoBtn) {
+      autoBtn.addEventListener("click", () => {
+        // Derived from every retained row across all running sweeps, so a single anomalous row
+        // can't set the range. Nothing is changed if no rows have arrived yet - silently
+        // applying a default would look like the button had done something.
+        const rows = Object.values(this._sweepRowHistory || {}).flat();
+        const range = autoContrastRange(rows);
+        if (!range) {
+          this._showError("No spectrum data yet - start a sweep and let a few rows arrive first.");
+          return;
+        }
+        this._dbMin = range.min;
+        this._dbMax = range.max;
+        dbMinInput.value = range.min;
+        dbMaxInput.value = range.max;
+        saveDbRange(range.min, range.max);
+        this._renderSweeps(true);
+      });
+    }
   }
 
   // Fills the form's fields from the chosen preset - a starting point the user can still edit
@@ -3019,6 +3139,8 @@ class SdrHubPanel extends HTMLElement {
           style="height:20px;margin-top:2px;border-radius:4px;cursor:ns-resize;touch-action:none;
           background:repeating-linear-gradient(to right,var(--divider-color,#e0e0e0) 0 6px,transparent 0 12px);
           display:flex;align-items:center;justify-content:center;"></div>
+        <div data-sweep-freq-axis="${esc(s.id)}" aria-hidden="true"
+          style="position:relative;height:14px;font-size:.65rem;color:var(--secondary-text-color,#727272);"></div>
         <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--secondary-text-color,#727272);">
           <div data-sweep-hover="${esc(s.id)}" style="height:1.2em;"></div>
           <div data-sweep-peak="${esc(s.id)}" style="height:1.2em;"></div>
@@ -3079,6 +3201,7 @@ class SdrHubPanel extends HTMLElement {
         }
       }
       this._renderTimeAxis(s.id);
+      this._renderFrequencyAxis(s.id);
       // Restore the position captured above, now that the replacement container has its
       // history replayed back in (so scrollHeight reflects the final content size). A
       // bottom-pinned view is restored by re-pinning to the new bottom rather than replaying
@@ -3750,6 +3873,40 @@ class SdrHubPanel extends HTMLElement {
       handle.addEventListener("pointerup", onUp);
       handle.addEventListener("pointercancel", onUp);
     });
+  }
+
+  // Frequency ticks beneath the waterfall. The panel already had a *time* axis and a hover
+  // readout, so a visible signal could be located in time but its frequency could only be found
+  // by hovering over it - which is no help for reading a printed screenshot, comparing two
+  // sweeps, or just seeing at a glance which part of the band is busy.
+  //
+  // Tick count is derived from the rendered width rather than fixed, so a narrow card does not
+  // collapse into unreadable overlapping labels.
+  _renderFrequencyAxis(sweepId) {
+    const axisEl = this.querySelector(`[data-sweep-freq-axis="${CSS.escape(sweepId)}"]`);
+    if (!axisEl) return;
+    const sweep = (this._state.sweeps || []).find((s) => s.id === sweepId);
+    if (!sweep || !Number.isFinite(sweep.start_hz) || !Number.isFinite(sweep.stop_hz)) {
+      axisEl.innerHTML = "";
+      return;
+    }
+    const width = axisEl.clientWidth || 0;
+    // ~90px per label keeps them from colliding at the smallest widths the card reaches.
+    const ticks = Math.max(2, Math.min(6, Math.floor(width / 90)));
+    const span = sweep.stop_hz - sweep.start_hz;
+    const parts = [];
+    for (let i = 0; i < ticks; i++) {
+      const frac = ticks === 1 ? 0 : i / (ticks - 1);
+      const hz = sweep.start_hz + span * frac;
+      // The first and last labels are pulled inside the bounds rather than centred, so neither
+      // is clipped by the card edge.
+      const align = i === 0 ? "left:0;text-align:left;" : i === ticks - 1 ? "right:0;text-align:right;" : `left:${(frac * 100).toFixed(2)}%;transform:translateX(-50%);`;
+      parts.push(
+        `<span style="position:absolute;top:0;${align}white-space:nowrap;">${esc(fmtMHz(hz))}</span>` +
+          `<span style="position:absolute;top:-3px;left:${(frac * 100).toFixed(2)}%;width:1px;height:3px;background:var(--divider-color,#e0e0e0);"></span>`,
+      );
+    }
+    axisEl.innerHTML = parts.join("");
   }
 
   _renderTimeAxis(sweepId) {
