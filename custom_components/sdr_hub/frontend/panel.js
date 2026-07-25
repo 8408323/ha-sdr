@@ -1982,7 +1982,11 @@ class SdrHubPanel extends HTMLElement {
     // exactly what this export exists for. A finite number cannot be a formula.
     if (typeof value === "number" && Number.isFinite(value)) return String(value);
     let text = String(value);
-    if (/^[=+\-@]/.test(text)) text = `'${text}`;
+    // Leading whitespace and control characters are skipped before looking for the sigil.
+    // Spreadsheets trim them and then evaluate what follows, so an anchored /^[=+\-@]/ test was
+    // bypassed outright by "\t=HYPERLINK(...)" - which arrives over the air in a model string and
+    // would execute when the file is opened. Tab and CR are the documented carriers.
+    if (/^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   }
 
@@ -1995,8 +1999,11 @@ class SdrHubPanel extends HTMLElement {
       this._showError("Nothing to export - no devices have been decoded yet.");
       return;
     }
+    // Cleared on the success path, like the Auto contrast handler. Leaving it up meant the panel
+    // still claimed there was nothing to export while a file was downloading.
+    this._showError("");
     const fixed = ["received_at", "name", "model", "id", "channel"];
-    // Excludes only the device fields the fixed columns already carry, derived from `fixed`
+    // Only the device fields the fixed columns already carry are dropped, derived from `fixed`
     // itself so the promise made in this method's comment stays true by construction.
     //
     // It previously filtered through DECODED_HIDDEN_FIELDS, which exists to keep clutter off the
@@ -2007,20 +2014,30 @@ class SdrHubPanel extends HTMLElement {
     const extras = new Set();
     for (const event of this._decodedLog) {
       for (const key of Object.keys(event.device || {})) {
-        if (!carriedByFixedColumns.has(key) && !fixed.includes(key)) extras.add(key);
+        if (!carriedByFixedColumns.has(key)) extras.add(key);
       }
     }
-    const columns = [...fixed, ...[...extras].sort()];
+    // A device field named "name" or "received_at" collides with a synthesised column rather than
+    // duplicating it - the fixed ones hold the *alias* and the *event* timestamp, which are not
+    // the same data. Such a field is emitted under a "device_" prefix instead of being discarded,
+    // since a decoder emitting either is losing real information otherwise.
+    const columnDefs = [
+      ...fixed.map((header) => ({ header, fixed: true, key: header })),
+      ...[...extras]
+        .sort()
+        .map((key) => ({ header: fixed.includes(key) ? `device_${key}` : key, fixed: false, key })),
+    ];
+    const columns = columnDefs.map((c) => c.header);
     const rows = [columns.map((c) => this._csvCell(c)).join(",")];
     // Oldest first: the in-memory log is newest-first for display, but a time series read in a
     // spreadsheet or plotted from a file is expected to run forwards.
     for (const event of [...this._decodedLog].reverse()) {
       const d = event.device || {};
       const shownAt = decodedDisplayTime(event);
-      const values = columns.map((col) => {
-        if (col === "received_at") return shownAt ? new Date(shownAt).toISOString() : "";
-        if (col === "name") return deviceDisplayName(d, this._deviceAliases);
-        return d[col];
+      const values = columnDefs.map((col) => {
+        if (col.fixed && col.key === "received_at") return shownAt ? new Date(shownAt).toISOString() : "";
+        if (col.fixed && col.key === "name") return deviceDisplayName(d, this._deviceAliases);
+        return d[col.key];
       });
       rows.push(values.map((v) => this._csvCell(v)).join(","));
     }
@@ -3948,7 +3965,19 @@ class SdrHubPanel extends HTMLElement {
       axisEl.innerHTML = "";
       return;
     }
-    const width = axisEl.clientWidth || 0;
+    // Measured from the canvas's own rendered box, not the axis element's. In full-history mode
+    // the canvas sits inside a scroll container, so with classic (space-consuming) scrollbars the
+    // container is narrower than the card while the axis - a sibling of the container - is not.
+    // Measuring the card shifted every tick rightward relative to the data as soon as the
+    // scrollbar appeared. The axis is also inset to match, so tick zero lines up with bin zero.
+    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
+    const axisBox = axisEl.getBoundingClientRect();
+    const canvasBox = canvas ? canvas.getBoundingClientRect() : null;
+    const width = canvasBox && canvasBox.width > 0 ? canvasBox.width : axisEl.clientWidth || 0;
+    if (canvasBox && axisBox.width > 0) {
+      axisEl.style.marginLeft = `${Math.max(0, canvasBox.left - axisBox.left)}px`;
+      axisEl.style.width = `${width}px`;
+    }
     // ~90px per label keeps them from colliding at the smallest widths the card reaches.
     const ticks = Math.max(2, Math.min(6, Math.floor(width / 90)));
     const span = sweep.stop_hz - sweep.start_hz;
@@ -4311,6 +4340,10 @@ class SdrHubPanel extends HTMLElement {
         } else if (!this._copyViaExecCommand(text)) {
           throw new Error("Clipboard access unavailable in this browser context");
         }
+        // Completes the stale-banner sweep. Weaker than the other cases since the button gives
+        // its own feedback, but a previous copy failure otherwise stays on screen contradicting
+        // the "Copied!" right beside it.
+        this._showError("");
         button.textContent = "Copied!";
       } catch (err) {
         this._showError(`Could not copy to clipboard: ${err.message || err}`);
@@ -4361,6 +4394,9 @@ class SdrHubPanel extends HTMLElement {
         this._showError("Could not save image: canvas produced no data");
         return;
       }
+      // Same stale-banner class as the CSV export and the Auto contrast handler - swept here
+      // together rather than one per review round.
+      this._showError("");
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -4384,21 +4420,36 @@ class SdrHubPanel extends HTMLElement {
     out.height = canvas.height + axisHeight;
     const ctx = out.getContext("2d");
     if (!ctx) return null;
-    // Opaque background: the waterfall now contains genuinely transparent pixels for blanked
-    // bins, and a PNG with holes in it looks like corruption against whatever the viewer happens
-    // to place behind it.
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, out.width, out.height);
-    ctx.drawImage(canvas, 0, 0);
-    ctx.fillStyle = "#000000";
     ctx.font = "10px sans-serif";
     ctx.textBaseline = "top";
-    const ticks = Math.max(2, Math.min(6, Math.floor(out.width / 90)));
     const span = sweep.stop_hz - sweep.start_hz;
+    // How many labels actually fit is measured, not assumed. A narrow sweep produces a canvas only
+    // a few pixels wide - width is the bin count - while the labels stay a fixed pixel size, so a
+    // hardcoded tick count drew text wider than the image and clipped the ruler unreadable.
+    const labelWidth = Math.max(
+      ctx.measureText(fmtMHz(sweep.start_hz)).width,
+      ctx.measureText(fmtMHz(sweep.stop_hz)).width,
+    );
+    const fits = Math.floor(out.width / (labelWidth + 8));
+    const ticks = Math.max(2, Math.min(6, fits));
+    // Below two labels there is no honest way to letter the ruler, so the marks are drawn without
+    // text rather than overlapping into illegibility.
+    const drawLabels = fits >= 2;
+
+    // Only the axis strip is filled. Filling the whole canvas destroyed the alpha that _paintRow
+    // deliberately writes for blanked bins - and under the Grayscale colormap pure white *is* the
+    // strongest signal, so missing capture data would have exported as maximum signal. Leaving the
+    // waterfall region transparent keeps "no data" distinguishable in the PNG, which is the whole
+    // point of issue #16's fix.
+    ctx.drawImage(canvas, 0, 0);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, canvas.height, out.width, axisHeight);
+    ctx.fillStyle = "#000000";
     for (let i = 0; i < ticks; i++) {
       const frac = ticks === 1 ? 0 : i / (ticks - 1);
       const x = frac * out.width;
       ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), canvas.height, 1, 3);
+      if (!drawLabels) continue;
       const label = fmtMHz(sweep.start_hz + span * frac);
       const w = ctx.measureText(label).width;
       // Same edge handling as the on-screen axis: the end labels are pulled inside the bounds so
