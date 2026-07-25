@@ -999,9 +999,14 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       // Fallback notification from a peer without BroadcastChannel - re-read both stores.
+      // Tracked with the barriers for exactly the same reason as the BroadcastChannel branches:
+      // a peer's clear or reset advances a generation, and an untracked read here lets a local
+      // decode or transition capture the old one, no-op, and lose its optimistic update. This
+      // path is the one taken when BroadcastChannel is unavailable, so leaving it untracked made
+      // the protection depend on which notification mechanism happened to be in use.
       if (ev.key === SYNC_NONCE_KEY) {
-        this._hydrateDecodedLog();
-        this._hydrateBatteryState();
+        this._trackBarrier("decoded", this._hydrateDecodedLog());
+        this._trackBarrier("battery", this._hydrateBatteryState());
         return;
       }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
@@ -1546,13 +1551,18 @@ class SdrHubPanel extends HTMLElement {
     // can't order against other tabs anyway (see isConvergentEvent), so this just keeps them
     // locally sane.
     const ord = Number.isFinite(eventOrder(event)) ? eventOrder(event) : Date.now();
+    // Waited on *before* reading the previous entry, not just before the write. The episode is
+    // derived from what this tab already knows about the device, so deriving it mid-hydration
+    // meant the persisted low might not be in _deviceBatteryOk yet: the repeat report was then
+    // stamped as a *new* episode, its newer ord replaced the hydrated entry, and the persisted
+    // alertedAt was dropped - letting an already-alerted low beep again.
+    await this._awaitBarrier("battery");
     const previous = this._deviceBatteryOk.get(key);
     // lowSince identifies the *episode*: it is the ord at which this device last went from
     // not-low to low, and is carried across repeat low reports. A recovery ends the episode, so
     // a later low starts a new one with a new lowSince. Alert markers are matched on it - see
     // mergeBatteryLowState - so a marker delayed past a recovery can't silence the next episode.
-    const previousEntry = this._deviceBatteryOk.get(key);
-    const lowSince = isLow ? (previousEntry?.low ? (previousEntry.lowSince ?? previousEntry.ord) : ord) : undefined;
+    const lowSince = isLow ? (previous?.low ? (previous.lowSince ?? previous.ord) : ord) : undefined;
     const entry = {
       model: decodedDevice.model,
       id: decodedDevice.id,

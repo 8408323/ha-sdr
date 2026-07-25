@@ -41,6 +41,14 @@ SEQ_RESERVE_AHEAD = 2 * SEQ_CHECKPOINT_INTERVAL
 # mergeBatteryLowState, so a stale low-battery warning could persist indefinitely.
 _seq_high_water_written = 0
 _seq_scheduled_high_water = 0
+# Separate throttle for the synchronous exhausted-reservation guard. Without it, a /data that
+# stays unwritable after the startup reservation is consumed leaves _seq_high_water_written
+# permanently behind, so the guard fired on *every* decode and did blocking filesystem work on
+# the event loop per packet - the same flooding the asynchronous path is throttled to avoid.
+_seq_guard_last_attempt = 0
+# Latches the degraded-durability warning so a broken /data logs once rather than once per
+# retry interval for as long as the fault lasts.
+_seq_reservation_warned = False
 # Serializes the whole check-write-mark sequence. The guard alone was not enough: two executor
 # jobs can both pass a bare comparison before either updates the mark, and the fsyncs inside the
 # critical section yield for long enough to make that interleaving realistic - after which the
@@ -84,7 +92,7 @@ def _write_seq_checkpoint(seq: int) -> None:
 
 
 def _write_seq_checkpoint_locked(seq: int) -> None:
-    global _seq_high_water_written, _seq_scheduled_high_water
+    global _seq_high_water_written, _seq_scheduled_high_water, _seq_reservation_warned
     # Reserve ahead of the issued value - see SEQ_RESERVE_AHEAD's comment.
     reserved = seq + SEQ_RESERVE_AHEAD
     try:
@@ -117,6 +125,7 @@ def _write_seq_checkpoint_locked(seq: int) -> None:
         # one interval, and the `stored + INTERVAL` seed would then overlap sequence values
         # clients had already persisted.
         _seq_high_water_written = reserved
+        _seq_reservation_warned = False
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
         # rather than failing the decode over a checkpoint write. The retry baseline is advanced
@@ -137,7 +146,7 @@ def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:
     I/O there would stall everything else the loop is running, including the WebSocket writers and
     the HTTP API, for as long as /data takes to sync.
     """
-    global _seq_scheduled_high_water
+    global _seq_scheduled_high_water, _seq_guard_last_attempt, _seq_reservation_warned
     # Hard invariant, checked first: never hand out a sequence the durable reservation does not
     # already *strictly* cover. Renewing asynchronously at the boundary was not enough - the
     # on-disk reservation is then merely equal to the value being issued, so a kill after the
@@ -146,7 +155,25 @@ def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:
     # Blocking the loop here is the correct trade: it only happens if the early renewal below has
     # not landed in time, and stalling briefly is strictly better than reissuing a sequence.
     if seq >= _seq_high_water_written:
-        _write_seq_checkpoint(seq)
+        # Throttled like the asynchronous path. When the reservation is genuinely exhausted and
+        # /data is writable, the first attempt succeeds and the branch stops firing. When /data is
+        # persistently unwritable the reservation cannot be renewed at all, so retrying per packet
+        # buys nothing and starves the loop; this retries once per interval instead.
+        #
+        # The deliberate trade-off: rather than stop broadcasting (which would make the add-on
+        # useless whenever /data fills), decoding continues with the ordering guarantee degraded
+        # to the pre-reservation behaviour for as long as the disk is broken. That failure mode is
+        # logged once so it is visible rather than silent.
+        if seq - _seq_guard_last_attempt >= SEQ_CHECKPOINT_INTERVAL:
+            _seq_guard_last_attempt = seq
+            _write_seq_checkpoint(seq)
+            if seq >= _seq_high_water_written and not _seq_reservation_warned:
+                _seq_reservation_warned = True
+                _LOGGER.warning(
+                    "Event sequence reservation exhausted and /data is not writable - sequence "
+                    "durability is degraded until the checkpoint at %s succeeds",
+                    SEQ_HIGH_WATER_PATH,
+                )
         _seq_scheduled_high_water = seq
         return
     # Renewed *early*, while a full interval of headroom remains, so in the normal case the write
