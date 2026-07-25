@@ -3141,6 +3141,13 @@ class SdrHubPanel extends HTMLElement {
         delete this._viewportHeight[id];
       }
     }
+    // The resize observers are a fifth per-sweep resource and are released here with the other
+    // four, above both early returns below. They were previously pruned further down, past the
+    // empty-list return - so stopping the *last* sweep skipped the cleanup entirely and left an
+    // observer holding a detached canvas whose backing store can be as large as the area cap,
+    // until the panel disconnected or another sweep started. Anything scoped per sweep belongs in
+    // this loop; keeping them together is what stops the next such resource drifting off again.
+    this._pruneSweepResizeObservers(activeIds);
     // _loadState() (and thus this) runs on every state_changed event, including the harmless
     // 30s poll and other panels' unrelated actions - not just changes to *this* sweep list. The
     // full rebuild below recreates every canvas element and replays its whole retained history
@@ -3269,7 +3276,6 @@ class SdrHubPanel extends HTMLElement {
       </div>`;
       })
       .join("");
-    this._pruneSweepResizeObservers();
     for (const s of this._state.sweeps) {
       this._wireConfirmButton(el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`), () =>
         this._onRemoveSweep(s.id),
@@ -4045,10 +4051,11 @@ class SdrHubPanel extends HTMLElement {
   }
 
   // Disconnects observers for sweeps that no longer exist, so a removed sweep's observer does not
-  // outlive its canvas and keep the element alive.
-  _pruneSweepResizeObservers() {
+  // outlive its canvas and keep the element alive. Takes the live id set from the caller, which
+  // has already computed it, rather than re-deriving it from state.
+  _pruneSweepResizeObservers(activeIds) {
     if (!this._sweepResizeObservers) return;
-    const live = new Set((this._state.sweeps || []).map((s) => s.id));
+    const live = activeIds || new Set((this._state.sweeps || []).map((s) => s.id));
     for (const [id, entry] of this._sweepResizeObservers) {
       if (!live.has(id)) {
         entry.observer.disconnect();
