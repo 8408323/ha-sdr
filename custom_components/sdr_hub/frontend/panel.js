@@ -47,24 +47,38 @@ const fmtElapsed = (ms) => {
 // portable/unambiguous format.
 const fmtAbsoluteTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
-// Serializes a read-modify-write critical section across every open tab/document on this
-// origin, not just this one - needed because every open SDR Hub tab independently receives and
-// reacts to the exact same WebSocket broadcast at effectively the same instant, so a plain
-// "read localStorage, compute, write it back" in each tab is a textbook lost-update race (two
-// tabs' writes for two different new events, or a decode racing a "Clear log" click, can
-// otherwise silently clobber one another regardless of write order). Falls back to running fn()
-// immediately, uncoordinated, in browsers without the Locks API (very old Safari) - correctness
-// degrades to best-effort there rather than the panel refusing to work at all.
-function withLock(name, fn) {
-  if (typeof navigator !== "undefined" && navigator.locks && navigator.locks.request) {
-    return navigator.locks.request(name, fn);
-  }
-  return Promise.resolve().then(fn);
-}
-const LOCK_DECODED_LOG = "sdr_hub_decoded_log_lock";
-const LOCK_BATTERY = "sdr_hub_battery_lock";
+// ── cross-tab coordination ───────────────────────────────────────────────────
+//
+// Every open panel tab holds its own independent WebSocket subscription and receives the exact
+// same broadcasts. That shapes what does and doesn't need coordinating here:
+//
+//   * Decoded log and low-battery state are *convergent*. Because the add-on now stamps each
+//     decoded_device with a single server-assigned event_id and received_at (see main.py's
+//     on_device), every tab observes the identical event stream and, sorting by
+//     (received_at, event_id) and deduping by event_id, independently computes an identical
+//     result. Two tabs persisting concurrently therefore write the *same bytes*, so plain
+//     last-writer-wins is harmless and no mutual exclusion is needed. (This is what an earlier
+//     revision got wrong: it generated the id client-side, so one physical decode became N
+//     distinct ids across N tabs and "merging" them duplicated every event.)
+//   * The alert *sound* is not convergent - it's a side effect, not state, so "exactly once
+//     across all tabs" genuinely needs mutual exclusion. That's what the leader election below
+//     provides, and it's the only thing that needs it.
+//
+// Deliberately built on localStorage + BroadcastChannel rather than the Web Locks API: locks is
+// [SecureContext], so `navigator.locks` is undefined on the plain-HTTP LAN origins Home
+// Assistant is most commonly reached over (verified: it's present on http://localhost:8123,
+// which the spec exempts, but absent on http://<lan-ip>:8123). Building coordination on it
+// would silently no-op on exactly the deployments this project targets. BroadcastChannel has no
+// such restriction.
+const BROADCAST_CHANNEL_NAME = "sdr_hub_panel_sync";
+// Which tab currently owns playing the alert sound: {tabId, ts}, refreshed by that tab's
+// heartbeat. A claim older than LEADER_TTL_MS is treated as abandoned (tab closed/crashed/
+// suspended) and may be taken over.
+const SOUND_LEADER_KEY = "sdr_hub_sound_leader";
+const LEADER_TTL_MS = 5000;
+const LEADER_HEARTBEAT_MS = 2000;
 
-function generateEventId() {
+function generateId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
@@ -156,20 +170,20 @@ const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 // Monotonic "generation" counter, bumped by every "Clear log" click (locally or in another
-// tab). Each persisted decoded-log entry is tagged with the generation active when it was
-// appended (see mergeDecodedLog/loadDecodedLog) - an entry whose generation doesn't match the
-// current one belongs to an already-superseded log and is dropped on load/merge. This replaces
-// an earlier wall-clock-timestamp-boundary approach, which had its own race: two events landing
-// in the same millisecond (a real occurrence, not just theoretical - Date.now() resolution is
-// 1ms or coarser in some browsers) couldn't be ordered against a clear that happened in that
-// same millisecond. A monotonic integer, bumped under the same lock every write goes through,
-// has no such resolution limit.
+// tab). Each persisted decoded-log entry is tagged with the generation read from storage at the
+// moment it was written (see _persistDecodedEvent) - an entry whose generation doesn't match the
+// current one belongs to an already-superseded log and is dropped on load. Reading the
+// generation at *write* time, rather than stamping it when the event arrived, is what makes a
+// concurrent clear impossible to race past. This also replaces an earlier
+// wall-clock-timestamp-boundary approach, which couldn't order an event against a clear that
+// happened in the same millisecond (Date.now() resolution is 1ms or coarser); a monotonic
+// integer has no such limit.
 const DECODED_LOG_GEN_KEY = "sdr_hub_decoded_log_gen";
 const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 // Canonical, cross-tab-shared map of currently-low-battery devices (batteryStateKey -> {model,
-// id, channel}) - all reads and read-modify-write updates to this go through LOCK_BATTERY (see
-// _updateBatteryState), which is what makes "is this device newly low" an actual atomic
-// check-and-set across every open tab instead of each tab racing its own independent guess.
+// id, channel}). Convergent state: every tab observes the same battery_ok transitions from its
+// own subscription and derives an identical map, so concurrent writers store the same value and
+// this needs no locking - see _updateBatteryState.
 const BATTERY_LOW_KEY = "sdr_hub_battery_low_state";
 // Every localStorage key this panel ever writes - used solely by _onResetPreferences() to wipe
 // them all in one action, so that list and this one can't silently drift apart the way two
@@ -275,9 +289,7 @@ function batteryStateKey(d) {
 }
 
 // Loads the canonical, cross-tab-shared low-battery-devices map (see BATTERY_LOW_KEY) as a
-// batteryStateKey -> {model, id, channel} Map. Every read of this is meant to happen inside a
-// LOCK_BATTERY-guarded section (see _updateBatteryState) except the initial constructor seed and
-// storage-event/reattach reconciliation, which are read-only and don't need the lock.
+// batteryStateKey -> {model, id, channel} Map.
 function loadBatteryLowState() {
   try {
     const raw = localStorage.getItem(BATTERY_LOW_KEY);
@@ -351,6 +363,26 @@ function saveDecodedLogGen(gen) {
   }
 }
 
+// Total order over decoded events, newest first. Uses only server-assigned fields
+// (received_at, then event_id as a deterministic tiebreak for same-timestamp events) so that
+// every tab sorts an identical event set into an identical array - which is precisely what lets
+// concurrent per-tab persists be safe without any mutual exclusion, since they then write the
+// same value rather than competing ones. Never uses per-tab arrival time, which differs between
+// tabs and would break that convergence.
+function compareDecodedEvents(a, b) {
+  if (b.received_at !== a.received_at) return b.received_at - a.received_at;
+  return a.event_id < b.event_id ? 1 : a.event_id > b.event_id ? -1 : 0;
+}
+
+// Anything without the server-assigned event_id/received_at is from an add-on older than the
+// change that added them (main.py's on_device). Such an event can't participate in cross-tab
+// convergence - there's no shared identity to dedup on - so it's kept for *this* tab's live
+// display but deliberately never persisted (see _persistDecodedEvent), rather than being
+// persisted under a fabricated client-side id that would duplicate across tabs.
+function isConvergentEvent(e) {
+  return !!e && typeof e.event_id === "string" && Number.isFinite(e.received_at);
+}
+
 // Only entries tagged with the given generation are returned - one stamped with an older
 // generation belongs to a log a "Clear log" click (this tab's or another's) has since
 // superseded, and should be treated as already cleared rather than resurrected.
@@ -362,7 +394,7 @@ function loadDecodedLog(gen) {
     if (!Array.isArray(parsed)) return [];
     // Only entries that still look like a real decoded_device event - a corrupted or
     // hand-edited value here would otherwise flow straight into _renderDecodedLog and blow up
-    // on fields (device, _receivedAt) it assumes are always present.
+    // on fields it assumes are always present.
     return parsed
       .filter(
         (e) =>
@@ -370,10 +402,10 @@ function loadDecodedLog(gen) {
           typeof e === "object" &&
           e.device &&
           typeof e.device === "object" &&
-          Number.isFinite(e._receivedAt) &&
-          typeof e._id === "string" &&
+          isConvergentEvent(e) &&
           e._gen === gen,
       )
+      .sort(compareDecodedEvents)
       .slice(0, MAX_DECODED_LOG);
   } catch {
     return [];
@@ -388,18 +420,14 @@ function saveDecodedLogRaw(log) {
   }
 }
 
-// Union-merges by _id rather than blindly replacing the stored array with this tab's own local
-// copy - every open tab independently receives the same WebSocket broadcast, so tab A's and tab
-// B's persisted writes for two *different* new events can otherwise race, and a plain "write my
-// whole local array" lets the loser's write silently discard the winner's event. Deduping by
-// _id and keeping the newest MAX_DECODED_LOG by _receivedAt makes the merge commutative and
-// idempotent regardless of which tab's write actually lands first - always called from inside a
-// LOCK_DECODED_LOG-guarded section (see _persistDecodedEvent), which is what prevents two tabs
-// from interleaving their own read-merge-write around each other in the first place.
+// Dedups by the *server-assigned* event_id and re-sorts into the canonical total order, so the
+// result depends only on the set of events seen - not on which tab computed it or in what order
+// its own WebSocket happened to deliver them. Two tabs running this over the same events produce
+// byte-identical output, which is what makes an unsynchronized last-writer-wins persist safe.
 function mergeDecodedLog(current, incoming) {
-  const byId = new Map(current.map((e) => [e._id, e]));
-  byId.set(incoming._id, incoming);
-  return [...byId.values()].sort((a, b) => b._receivedAt - a._receivedAt).slice(0, MAX_DECODED_LOG);
+  const byId = new Map(current.map((e) => [e.event_id, e]));
+  for (const e of incoming) byId.set(e.event_id, e);
+  return [...byId.values()].sort(compareDecodedEvents).slice(0, MAX_DECODED_LOG);
 }
 
 function loadBatterySoundEnabled() {
@@ -582,13 +610,11 @@ class SdrHubPanel extends HTMLElement {
     this._decodedLogGen = loadDecodedLogGen();
     this._decodedLog = loadDecodedLog(this._decodedLogGen);
     // batteryStateKey(device) -> {model, id, channel} for currently-low devices only - the
-    // canonical, cross-tab-shared source of truth (see BATTERY_LOW_KEY), read and updated only
-    // through LOCK_BATTERY (see _updateBatteryState) so "is this device newly low" is an actual
-    // atomic check-and-set across every open tab, not each tab's own independent guess. Seeded
-    // from persisted state immediately (not left empty) - unlike an earlier, in-memory-only
-    // design, this map genuinely reflects cross-tab-confirmed reality, so there's nothing "stale
-    // and possibly wrong" about restoring it on a fresh instance the way there would be if it
-    // were still just one browser's own unreliable local guess.
+    // canonical, cross-tab-shared source of truth (see BATTERY_LOW_KEY). Seeded from persisted
+    // state immediately rather than left empty: every tab derives this from the same event
+    // stream, so what's stored is a value this browser's tabs collectively agreed on, not one
+    // tab's unverifiable guess. A stream_gap (which every tab misses together) is the one case
+    // that can invalidate it, and _handleEvent clears it explicitly there.
     this._deviceBatteryOk = loadBatteryLowState();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
@@ -617,6 +643,12 @@ class SdrHubPanel extends HTMLElement {
     // decoded log) is currently attached - same re-arm-on-reattach reasoning as _audioUnlockWired
     // above, since it's a page-wide `window` listener, not a per-element one.
     this._storageSyncWired = false;
+    // Identifies this specific tab in the sound-leader election (see _claimSoundLeadership) -
+    // random per panel instance, never persisted, since it's meaningless outside this document's
+    // lifetime.
+    this._tabId = generateId();
+    this._soundLeaderTimer = null;
+    this._broadcastChannel = null;
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -727,24 +759,50 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
-      // straight from storage rather than trying to diff/adopt ev.newValue directly. The actual
-      // conflict-free merge already happened inside whichever tab's LOCK_DECODED_LOG-guarded
-      // write produced this value (see mergeDecodedLog/_persistDecodedEvent); this tab just needs
-      // to catch up to it, which loadDecodedLog(gen) does correctly regardless of write ordering.
+      // straight from storage rather than trying to diff/adopt ev.newValue directly. Since every
+      // tab derives the same value from the same server-assigned event ids (see
+      // mergeDecodedLog), "just re-read what's stored" is always correct here regardless of
+      // which tab's write landed last.
       if (ev.key === DECODED_LOG_KEY || ev.key === DECODED_LOG_GEN_KEY) {
         this._decodedLogGen = loadDecodedLogGen();
         this._decodedLog = loadDecodedLog(this._decodedLogGen);
         this._renderDecodedLog();
       }
-      // Another tab's low-battery state update (or recovery) - same "just reload the canonical
-      // value" approach, since _updateBatteryState's LOCK_BATTERY-guarded write already resolved
-      // any concurrent update from this or another tab before it landed here.
+      // Another tab's low-battery state update (or recovery) - same convergent-state reasoning.
       if (ev.key === BATTERY_LOW_KEY) {
         this._deviceBatteryOk = loadBatteryLowState();
         this._renderBatteryAlerts();
       }
     };
     window.addEventListener("storage", this._onStorageEvent);
+    // BroadcastChannel carries the handful of things that *aren't* convergent derived state and
+    // so can't just be re-read from storage - currently only an explicit "Clear log" action,
+    // which needs to reach other tabs promptly rather than whenever they next happen to look.
+    // Chosen over the Web Locks API for cross-tab work generally because, unlike locks, it is
+    // available in insecure contexts (see BROADCAST_CHANNEL_NAME's comment).
+    try {
+      this._broadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+      this._broadcastChannel.onmessage = (ev) => {
+        const msg = ev.data;
+        if (!msg || msg.kind !== "log_cleared") return;
+        if (!Number.isInteger(msg.gen) || msg.gen <= this._decodedLogGen) return;
+        this._decodedLogGen = msg.gen;
+        this._decodedLog = loadDecodedLog(msg.gen);
+        this._renderDecodedLog();
+      };
+    } catch {
+      // No BroadcastChannel (very old browser) - the storage event above still propagates the
+      // same clear, just without the immediacy.
+      this._broadcastChannel = null;
+    }
+  }
+
+  _postSync(message) {
+    try {
+      if (this._broadcastChannel) this._broadcastChannel.postMessage(message);
+    } catch {
+      // Channel closed mid-teardown - the storage event covers the same ground.
+    }
   }
 
   connectedCallback() {
@@ -831,7 +889,15 @@ class SdrHubPanel extends HTMLElement {
     if (this._storageSyncWired) {
       window.removeEventListener("storage", this._onStorageEvent);
       this._storageSyncWired = false;
+      if (this._broadcastChannel) {
+        this._broadcastChannel.close();
+        this._broadcastChannel = null;
+      }
     }
+    // Hand the sound role back immediately - _audioCtx was just closed above, so this tab can no
+    // longer play anything, and holding the claim until it expires would leave alerts unplayed
+    // by any tab for up to LEADER_TTL_MS.
+    this._releaseSoundLeadership();
     // _deviceBatteryOk is just a cache of the canonical, cross-tab-shared BATTERY_LOW_KEY - a
     // detach doesn't need to (and shouldn't) wipe it, since connectedCallback reloads it fresh
     // from storage on reattach regardless, picking up whatever the shared source of truth has
@@ -913,19 +979,10 @@ class SdrHubPanel extends HTMLElement {
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
     } else if (event.type === "decoded_device") {
-      event._receivedAt = Date.now(); // client-side only, for the relative-time label
-      // Stamped once, immediately, and reused for both the instant local view below and the
-      // eventual cross-tab merge (_persistDecodedEvent) - _id lets the merge dedup this exact
-      // event regardless of which tab's write lands first; _gen ties it to the clear-generation
-      // active right now, so a "Clear log" that races ahead of the async persist (locally or in
-      // another tab) can recognize and drop it instead of resurrecting cleared history.
-      event._id = generateEventId();
-      event._gen = this._decodedLogGen;
-      // Local, synchronous update first - shows up instantly without waiting on the
-      // cross-tab-coordinated persist below, which _persistDecodedEvent reconciles this back
-      // against (including from other tabs' concurrent writes) once it resolves.
-      this._decodedLog.unshift(event);
-      if (this._decodedLog.length > MAX_DECODED_LOG) this._decodedLog.length = MAX_DECODED_LOG;
+      // Purely for this tab's own relative-age labels. Ordering and identity come from the
+      // add-on's event_id/received_at instead (see compareDecodedEvents) - those are identical
+      // in every tab, this is not.
+      event._receivedAt = Date.now();
       const decodedDevice = event.device || {};
       // A fresh decode from a pinned device gets a one-shot flash (consumed and cleared by
       // _renderDecodedLog on its next draw) - only for favorites, since flashing every incoming
@@ -933,10 +990,6 @@ class SdrHubPanel extends HTMLElement {
       // (someone watching one specific sensor among a lot of unrelated traffic).
       const favKey = deviceFavoriteKey(decodedDevice);
       if (this._favoriteDevices.has(favKey)) this._flashDeviceKey = favKey;
-      this._renderDecodedLog();
-      // Fire-and-forget (not awaited) - _handleEvent is synchronous and the instant local render
-      // above already reflects this event; these just reconcile the canonical, cross-tab-shared
-      // persisted state in the background and re-render again once that settles.
       this._persistDecodedEvent(event);
       if (Object.hasOwn(decodedDevice, "battery_ok")) this._updateBatteryState(decodedDevice);
     } else if (event.type === "status" || event.type === "state_changed") {
@@ -952,70 +1005,153 @@ class SdrHubPanel extends HTMLElement {
       // stream_gap: the connection never dropped, but the add-on's per-client send queue filled
       // (a slow consumer, or a burst of sweep_row messages) and had to silently discard an
       // older, still-unsent message to bound memory - see broadcaster.py's broadcast(). Either
-      // way, an event may have been lost - reload the canonical low-battery state from storage
-      // (rather than clearing it) so this tab picks up whatever the shared source of truth has
-      // settled on, including a recovery this specific tab's stream happened to miss.
-      this._deviceBatteryOk = loadBatteryLowState();
+      // way an event may have been lost, and crucially the loss is *upstream of every tab*: both
+      // signals originate from the coordinator's single shared connection to the add-on, so no
+      // other tab saw the missed recovery either. Re-reading the shared low-battery state would
+      // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
+      // the next real report from each device repopulate it - the alternative is a banner that
+      // could claim a recovered device is still low indefinitely, if it happens to go quiet.
+      this._deviceBatteryOk = new Map();
+      saveBatteryLowStateRaw(this._deviceBatteryOk);
       this._renderBatteryAlerts();
       this._loadState();
     }
   }
 
-  // Merges `event` into the canonical, cross-tab-shared decoded log under LOCK_DECODED_LOG, then
-  // reconciles this tab's in-memory view (this._decodedLog/_decodedLogGen) to match the result -
-  // always, even when the event turned out to belong to an already-superseded generation (a
-  // "Clear log" click, locally or in another tab, raced ahead of this persist), so the local
-  // optimistic entry _handleEvent already rendered doesn't linger after a clear that should have
-  // removed it.
-  async _persistDecodedEvent(event) {
-    const result = await withLock(LOCK_DECODED_LOG, async () => {
-      const currentGen = loadDecodedLogGen();
-      if (event._gen !== currentGen) {
-        return { gen: currentGen, log: loadDecodedLog(currentGen) };
-      }
-      const current = loadDecodedLog(currentGen);
-      const next = mergeDecodedLog(current, event);
-      saveDecodedLogRaw(next);
-      return { gen: currentGen, log: next };
-    });
-    this._decodedLogGen = result.gen;
-    this._decodedLog = result.log;
+  // Fully synchronous, and deliberately unsynchronized: the merge is over server-assigned
+  // event_ids into a canonical total order (see mergeDecodedLog/compareDecodedEvents), so every
+  // tab that has seen the same events computes the identical array. Concurrent writers therefore
+  // store the same value rather than competing ones, which is what makes last-writer-wins safe
+  // here without any lock. The generation is re-read from storage at write time (not stamped
+  // when the event arrived) so a "Clear log" that lands in between is always observed, never
+  // raced past.
+  _persistDecodedEvent(event) {
+    const gen = loadDecodedLogGen();
+    this._decodedLogGen = gen;
+    // Pre-add-on-upgrade events have no shared identity to converge on - show them in this tab
+    // (so a newer panel against an older add-on still works) but never persist them, since a
+    // fabricated client-side id would duplicate the same decode once per open tab.
+    if (!isConvergentEvent(event)) {
+      this._decodedLog = [event, ...this._decodedLog].slice(0, MAX_DECODED_LOG);
+      this._renderDecodedLog();
+      return;
+    }
+    const next = mergeDecodedLog(loadDecodedLog(gen), [{ ...event, _gen: gen }]);
+    saveDecodedLogRaw(next);
+    this._decodedLog = next;
     this._renderDecodedLog();
   }
 
-  // Atomically checks-and-sets `decodedDevice`'s low-battery state against the canonical,
-  // cross-tab-shared BATTERY_LOW_KEY under LOCK_BATTERY - every open tab independently receives
-  // the same WebSocket broadcast, so without a real lock, two tabs could both observe "not
-  // previously low" for the same transition and both play the alert sound. Serializing the
-  // check-then-set here means only the first tab to actually acquire the lock and find the
-  // device not-yet-low gets `true` back; by the time any other tab's callback runs, the map
-  // already reflects the first tab's write.
-  async _updateBatteryState(decodedDevice) {
+  // Also unsynchronized, and for the same reason: every tab sees the same battery_ok transitions
+  // and derives the same map, so the persisted value converges without coordination. What
+  // *can't* converge is the alert sound - it's a side effect, so "exactly once across all tabs"
+  // needs real mutual exclusion, which is the one thing the sound-leader election provides.
+  _updateBatteryState(decodedDevice) {
     const key = batteryStateKey(decodedDevice);
     const isLow = !decodedDevice.battery_ok;
-    const shouldPlaySound = await withLock(LOCK_BATTERY, async () => {
-      const map = loadBatteryLowState();
-      const wasAlreadyLow = map.has(key);
-      if (!isLow) {
-        // Recovered (or was never low) - nothing to alert on, so drop any stored entry rather
-        // than keeping a growing pile of healthy devices around forever.
-        map.delete(key);
-      } else {
-        // Delete-then-set (rather than a plain set on an existing key) moves this entry to the
-        // end of the Map's iteration order, so the eviction below reliably drops the *oldest*
-        // still-low device first when the bound is exceeded.
-        map.delete(key);
-        map.set(key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel });
-        while (map.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
-          map.delete(map.keys().next().value);
-        }
+    const map = loadBatteryLowState();
+    const wasAlreadyLow = map.has(key);
+    if (!isLow) {
+      // Recovered (or was never low) - nothing to alert on, so drop any stored entry rather
+      // than keeping a growing pile of healthy devices around forever.
+      map.delete(key);
+    } else {
+      // Delete-then-set (rather than a plain set on an existing key) moves this entry to the
+      // end of the Map's iteration order, so the eviction below reliably drops the *oldest*
+      // still-low device first when the bound is exceeded.
+      map.delete(key);
+      map.set(key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel });
+      while (map.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
+        map.delete(map.keys().next().value);
       }
-      saveBatteryLowStateRaw(map);
-      this._deviceBatteryOk = map;
-      return isLow && !wasAlreadyLow;
-    });
+    }
+    saveBatteryLowStateRaw(map);
+    this._deviceBatteryOk = map;
     this._renderBatteryAlerts();
-    if (shouldPlaySound && this._batterySoundEnabled) this._playBatteryAlertSound();
+    if (isLow && !wasAlreadyLow) this._maybePlayLeaderAlert();
+  }
+
+  // Plays the alert only in the tab currently holding sound leadership. Only tabs that can
+  // *actually* produce sound right now (pref enabled and an already-unlocked AudioContext)
+  // contend for it - otherwise a muted or audio-locked tab could win the election and silently
+  // swallow the alert for every tab that could have played it.
+  _maybePlayLeaderAlert() {
+    if (!this._canPlayAlertSound()) return;
+    if (!this._claimSoundLeadership()) return;
+    this._playBatteryAlertSound();
+  }
+
+  _canPlayAlertSound() {
+    return !!this._batterySoundEnabled && !!this._audioCtx && this._audioCtx.state === "running";
+  }
+
+  // Best-effort mutual exclusion for the alert *sound* only - never for state. A claim is taken
+  // when the stored one is absent, expired (its owner closed/crashed/was suspended past
+  // LEADER_TTL_MS), or already ours. Two tabs claiming in the same instant is possible and its
+  // worst case is one duplicated beep - acceptable for a notification, and categorically
+  // different from the data-integrity guarantees the (convergent) log and battery state get.
+  _claimSoundLeadership() {
+    try {
+      const now = Date.now();
+      const raw = localStorage.getItem(SOUND_LEADER_KEY);
+      const current = raw ? JSON.parse(raw) : null;
+      const held = current && typeof current.tabId === "string" && Number.isFinite(current.ts);
+      if (held && current.tabId !== this._tabId && now - current.ts < LEADER_TTL_MS) return false;
+      localStorage.setItem(SOUND_LEADER_KEY, JSON.stringify({ tabId: this._tabId, ts: now }));
+      this._startSoundLeaderHeartbeat();
+      return true;
+    } catch {
+      // Unavailable storage - fall back to just playing it. A possible duplicate beep across
+      // tabs beats silently dropping the notification entirely.
+      return true;
+    }
+  }
+
+  // Keeps this tab's claim fresh while it remains able to play sound, so other tabs don't treat
+  // it as abandoned and take over. Stops (letting the claim expire naturally) as soon as this
+  // tab can no longer actually play - e.g. the user unticked the sound preference.
+  _startSoundLeaderHeartbeat() {
+    if (this._soundLeaderTimer) return;
+    this._soundLeaderTimer = setInterval(() => {
+      if (!this._canPlayAlertSound()) {
+        this._stopSoundLeaderHeartbeat();
+        return;
+      }
+      try {
+        const raw = localStorage.getItem(SOUND_LEADER_KEY);
+        const current = raw ? JSON.parse(raw) : null;
+        // Only renew a claim that's still ours - another tab may have legitimately taken over
+        // while this one was suspended, and stomping that would re-create the split we're
+        // avoiding.
+        if (current && current.tabId !== this._tabId) {
+          this._stopSoundLeaderHeartbeat();
+          return;
+        }
+        localStorage.setItem(SOUND_LEADER_KEY, JSON.stringify({ tabId: this._tabId, ts: Date.now() }));
+      } catch {
+        this._stopSoundLeaderHeartbeat();
+      }
+    }, LEADER_HEARTBEAT_MS);
+  }
+
+  _stopSoundLeaderHeartbeat() {
+    if (!this._soundLeaderTimer) return;
+    clearInterval(this._soundLeaderTimer);
+    this._soundLeaderTimer = null;
+  }
+
+  // Releases leadership outright rather than waiting out LEADER_TTL_MS - on an ordinary detach
+  // another tab should be able to take over immediately, not after a multi-second gap during
+  // which a low-battery alert would go unplayed by anyone.
+  _releaseSoundLeadership() {
+    this._stopSoundLeaderHeartbeat();
+    try {
+      const raw = localStorage.getItem(SOUND_LEADER_KEY);
+      const current = raw ? JSON.parse(raw) : null;
+      if (current && current.tabId === this._tabId) localStorage.removeItem(SOUND_LEADER_KEY);
+    } catch {
+      // Unavailable storage - the claim (if any) simply expires on its own.
+    }
   }
 
   _showError(message, { isLoadError = false } = {}) {
@@ -1203,23 +1339,23 @@ class SdrHubPanel extends HTMLElement {
       ev.target.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
       this._renderDecodedLog();
     });
-    this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", async () => {
+    this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", () => {
       // Only clears the *displayed* log, not the low-battery state - a device that's genuinely
       // still reporting low battery should keep showing in the alert banner even after the user
       // clears this view, since that's a real hardware condition independent of what's on screen.
-      // Bumping the generation counter under LOCK_DECODED_LOG (rather than just writing an empty
-      // array) is what lets every tab - including one with a decode in flight to
-      // _persistDecodedEvent right now - recognize and drop anything tagged with the
-      // now-superseded generation instead of racing to resurrect it. See DECODED_LOG_GEN_KEY.
-      const gen = await withLock(LOCK_DECODED_LOG, async () => {
-        const nextGen = loadDecodedLogGen() + 1;
-        saveDecodedLogGen(nextGen);
-        saveDecodedLogRaw([]);
-        return nextGen;
-      });
-      this._decodedLogGen = gen;
+      // Bumping the generation counter (rather than just writing an empty array) is what lets
+      // every tab distinguish "cleared" from "hasn't seen these events yet": a decode persisted
+      // afterwards reads the new generation at write time and is tagged with it, while anything
+      // still carrying the old one is filtered out on load. Unlike the array itself, this is a
+      // genuine user action rather than convergent derived state, so it's also announced over
+      // BroadcastChannel for tabs to pick up immediately. See DECODED_LOG_GEN_KEY.
+      const nextGen = loadDecodedLogGen() + 1;
+      saveDecodedLogGen(nextGen);
+      saveDecodedLogRaw([]);
+      this._decodedLogGen = nextGen;
       this._decodedLog = [];
       this._renderDecodedLog();
+      this._postSync({ kind: "log_cleared", gen: nextGen });
     });
     const helpEl = this.querySelector("#sdr-hub-help");
     this.querySelector("[data-show-help]").addEventListener("click", () => {
