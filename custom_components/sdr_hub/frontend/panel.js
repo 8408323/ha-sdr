@@ -138,6 +138,12 @@ const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 // own, deliberately independent of DECODED_LOG_KEY above - see saveBatterySoundAlerted()'s
 // comment for why the 50-entry display log isn't a reliable source for this.
 const BATTERY_SOUND_ALERTED_KEY = "sdr_hub_battery_sound_alerted";
+// epoch-ms timestamp of the most recent "Clear log" click, or 0 if it's never been used.
+// Deliberately a separate key from DECODED_LOG_KEY rather than folded into it - see
+// _onStorageEvent's use of it for why a boundary *timestamp* (compared against each entry's own
+// _receivedAt) is what actually lets a cross-tab clear coexist correctly with a same-instant
+// decode, instead of the two tabs' writes racing to clobber each other outright.
+const DECODED_LOG_CLEARED_AT_KEY = "sdr_hub_decoded_log_cleared_at";
 // Every localStorage key this panel ever writes - used solely by _onResetPreferences() to wipe
 // them all in one action, so that list and this one can't silently drift apart the way two
 // independently-maintained copies could.
@@ -152,6 +158,7 @@ const ALL_PREF_KEYS = [
   DECODED_LOG_KEY,
   BATTERY_SOUND_ALERT_KEY,
   BATTERY_SOUND_ALERTED_KEY,
+  DECODED_LOG_CLEARED_AT_KEY,
 ];
 
 function loadFormPrefs(key) {
@@ -333,6 +340,24 @@ function saveDecodedLog(log) {
   }
 }
 
+function loadDecodedLogClearedAt() {
+  try {
+    const raw = localStorage.getItem(DECODED_LOG_CLEARED_AT_KEY);
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveDecodedLogClearedAt(ts) {
+  try {
+    localStorage.setItem(DECODED_LOG_CLEARED_AT_KEY, String(ts));
+  } catch {
+    // See saveDecodedLog above.
+  }
+}
+
 function loadBatterySoundEnabled() {
   try {
     return localStorage.getItem(BATTERY_SOUND_ALERT_KEY) === "true";
@@ -507,7 +532,12 @@ class SdrHubPanel extends HTMLElement {
     this._scrollMode = {}; // sweep_id -> bool, "keep full history (scrollable)" toggle
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
-    this._decodedLog = loadDecodedLog(); // most-recent-first - restored from localStorage so a page reload doesn't lose recent activity
+    // most-recent-first - restored from localStorage so a page reload doesn't lose recent
+    // activity. Filtered against the persisted clear boundary as defense in depth against a
+    // cross-tab clear-vs-decode race (see _onStorageEvent) having left pre-clear entries in a
+    // composite write - a normal, race-free save never contains any post-clear.
+    this._decodedLogClearedAt = loadDecodedLogClearedAt();
+    this._decodedLog = loadDecodedLog().filter((e) => e._receivedAt > this._decodedLogClearedAt);
     // batteryStateKey(device) -> {ok:false, model, id} for currently-low devices only, tracked
     // independently of _decodedLog so a device that reported low battery and then went silent
     // (falling off the capped log once enough *other* devices decode) doesn't have its alert
@@ -673,28 +703,24 @@ class SdrHubPanel extends HTMLElement {
         location.reload();
         return;
       }
-      // Specifically an empty-array write to the decoded log - i.e. another tab's "Clear log"
-      // button, which calls saveDecodedLog([]) and so never hits the newValue === null branch
-      // above at all (an empty array is still a value, not a removal). Deliberately narrower than
-      // "any decoded-log update": every open tab independently subscribes to and receives the
-      // same decoded_device broadcast over its own WebSocket connection, so a *regular* new-entry
-      // write in tab A is already about to happen in tab B too, from B's own copy of the same
-      // event - adopting A's write here as well would race that and double-prepend the same
-      // event into B's in-memory log (then B would persist *that* duplicate, which every tab
-      // including A would in turn adopt). "Clear log" has no such WS-driven counterpart in other
-      // tabs, so it's the one write this needs to actively propagate rather than leave to each
-      // tab's own event stream.
-      if (ev.key === DECODED_LOG_KEY && ev.newValue === "[]") {
-        // Guards a race this handler can otherwise lose: "storage" events queue on the event
-        // loop, so this can fire *after* this tab has since received and saved its own newer
-        // decoded_device event (overwriting localStorage with a nonempty log) - blindly trusting
-        // ev.newValue (always "[]" here, by definition of this branch) would wipe out that newer
-        // entry based on stale information. Re-reading the *current* value at the moment this
-        // actually runs (rather than what triggered the event) tells us whether the clear this
-        // event represents is still the latest word on the subject - if something newer has
-        // since been written, defer to that instead.
-        if (localStorage.getItem(DECODED_LOG_KEY) === "[]") {
-          this._decodedLog = [];
+      // Another tab's "Clear log" click, propagated via the boundary *timestamp* it wrote
+      // (DECODED_LOG_CLEARED_AT_KEY) rather than by trying to adopt its literal `[]` write to
+      // DECODED_LOG_KEY. An empty-array-write approach (tried in an earlier round) couldn't be
+      // made race-safe: every open tab independently subscribes to and receives the same
+      // decoded_device broadcast over its own WebSocket connection, so a regular new-entry write
+      // in tab A racing a clear in tab B is a real, unavoidable case - either direction of "trust
+      // whichever write arrives/looks newer" can end up discarding a legitimate decode or
+      // resurrecting cleared history, because a bare array value carries no ordering information
+      // relative to entries already sitting in another tab's in-memory log. A boundary timestamp
+      // sidesteps that: instead of asking "which whole-array write wins", each tab independently
+      // filters its own in-memory log down to entries strictly newer than the latest known clear,
+      // using each entry's own _receivedAt - so a decode that's genuinely newer than the clear
+      // always survives regardless of write ordering, and anything genuinely older never does.
+      if (ev.key === DECODED_LOG_CLEARED_AT_KEY && ev.newValue) {
+        const clearedAt = Number(ev.newValue);
+        if (Number.isFinite(clearedAt) && clearedAt > this._decodedLogClearedAt) {
+          this._decodedLogClearedAt = clearedAt;
+          this._decodedLog = this._decodedLog.filter((e) => e._receivedAt > clearedAt);
           this._renderDecodedLog();
         }
       }
@@ -715,16 +741,19 @@ class SdrHubPanel extends HTMLElement {
     // race into a second, duplicate subscription (confirmed live: rows arrived at ~2x the
     // add-on's actual broadcast rate, evicting "keep full history" mode's capped buffer
     // twice as fast as it should).
+    // Reload the persisted sound-dedup set on every connectedCallback, not just once in the
+    // constructor, and deliberately *outside*/independent of the `!_subscribing` branch below -
+    // disconnectedCallback tears down both the WS subscription and the storage listener on every
+    // detach, including one where _subscribe() had a call still in flight (_subscribing already
+    // true), which leaves that branch a no-op on this reattach even though the listeners were
+    // still torn down for its whole duration. While detached this instance misses both a live
+    // battery_ok:true recovery from the add-on AND another tab's own recovery-driven update to
+    // BATTERY_SOUND_ALERTED_KEY. Retaining the stale in-memory Set across the reattach would keep
+    // treating an already-recovered device as "already alerted", silently skipping the alert for
+    // its next real low report even though the recovery was in fact observed (by another tab, or
+    // would have been by this one had it stayed connected) and already persisted.
+    this._deviceBatterySoundAlerted = loadBatterySoundAlerted();
     if (!this._unsub && !this._subscribing) {
-      // Reload the persisted sound-dedup set here too, not just once in the constructor -
-      // disconnectedCallback tears down both the WS subscription and the storage listener, so
-      // while detached this instance misses both a live battery_ok:true recovery from the add-on
-      // AND another tab's own recovery-driven update to BATTERY_SOUND_ALERTED_KEY. Retaining the
-      // stale in-memory Set across the reattach would keep treating an already-recovered device
-      // as "already alerted", silently skipping the alert for its next real low report even
-      // though the recovery was in fact observed (by another tab, or would have been by this one
-      // had it stayed connected) and already persisted.
-      this._deviceBatterySoundAlerted = loadBatterySoundAlerted();
       this._loadState();
       this._subscribe();
     }
@@ -1155,6 +1184,11 @@ class SdrHubPanel extends HTMLElement {
       // reporting low battery should keep showing in the alert banner even after the user clears
       // this view, since that's a real hardware condition independent of what's on screen.
       this._decodedLog = [];
+      // Recorded (and persisted) as an explicit boundary, not just an empty-array write - see
+      // _onStorageEvent for why a plain "the log is now []" signal can't reliably survive a race
+      // against another tab's own concurrent, legitimate decode.
+      this._decodedLogClearedAt = Date.now();
+      saveDecodedLogClearedAt(this._decodedLogClearedAt);
       saveDecodedLog(this._decodedLog);
       this._renderDecodedLog();
     });
@@ -1810,25 +1844,18 @@ class SdrHubPanel extends HTMLElement {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = this._audioCtx ?? (this._audioCtx = new AudioCtx());
-      // ctx.currentTime is frozen while suspended, so scheduling the oscillator immediately
-      // (the old behavior) queued it against that frozen time rather than actually playing now -
-      // it could then suddenly play much later, whenever some *unrelated* interaction happened
-      // to unlock the context, well after the low-battery event that triggered it. Wait for a
-      // successful resume() and confirm the context actually reports "running" before scheduling
-      // - resume() rejecting (still no qualifying gesture, or genuinely unsupported) is handled
-      // explicitly below rather than by letting it silently reject unobserved.
-      if (ctx.state === "suspended") {
-        ctx
-          .resume()
-          .then(() => {
-            if (ctx.state === "running") this._scheduleBatteryAlertTone(ctx);
-          })
-          .catch(() => {
-            // Same "convenience notification, not worth surfacing an error over" reasoning as
-            // the outer catch below.
-          });
-        return;
-      }
+      // Only plays if the context is already unlocked ("running") from an earlier user gesture -
+      // see _wireAudioUnlock/_ensureAudioContextRunning, both of which run from an actual click/
+      // keydown, unlike this method (called from a gesture-less WS event). Deliberately does NOT
+      // call ctx.resume() and wait on it here (an earlier round of this same fix did, and that
+      // was itself the bug): resume()'s promise can stay pending rather than reject when there's
+      // still no qualifying gesture, and *any* later unrelated interaction on the page - not
+      // necessarily one that has anything to do with this alert - would resolve it via
+      // _wireAudioUnlock's own resume() call on the same shared context, which would then
+      // schedule this now-stale tone at that unrelated, much later moment. Silently dropping this
+      // one alert (the banner stays visible regardless) is a smaller cost than a surprise delayed
+      // beep for an event that's no longer new.
+      if (ctx.state !== "running") return;
       this._scheduleBatteryAlertTone(ctx);
     } catch {
       // Autoplay policy (no prior user gesture on this page) or an unsupported/unavailable
@@ -1837,9 +1864,7 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
-  // The actual oscillator scheduling, split out of _playBatteryAlertSound so it can be deferred
-  // until after an in-flight ctx.resume() actually resolves (see there) instead of always running
-  // synchronously against a context that might still be suspended.
+  // The actual oscillator scheduling, split out of _playBatteryAlertSound purely for readability.
   _scheduleBatteryAlertTone(ctx) {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
