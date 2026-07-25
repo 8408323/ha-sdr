@@ -1835,7 +1835,12 @@ class SdrHubPanel extends HTMLElement {
       if (rows.length > cap) rows.length = cap;
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
-      this._renderFrequencyAxis(event.sweep_id);
+      // The frequency axis is deliberately NOT rendered per row. It depends only on the sweep's
+      // bounds and the canvas width - neither of which a row changes - so rebuilding it here cost
+      // two synchronous getBoundingClientRect reads and a full tick-DOM replacement for every
+      // row, and scanner.py can emit one per FFT capture. Bounds changes come through
+      // _renderSweeps; width changes come through the ResizeObserver. The call only became
+      // redundant when that observer was added, which is why it survived until now.
     } else if (event.type === "decoded_device") {
       // Purely for this tab's own relative-age labels. Ordering and identity come from the
       // add-on's event_id/received_at instead (see compareDecodedEvents) - those are identical
@@ -4016,11 +4021,16 @@ class SdrHubPanel extends HTMLElement {
     // Measuring the card shifted every tick rightward relative to the data as soon as the
     // scrollbar appeared. The axis is also inset to match, so tick zero lines up with bin zero.
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
-    const axisBox = axisEl.getBoundingClientRect();
     const canvasBox = canvas ? canvas.getBoundingClientRect() : null;
+    // The inset is measured against the axis's *parent*, which this code never mutates. Deriving
+    // it from the axis's own box was self-invalidating: applying marginLeft moves that box, so the
+    // next render measured a difference of zero and removed the inset, and the render after that
+    // restored it - an oscillation that only became visible once the ResizeObserver started
+    // re-rendering without a width change.
+    const parentBox = axisEl.parentElement ? axisEl.parentElement.getBoundingClientRect() : null;
     const width = canvasBox && canvasBox.width > 0 ? canvasBox.width : axisEl.clientWidth || 0;
-    if (canvasBox && axisBox.width > 0) {
-      axisEl.style.marginLeft = `${Math.max(0, canvasBox.left - axisBox.left)}px`;
+    if (canvasBox && parentBox) {
+      axisEl.style.marginLeft = `${Math.max(0, canvasBox.left - parentBox.left)}px`;
       axisEl.style.width = `${width}px`;
     }
     // Pinning the width fixed the scrollbar offset but gave up the fluidity the old
@@ -4056,6 +4066,15 @@ class SdrHubPanel extends HTMLElement {
   // than the axis, since the canvas is the element whose width the ticks must match.
   _observeSweepResize(sweepId, canvas) {
     if (!canvas || typeof ResizeObserver === "undefined") return;
+    // Refuse to register once the panel is detached. disconnectedCallback tears observers down,
+    // but a sdr_hub/get_state still in flight resolves afterwards, and its _loadState ->
+    // _renderSweeps would register a fresh observer on a detached canvas that nothing will ever
+    // clean up - retaining the panel and its whole row history.
+    //
+    // This was previously blocked by accident: the memo key survived the detach, so a late
+    // _renderSweeps hit its early return before reaching here. Clearing that key to fix the
+    // reconnect bug removed the incidental guard, so the guard now has to be explicit.
+    if (!this.isConnected) return;
     this._sweepResizeObservers ??= new Map();
     const existing = this._sweepResizeObservers.get(sweepId);
     if (existing && existing.canvas === canvas) return;
@@ -4528,9 +4547,12 @@ class SdrHubPanel extends HTMLElement {
     // How many labels actually fit is measured, not assumed. A narrow sweep produces a canvas only
     // a few pixels wide - width is the bin count - while the labels stay a fixed pixel size, so a
     // hardcoded tick count drew text wider than the image and clipped the ruler unreadable.
+    // Measures the *rendered* endpoint labels, including the " MHz" the last one now carries.
+    // Measuring the bare number while drawing the wider string let the two-label case be selected
+    // when it does not actually fit.
     const labelWidth = Math.max(
       ctx.measureText(fmtMHz(sweep.start_hz)).width,
-      ctx.measureText(fmtMHz(sweep.stop_hz)).width,
+      ctx.measureText(`${fmtMHz(sweep.stop_hz)} MHz`).width,
     );
     const fits = Math.floor(out.width / (labelWidth + 8));
     const ticks = Math.max(2, Math.min(6, fits));
