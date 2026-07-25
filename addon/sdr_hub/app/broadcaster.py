@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 import logging
 
 from constants import WS_SEND_QUEUE_MAXSIZE
@@ -73,7 +74,13 @@ class Broadcaster:
                     # sees this before the next real message knows any event-derived state it's
                     # been building up may now be incomplete.
                     self._gap_pending[ws] = False
-                    await ws.send_json({"type": "stream_gap"})
+                    # gap_id is assigned here, once, per gap - the same reasoning as decoded
+                    # events' event_id. Every panel tab receives this one notice (via the
+                    # integration's single shared connection), so a server-assigned id lets every
+                    # tab recognise the *same* gap and handle it idempotently. Without it, tabs
+                    # can only guess from their own generation counters, which are unreliable
+                    # while a hydration is still in flight.
+                    await ws.send_json({"type": "stream_gap", "gap_id": uuid.uuid4().hex})
                 await ws.send_json(message)
         except Exception:  # noqa: BLE001 - a broken client shouldn't affect others
             # Visible by default (not debug-only): a send failure here means this client

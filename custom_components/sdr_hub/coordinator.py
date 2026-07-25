@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -123,7 +124,10 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # (and in addition to) the panel's own disconnectedCallback-driven clear,
                         # since the panel element can stay attached to HA the whole time this
                         # add-on-facing WS drops and reconnects underneath it.
-                        self._dispatch({"type": "stream_reconnected"})
+                        # See broadcaster.py's stream_gap for why this carries an id: it is a
+                        # single-source signal fanned out to every tab, so a shared identity lets
+                        # them converge on handling it exactly once.
+                        self._dispatch({"type": "stream_reconnected", "gap_id": uuid.uuid4().hex})
                     first_connection = False
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
