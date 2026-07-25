@@ -50,6 +50,11 @@ def resolve_seq_seed() -> int:
 def _write_seq_checkpoint(seq: int) -> None:
     """Durably records `seq`. Blocking - must not run on the event loop."""
     global _seq_high_water_written
+    # Executor jobs are not guaranteed to complete in submission order, so a delayed lower
+    # checkpoint could otherwise overwrite a higher one and leave the stored mark behind the
+    # true high water. Never move it backwards.
+    if seq <= _seq_high_water_written:
+        return
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
