@@ -366,6 +366,11 @@ class SdrHubPanel extends HTMLElement {
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
+    // model|id -> latest known battery_ok, tracked independently of _decodedLog so a device
+    // that reported low battery and then went silent (falling off the capped log once enough
+    // *other* devices decode) doesn't have its alert silently cleared - it's only cleared by an
+    // actual battery_ok:true recovery event, never by the log simply rolling past it.
+    this._deviceBatteryOk = new Map();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -514,6 +519,17 @@ class SdrHubPanel extends HTMLElement {
       event._receivedAt = Date.now(); // client-side only, for the relative-time label
       this._decodedLog.unshift(event);
       if (this._decodedLog.length > MAX_DECODED_LOG) this._decodedLog.length = MAX_DECODED_LOG;
+      // Update the persistent battery-state map before it can be trimmed off the log above -
+      // see the field comment on _deviceBatteryOk for why this can't just be derived from
+      // _decodedLog at render time.
+      const decodedDevice = event.device || {};
+      if (Object.hasOwn(decodedDevice, "battery_ok")) {
+        this._deviceBatteryOk.set(deviceFavoriteKey(decodedDevice), {
+          ok: !!decodedDevice.battery_ok,
+          model: decodedDevice.model,
+          id: decodedDevice.id,
+        });
+      }
       this._renderDecodedLog();
     } else if (event.type === "status" || event.type === "state_changed") {
       // A receiver/sweep died, or something else changed the add-on's state from outside
@@ -545,6 +561,10 @@ class SdrHubPanel extends HTMLElement {
     // populated, leaving the sweep list permanently blank after a shell rebuild.
     this._renderedSweepIdsKey = null;
     this._renderedSweepStatusKey = null;
+    // Same invalidation, same reason, for _renderReceivers()'s analogous no-op-refresh skip -
+    // #sdr-hub-receivers is about to be recreated empty by this shell rebuild below.
+    this._renderedReceiverIdsKey = null;
+    this._renderedReceiverStatusKey = null;
     const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
     const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
     // "Dismissed" only skips showing it by default on load - the Help button in the header
@@ -569,7 +589,7 @@ class SdrHubPanel extends HTMLElement {
           <button data-dismiss-help style="${BTN}">Got it, don't show again</button>
         </div>
         <div id="sdr-hub-error" style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
-        <div id="sdr-hub-battery-alert" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
+        <div id="sdr-hub-battery-alert" role="alert" aria-live="assertive" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Dongles</h2>
@@ -1120,6 +1140,33 @@ class SdrHubPanel extends HTMLElement {
   _renderReceivers() {
     const el = this.querySelector("#sdr-hub-receivers");
     if (!el) return;
+    // _loadState() (and thus this) runs on every state_changed event, including the harmless
+    // 30s poll - a full innerHTML rebuild on every one of those would tear down and recreate
+    // each row's Stop button, discarding any in-progress confirm-to-stop arming (see
+    // _wireConfirmButton) and forcing the user to start the confirmation over. Skip the rebuild
+    // (matching the same no-op-refresh guard _renderSweeps already uses) when the set of
+    // receivers and their statuses hasn't actually changed - only patch the status label text.
+    const idsKey = this._state.receivers
+      .map((r) => r.id)
+      .sort()
+      .join(",");
+    const statusKey = this._state.receivers.map((r) => `${r.id}:${r.status}`).join(",");
+    if (this._renderedReceiverIdsKey === idsKey) {
+      if (this._renderedReceiverStatusKey !== statusKey) {
+        for (const r of this._state.receivers) {
+          const statusCell = el.querySelector(`[data-receiver-status="${CSS.escape(r.id)}"]`);
+          if (statusCell) {
+            statusCell.innerHTML =
+              r.status === "error" ? `<span style="color:var(--error-color,#db4437);">error</span>` : "running";
+          }
+        }
+        this._renderedReceiverStatusKey = statusKey;
+      }
+      this._applyReceiverFilter();
+      return;
+    }
+    this._renderedReceiverIdsKey = idsKey;
+    this._renderedReceiverStatusKey = statusKey;
     if (this._state.receivers.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active receivers.</p>`;
       return;
@@ -1138,7 +1185,7 @@ class SdrHubPanel extends HTMLElement {
             <td>${r.label ? esc(r.label) : `<em style="color:var(--secondary-text-color,#727272);">—</em>`}</td>
             <td>${r.frequencies_hz.map(fmtMHz).join(", ")} MHz</td>
             <td>${esc(r.dongle_serial)}</td>
-            <td>${r.status === "error" ? `<span style="color:var(--error-color,#db4437);">error</span>` : "running"}</td>
+            <td data-receiver-status="${esc(r.id)}">${r.status === "error" ? `<span style="color:var(--error-color,#db4437);">error</span>` : "running"}</td>
             <td style="display:flex;gap:8px;">
               <button data-copy-receiver-yaml="${esc(r.id)}" title="Copy as an sdr_hub.add_receiver automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
               <button data-remove-receiver="${esc(r.id)}" style="${BTN_DANGER}">Stop</button>
@@ -1192,18 +1239,13 @@ class SdrHubPanel extends HTMLElement {
   _renderBatteryAlerts() {
     const el = this.querySelector("#sdr-hub-battery-alert");
     if (!el) return;
-    // Only the most recent event per device (model+id) reflects its *current* battery state -
-    // walking newest-first and keeping just the first sighting of each key means an older
-    // battery_ok:false that has since recovered doesn't stay stuck showing as low.
-    const seen = new Set();
+    // Reads from _deviceBatteryOk (updated per-event in _handleEvent), not _decodedLog - the
+    // log is capped at MAX_DECODED_LOG and a weakening sensor that stops transmitting after
+    // reporting low battery would otherwise have its record evicted by newer events from other
+    // devices, silently clearing an alert that never actually recovered.
     const low = [];
-    for (const event of this._decodedLog) {
-      const d = event.device || {};
-      if (!Object.hasOwn(d, "battery_ok")) continue;
-      const key = deviceFavoriteKey(d);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (!d.battery_ok) low.push(d.id != null ? `${d.model || "Unknown device"} (id ${d.id})` : d.model || "Unknown device");
+    for (const { ok, model, id } of this._deviceBatteryOk.values()) {
+      if (!ok) low.push(id != null ? `${model || "Unknown device"} (id ${id})` : model || "Unknown device");
     }
     if (low.length === 0) {
       el.style.display = "none";
