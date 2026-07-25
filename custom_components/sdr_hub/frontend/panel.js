@@ -218,11 +218,18 @@ async function idbGet(key) {
 function normalizeBatteryRecord(raw) {
   const gen = raw && Number.isInteger(raw.gen) && raw.gen >= 0 ? raw.gen : 0;
   const entries = raw && raw.entries && typeof raw.entries === "object" ? raw.entries : {};
-  // The last stream gap already applied to this record. Gaps carry a server-assigned id (see
+  // The stream gaps already applied to this record. Gaps carry a server-assigned id (see
   // broadcaster.py), so every tab can recognise the same gap and apply it exactly once - without
   // inferring "has a peer already handled this?" from its own generation counter, which is
   // unreliable while a hydration is still in flight.
-  const lastGapId = raw && typeof raw.lastGapId === "string" ? raw.lastGapId : null;
+  //
+  // A *set* rather than just the most recent one: with gaps A then B, a tab whose A handling was
+  // delayed would otherwise see lastGapId === B, treat A as new, and clear a valid post-B
+  // transition. Bounded, so a long-lived record cannot grow without limit; a duplicate older than
+  // the window degrades to the previous behaviour rather than to something worse.
+  const rawGaps = raw && Array.isArray(raw.appliedGaps) ? raw.appliedGaps.filter((g) => typeof g === "string") : [];
+  const legacyGap = raw && typeof raw.lastGapId === "string" ? [raw.lastGapId] : [];
+  const appliedGaps = [...new Set([...rawGaps, ...legacyGap])].slice(-MAX_TRACKED_APPLIED_GAPS);
   // Per-key memory of evicted recovery tombstones: key -> the order at which it was known to have
   // recovered. A count-limited tombstone set cannot by itself dominate an arbitrarily delayed
   // writer (a tab suspended mid-write can resume long after its device's tombstone was pushed out,
@@ -237,7 +244,7 @@ function normalizeBatteryRecord(raw) {
   const evicted = new Map(Object.entries(rawEvicted).filter(([, v]) => Number.isFinite(v)));
   return {
     gen,
-    lastGapId,
+    appliedGaps,
     evicted,
     map: new Map(
       Object.entries(entries).filter(
@@ -247,8 +254,13 @@ function normalizeBatteryRecord(raw) {
   };
 }
 
-function serializeBatteryRecord(gen, map, evicted = new Map(), lastGapId = null) {
-  return { gen, lastGapId, evicted: Object.fromEntries(evicted), entries: Object.fromEntries(map) };
+function serializeBatteryRecord(gen, map, evicted = new Map(), appliedGaps = []) {
+  return {
+    gen,
+    appliedGaps: appliedGaps.slice(-MAX_TRACKED_APPLIED_GAPS),
+    evicted: Object.fromEntries(evicted),
+    entries: Object.fromEntries(map),
+  };
 }
 
 // Union of two eviction maps, keeping the highest known recovery order per key. Used wherever two
@@ -275,6 +287,15 @@ function mergeEvicted(a, b) {
   // the oldest knowledge is dropped and behaviour degrades to the pre-eviction-tracking case.
   if (out.size <= MAX_TRACKED_EVICTED_TOMBSTONES) return out;
   return new Map([...out.entries()].sort(([, x], [, y]) => y - x).slice(0, MAX_TRACKED_EVICTED_TOMBSTONES));
+}
+
+// Display time for a decoded event. The server's received_at is authoritative and identical in
+// every tab; _receivedAt is this tab's own arrival time and exists only for events from an add-on
+// that predates received_at. Preferring the server value is what keeps the stored copies of one
+// event byte-identical across tabs - see the note in _persistDecodedEvent.
+function decodedDisplayTime(event) {
+  if (Number.isFinite(event?.received_at)) return event.received_at * 1000;
+  return Number.isFinite(event?._receivedAt) ? event._receivedAt : null;
 }
 
 function normalizeDecodedRecord(raw) {
@@ -837,6 +858,9 @@ const MAX_TRACKED_BATTERY_TOMBSTONES = 50;
 // Evicted-tombstone records are a key and a number each, so this can be an order of magnitude
 // larger than the tombstone cap itself at negligible cost.
 const MAX_TRACKED_EVICTED_TOMBSTONES = 500;
+// Applied stream-gap ids retained for duplicate detection. Gaps are rare (a full send queue or a
+// reconnect), so a small window comfortably covers any realistic delay between tabs.
+const MAX_TRACKED_APPLIED_GAPS = 32;
 
 class SdrHubPanel extends HTMLElement {
   constructor() {
@@ -1412,7 +1436,15 @@ class SdrHubPanel extends HTMLElement {
   // has to be part of the barrier, not just the initial load.
   _trackBarrier(kind, promise) {
     const guarded = Promise.resolve(promise).catch(() => {});
-    for (const k of kind === "both" ? ["decoded", "battery"] : [kind]) this._barriers[k] = guarded;
+    for (const k of kind === "both" ? ["decoded", "battery"] : [kind]) {
+      // Aggregated with whatever is already outstanding, never assigned over it. Overwriting made
+      // the displaced operation invisible: a Clear waiting on a prior barrier could be replaced by
+      // a peer hydration, after which a decode waited only on the hydration, wrote under the old
+      // generation, and was then erased when the orphaned clear finally committed. _awaitBarrier
+      // cannot see a promise that was overwritten, so the aggregation has to happen here.
+      const existing = this._barriers[k];
+      this._barriers[k] = existing ? Promise.all([existing, guarded]).then(() => {}) : guarded;
+    }
     return promise;
   }
 
@@ -1545,7 +1577,13 @@ class SdrHubPanel extends HTMLElement {
           const boundary = current.clearedOrd;
           if (!Number.isFinite(order) || !Number.isFinite(boundary) || order <= boundary) return undefined;
         }
-        const merged = mergeDecodedLog(current.log, [{ ...event, _gen: current.gen }]);
+        // _receivedAt is deliberately stripped: it is this tab's arrival time, so persisting it
+        // made two tabs' copies of the *same* server event differ. mergeDecodedLog replaces by
+        // event_id, so a suspended tab flushing an old queued event could overwrite the canonical
+        // copy and make an old decode read as newly received everywhere, including after reload.
+        // Display falls back to the server's received_at (see decodedDisplayTime).
+        const { _receivedAt, ...convergent } = event;
+        const merged = mergeDecodedLog(current.log, [{ ...convergent, _gen: current.gen }]);
         return { gen: current.gen, clearedOrd: current.clearedOrd, entries: merged };
       });
       // A clear landed while this was in flight - its result is pre-clear, so applying it would
@@ -1604,7 +1642,7 @@ class SdrHubPanel extends HTMLElement {
         // post-gap transition, erasing it. The recorded id makes the first application win and
         // every duplicate a no-op, regardless of what any tab's cached generation says.
         if (gapId) {
-          if (current.lastGapId === gapId) return undefined;
+          if (current.appliedGaps.includes(gapId)) return undefined;
         } else if (current.gen !== expectedGen) {
           // Legacy add-on with no gap_id - fall back to the generation guard. Weaker (it cannot
           // tell a peer's duplicate from a stale local generation) but better than bumping
@@ -1613,7 +1651,12 @@ class SdrHubPanel extends HTMLElement {
         }
         // Eviction knowledge carries across the bump: it describes writers that may still be in
         // flight, which a generation change does not retract.
-        return serializeBatteryRecord(current.gen + 1, new Map(), current.evicted, gapId ?? current.lastGapId);
+        return serializeBatteryRecord(
+          current.gen + 1,
+          new Map(),
+          current.evicted,
+          gapId ? [...current.appliedGaps, gapId] : current.appliedGaps,
+        );
       });
       const settled = normalizeBatteryRecord(record);
       this._batteryGen = settled.gen;
@@ -1660,6 +1703,11 @@ class SdrHubPanel extends HTMLElement {
     // a lagging tab's earlier event could be stamped later than another tab's subsequent
     // recovery and overwrite it, pinning a low-battery warning that nothing would clear.
     if (!isConvergentEvent(event)) {
+      // Waited on even though nothing is persisted: an adopting hydration in flight (first load,
+      // reattach, HA reconnect) replaces _deviceBatteryOk wholesale with its snapshot, and since
+      // this branch deliberately never writes, the report would simply vanish until the device
+      // transmitted again.
+      await this._awaitBarrier("battery");
       const localOrd = Number.isFinite(ord) ? ord : Date.now();
       const localBase = { ...base, ord: localOrd };
       this._deviceBatteryOk = mergeBatteryLowState(
@@ -1723,7 +1771,7 @@ class SdrHubPanel extends HTMLElement {
           new Map([[key, withEpisode(base, current.map.get(key))]]),
           mergeEvicted(this._batteryEvicted, current.evicted),
         );
-        return serializeBatteryRecord(current.gen, merged.map, merged.evicted, current.lastGapId);
+        return serializeBatteryRecord(current.gen, merged.map, merged.evicted, current.appliedGaps);
       });
       const settled = normalizeBatteryRecord(record);
       // Same overlapping-transaction reasoning as _persistDecodedEvent - merge unless the
@@ -2130,7 +2178,7 @@ class SdrHubPanel extends HTMLElement {
       });
       await idbMutate(IDB_KEY_BATTERY, (raw) => {
         const cur = normalizeBatteryRecord(raw);
-        return serializeBatteryRecord(cur.gen + 1, new Map(), cur.evicted, cur.lastGapId);
+        return serializeBatteryRecord(cur.gen + 1, new Map(), cur.evicted, cur.appliedGaps);
       });
     } catch {
       // No usable store - nothing persisted to clear.
@@ -2820,10 +2868,11 @@ class SdrHubPanel extends HTMLElement {
         const fields = Object.keys(d)
           .filter((k) => !DECODED_HIDDEN_FIELDS.has(k))
           .map((k) => fmtDecodedField(k, d[k]));
-        const age = event._receivedAt
+        const shownAt = decodedDisplayTime(event);
+        const age = shownAt
           ? this._decodedTimeMode === "absolute"
-            ? fmtAbsoluteTime(event._receivedAt)
-            : `-${fmtElapsed(now - event._receivedAt)}`
+            ? fmtAbsoluteTime(shownAt)
+            : `-${fmtElapsed(now - shownAt)}`
           : "";
         const cardStyle = fav ? `background:rgba(245,166,35,.1);${flash ? "animation:sdr-hub-flash 1.2s ease-out;" : ""}` : "";
         return `
