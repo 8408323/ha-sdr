@@ -426,6 +426,12 @@ class SdrHubPanel extends HTMLElement {
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
     this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
+    // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
+    // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
+    // favorite only flashes once per new decode rather than on every unrelated re-render.
+    this._flashDeviceKey = null;
+    this._connectionStatus = "connected"; // "connected" | "disconnected" - see _wireConnectionStatus
+    this._connListenersWired = false;
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -445,10 +451,46 @@ class SdrHubPanel extends HTMLElement {
       this._renderShell();
       this._loadState();
       this._subscribe();
+      this._wireConnectionStatus();
       if (!this._decodedAgeInterval) {
         this._decodedAgeInterval = setInterval(() => this._renderDecodedLog(), 30000);
       }
     }
+  }
+
+  // hass.connection (home-assistant-js-websocket's Connection) is the underlying WS link to HA
+  // itself - separate from, and a layer below, this panel's own sdr_hub/subscribe message
+  // stream (which the library transparently re-subscribes on reconnect, so _unsub/_subscribing
+  // alone never surface a drop to the user). "ready"/"disconnected" are that library's own
+  // connection-lifecycle events - wiring them here is what lets the header badge reflect an
+  // actual live-or-not state instead of just staying "connected" forever after the first render.
+  // Called from the hass setter's `first` branch, and again from connectedCallback after a
+  // detach where disconnectedCallback tore these down (mirrors _subscribe()'s own re-wiring) -
+  // guarded by _connListenersWired in both places, since hass.connection is a page-wide
+  // singleton the panel doesn't own and re-wiring while already wired would accumulate
+  // duplicate listeners that never get removed.
+  _wireConnectionStatus() {
+    this._onConnReady = () => {
+      this._connectionStatus = "connected";
+      this._renderConnectionStatus();
+    };
+    this._onConnDisconnected = () => {
+      this._connectionStatus = "disconnected";
+      this._renderConnectionStatus();
+    };
+    this._hass.connection.addEventListener("ready", this._onConnReady);
+    this._hass.connection.addEventListener("disconnected", this._onConnDisconnected);
+    this._connListenersWired = true;
+    this._connectionStatus = this._hass.connection.connected ? "connected" : "disconnected";
+    this._renderConnectionStatus();
+  }
+
+  _renderConnectionStatus() {
+    const el = this.querySelector("#sdr-hub-connection-status");
+    if (!el) return;
+    const connected = this._connectionStatus === "connected";
+    el.textContent = connected ? "● Live" : "● Reconnecting…";
+    el.style.color = connected ? "var(--success-color,#4caf50)" : "var(--warning-color,#ff9800)";
   }
 
   set panel(panel) {
@@ -479,6 +521,10 @@ class SdrHubPanel extends HTMLElement {
     if (!this._decodedAgeInterval) {
       this._decodedAgeInterval = setInterval(() => this._renderDecodedLog(), 30000);
     }
+    // Mirrors the _unsub re-wiring above - disconnectedCallback tore these down too, so a
+    // detach-then-reattach (same instance) needs them re-wired or the badge would stop tracking
+    // future connection drops/recoveries after the first reattach.
+    if (!this._connListenersWired) this._wireConnectionStatus();
   }
 
   disconnectedCallback() {
@@ -489,6 +535,14 @@ class SdrHubPanel extends HTMLElement {
     if (this._decodedAgeInterval) {
       clearInterval(this._decodedAgeInterval);
       this._decodedAgeInterval = null;
+    }
+    // hass.connection outlives this element (it's HA-wide, not per-panel) - these listeners
+    // must be removed on detach or a truly destroyed/GC'd panel instance would otherwise leave
+    // its handlers permanently registered on that shared object.
+    if (this._connListenersWired) {
+      this._hass.connection.removeEventListener("ready", this._onConnReady);
+      this._hass.connection.removeEventListener("disconnected", this._onConnDisconnected);
+      this._connListenersWired = false;
     }
     // _deviceBatteryOk is populated purely from the decoded_device event stream - there's no
     // authoritative server-side battery snapshot in get_state to reconcile against on
@@ -582,6 +636,12 @@ class SdrHubPanel extends HTMLElement {
       // see the field comment on _deviceBatteryOk for why this can't just be derived from
       // _decodedLog at render time.
       const decodedDevice = event.device || {};
+      // A fresh decode from a pinned device gets a one-shot flash (consumed and cleared by
+      // _renderDecodedLog on its next draw) - only for favorites, since flashing every incoming
+      // event regardless of relevance would be noise for exactly the users this is meant to help
+      // (someone watching one specific sensor among a lot of unrelated traffic).
+      const favKey = deviceFavoriteKey(decodedDevice);
+      if (this._favoriteDevices.has(favKey)) this._flashDeviceKey = favKey;
       if (Object.hasOwn(decodedDevice, "battery_ok")) {
         const key = batteryStateKey(decodedDevice);
         if (decodedDevice.battery_ok) {
@@ -663,9 +723,21 @@ class SdrHubPanel extends HTMLElement {
     // dismissed too quickly or wants a refresher later.
     const helpDismissed = loadHelpDismissed();
     this.innerHTML = `
+      <style>
+        /* Settles at the same rgba(245,166,35,.1) resting background a favorited decoded-device
+           card already gets - see _renderDecodedLog - so the flash reads as "this card just got
+           brighter for a moment" rather than ending on a visibly different steady state. */
+        @keyframes sdr-hub-flash {
+          0% { background-color: rgba(245,166,35,.6); }
+          100% { background-color: rgba(245,166,35,.1); }
+        }
+      </style>
       <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-          <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+            <span id="sdr-hub-connection-status" role="status" style="font-size:.8rem;font-weight:600;"></span>
+          </div>
           <button data-show-help style="${BTN_SECONDARY}">Help</button>
         </div>
         <div id="sdr-hub-help" style="${CARD};display:${helpDismissed ? "none" : "block"};">
@@ -718,7 +790,10 @@ class SdrHubPanel extends HTMLElement {
             </label>
             <button type="submit" style="${BTN}">Start sweep</button>
           </form>
-          <input id="sdr-hub-sweep-filter" type="text" aria-label="Filter sweeps by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <input id="sdr-hub-sweep-filter" type="text" aria-label="Filter sweeps by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};flex:1;box-sizing:border-box;">
+            <button id="sdr-hub-stop-all-sweeps" type="button" style="${BTN_DANGER};white-space:nowrap;">Stop all</button>
+          </div>
           <div id="sdr-hub-sweeps"></div>
         </div>
 
@@ -735,7 +810,10 @@ class SdrHubPanel extends HTMLElement {
             <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. Weather station" style="${INPUT};width:140px"></label>
             <button type="submit" style="${BTN}">Start receiver</button>
           </form>
-          <input id="sdr-hub-receiver-filter" type="text" aria-label="Filter receivers by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <input id="sdr-hub-receiver-filter" type="text" aria-label="Filter receivers by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};flex:1;box-sizing:border-box;">
+            <button id="sdr-hub-stop-all-receivers" type="button" style="${BTN_DANGER};white-space:nowrap;">Stop all</button>
+          </div>
           <div id="sdr-hub-receivers"></div>
         </div>
 
@@ -813,6 +891,12 @@ class SdrHubPanel extends HTMLElement {
       this._receiverFilter = ev.target.value.trim().toLowerCase();
       this._applyReceiverFilter();
     });
+    // "Stop all" always targets every active sweep/receiver, regardless of the filter text
+    // above it - "stop everything" is the whole point of a bulk action, and scoping it to
+    // whatever happens to currently be filtered-in would make it a trap for anyone who filtered
+    // down to look at one thing and forgot to clear it before reaching for this button.
+    this._wireConfirmButton(this.querySelector("#sdr-hub-stop-all-sweeps"), () => this._onStopAllSweeps());
+    this._wireConfirmButton(this.querySelector("#sdr-hub-stop-all-receivers"), () => this._onStopAllReceivers());
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
     this._wireColormapControls();
@@ -1407,11 +1491,17 @@ class SdrHubPanel extends HTMLElement {
     // instead of scanning past everything else that's decoded more recently.
     const isFavorite = (event) => this._favoriteDevices.has(deviceFavoriteKey(event.device || {}));
     const sorted = [...filtered].sort((a, b) => Number(isFavorite(b)) - Number(isFavorite(a)));
+    let flashConsumed = false;
     el.innerHTML = sorted
       .map((event) => {
         const d = event.device || {};
         const key = deviceFavoriteKey(d);
         const fav = this._favoriteDevices.has(key);
+        // Only the first (newest, thanks to the favorite sort-to-top above) matching card
+        // consumes the pending flash - without this a device with multiple log entries could
+        // flash more than once per new decode.
+        const flash = fav && !flashConsumed && key === this._flashDeviceKey;
+        if (flash) flashConsumed = true;
         const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
           Boolean,
         );
@@ -1423,8 +1513,9 @@ class SdrHubPanel extends HTMLElement {
             ? fmtAbsoluteTime(event._receivedAt)
             : `-${fmtElapsed(now - event._receivedAt)}`
           : "";
+        const cardStyle = fav ? `background:rgba(245,166,35,.1);${flash ? "animation:sdr-hub-flash 1.2s ease-out;" : ""}` : "";
         return `
-          <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${fav ? "background:rgba(245,166,35,.1);" : ""}">
+          <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;">
               <span style="display:flex;align-items:center;gap:6px;">
                 <button data-pin-device="${esc(key)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
@@ -1438,6 +1529,10 @@ class SdrHubPanel extends HTMLElement {
           </div>`;
       })
       .join("");
+    // Cleared unconditionally after this render (whether or not a card actually consumed it,
+    // e.g. the flashed device was filtered out this time) - a flash means "this just happened",
+    // not "show it next time this device happens to be visible again".
+    this._flashDeviceKey = null;
     el.querySelectorAll("[data-pin-device]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const key = btn.dataset.pinDevice;
@@ -2138,6 +2233,15 @@ class SdrHubPanel extends HTMLElement {
     await this._loadState();
   }
 
+  // Snapshots ids up front rather than iterating this._state.sweeps directly - each
+  // _onRemoveSweep call's own _loadState() reassigns this._state (and thus .sweeps) as it goes,
+  // so iterating the live array while removing from it would skip entries. Sequential (not
+  // Promise.all) so overlapping _loadState() calls can't resolve out of order and reintroduce
+  // a sweep that was already removed - see _loadState's own request-id-guard comment.
+  async _onStopAllSweeps() {
+    for (const id of this._state.sweeps.map((s) => s.id)) await this._onRemoveSweep(id);
+  }
+
   async _onAddReceiver(ev) {
     ev.preventDefault();
     // See _onAddSweep's identical formEl capture above - same reasoning.
@@ -2179,6 +2283,11 @@ class SdrHubPanel extends HTMLElement {
       this._showError(`Could not stop receiver: ${err.message || err}`);
     }
     await this._loadState();
+  }
+
+  // See _onStopAllSweeps above - same snapshot-ids-then-sequentially-remove reasoning.
+  async _onStopAllReceivers() {
+    for (const id of this._state.receivers.map((r) => r.id)) await this._onRemoveReceiver(id);
   }
 }
 
