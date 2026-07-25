@@ -132,6 +132,22 @@ const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
+const DECODED_LOG_KEY = "sdr_hub_decoded_log";
+const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
+// Every localStorage key this panel ever writes - used solely by _onResetPreferences() to wipe
+// them all in one action, so that list and this one can't silently drift apart the way two
+// independently-maintained copies could.
+const ALL_PREF_KEYS = [
+  SWEEP_FORM_PREFS_KEY,
+  RECEIVER_FORM_PREFS_KEY,
+  HELP_DISMISSED_KEY,
+  COLORMAP_KEY,
+  DB_RANGE_KEY,
+  FAVORITE_DEVICES_KEY,
+  DECODED_TIME_MODE_KEY,
+  DECODED_LOG_KEY,
+  BATTERY_SOUND_ALERT_KEY,
+];
 
 function loadFormPrefs(key) {
   try {
@@ -249,6 +265,47 @@ function loadDecodedTimeMode() {
 function saveDecodedTimeMode(mode) {
   try {
     localStorage.setItem(DECODED_TIME_MODE_KEY, mode);
+  } catch {
+    // See saveColormap above.
+  }
+}
+
+function loadDecodedLog() {
+  try {
+    const raw = localStorage.getItem(DECODED_LOG_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Only entries that still look like a real decoded_device event - a corrupted or
+    // hand-edited value here would otherwise flow straight into _renderDecodedLog and blow up
+    // on fields (device, _receivedAt) it assumes are always present.
+    return parsed
+      .filter((e) => e && typeof e === "object" && e.device && typeof e.device === "object" && Number.isFinite(e._receivedAt))
+      .slice(0, MAX_DECODED_LOG);
+  } catch {
+    return [];
+  }
+}
+
+function saveDecodedLog(log) {
+  try {
+    localStorage.setItem(DECODED_LOG_KEY, JSON.stringify(log.slice(0, MAX_DECODED_LOG)));
+  } catch {
+    // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
+  }
+}
+
+function loadBatterySoundEnabled() {
+  try {
+    return localStorage.getItem(BATTERY_SOUND_ALERT_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function saveBatterySoundEnabled(enabled) {
+  try {
+    localStorage.setItem(BATTERY_SOUND_ALERT_KEY, enabled ? "true" : "false");
   } catch {
     // See saveColormap above.
   }
@@ -412,7 +469,7 @@ class SdrHubPanel extends HTMLElement {
     this._scrollMode = {}; // sweep_id -> bool, "keep full history (scrollable)" toggle
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
-    this._decodedLog = []; // most-recent-first
+    this._decodedLog = loadDecodedLog(); // most-recent-first - restored from localStorage so a page reload doesn't lose recent activity
     // batteryStateKey(device) -> {ok:false, model, id} for currently-low devices only, tracked
     // independently of _decodedLog so a device that reported low battery and then went silent
     // (falling off the capped log once enough *other* devices decode) doesn't have its alert
@@ -432,6 +489,8 @@ class SdrHubPanel extends HTMLElement {
     this._flashDeviceKey = null;
     this._connectionStatus = "connected"; // "connected" | "disconnected" - see _wireConnectionStatus
     this._connListenersWired = false;
+    this._batterySoundEnabled = loadBatterySoundEnabled();
+    this._audioCtx = null; // lazily created on first alert - see _playBatteryAlertSound
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -544,6 +603,10 @@ class SdrHubPanel extends HTMLElement {
       this._hass.connection.removeEventListener("disconnected", this._onConnDisconnected);
       this._connListenersWired = false;
     }
+    if (this._audioCtx) {
+      this._audioCtx.close();
+      this._audioCtx = null;
+    }
     // _deviceBatteryOk is populated purely from the decoded_device event stream - there's no
     // authoritative server-side battery snapshot in get_state to reconcile against on
     // reconnect. A device can recover while this subscription is torn down, and that missed
@@ -649,6 +712,10 @@ class SdrHubPanel extends HTMLElement {
           // rather than keeping a growing pile of healthy devices around forever.
           this._deviceBatteryOk.delete(key);
         } else {
+          // Checked before the delete-then-set below (which would otherwise always make a
+          // membership check true) - only a device *newly* going low should play a sound, not
+          // every repeated low report from a device that's already shown in the banner.
+          const wasAlreadyLow = this._deviceBatteryOk.has(key);
           // Delete-then-set (rather than a plain set on an existing key) moves this entry to
           // the end of the Map's iteration order, so the eviction below reliably drops the
           // *oldest* still-low device first when the bound is exceeded.
@@ -662,8 +729,10 @@ class SdrHubPanel extends HTMLElement {
           while (this._deviceBatteryOk.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
             this._deviceBatteryOk.delete(this._deviceBatteryOk.keys().next().value);
           }
+          if (!wasAlreadyLow && this._batterySoundEnabled) this._playBatteryAlertSound();
         }
       }
+      saveDecodedLog(this._decodedLog);
       this._renderDecodedLog();
     } else if (event.type === "status" || event.type === "state_changed") {
       // A receiver/sweep died, or something else changed the add-on's state from outside
@@ -848,6 +917,17 @@ class SdrHubPanel extends HTMLElement {
             <button id="sdr-hub-copy-all-yaml" type="button" title="Copy every active sweep and receiver as a single automation action list" style="${BTN_SECONDARY}">Copy all as YAML</button>
           </div>
         </div>
+
+        <div style="${CARD}">
+          <h2 style="margin:0 0 8px;font-size:1.1rem;">Settings</h2>
+          <label style="${LABEL};display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px;">
+            <input type="checkbox" id="sdr-hub-battery-sound-toggle" ${this._batterySoundEnabled ? "checked" : ""}>
+            Play a sound when a device first reports low battery
+          </label>
+          <div>
+            <button id="sdr-hub-reset-prefs" type="button" title="Clears all locally-saved preferences (colormap, contrast, favorites, decoded log, etc.) and reloads" style="${BTN_DANGER}">Reset all preferences</button>
+          </div>
+        </div>
       </div>
     `;
 
@@ -866,6 +946,7 @@ class SdrHubPanel extends HTMLElement {
       // reporting low battery should keep showing in the alert banner even after the user clears
       // this view, since that's a real hardware condition independent of what's on screen.
       this._decodedLog = [];
+      saveDecodedLog(this._decodedLog);
       this._renderDecodedLog();
     });
     const helpEl = this.querySelector("#sdr-hub-help");
@@ -903,6 +984,27 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
     this._wireCopyButton(this.querySelector("#sdr-hub-copy-all-yaml"), () => this._allConfigYaml());
+    this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
+      this._batterySoundEnabled = ev.target.checked;
+      saveBatterySoundEnabled(this._batterySoundEnabled);
+    });
+    this._wireConfirmButton(this.querySelector("#sdr-hub-reset-prefs"), () => this._onResetPreferences(), "Confirm reset?");
+  }
+
+  // A full page reload after clearing every known key is far simpler and more robust than
+  // hand-resetting each piece of in-memory state this panel tracks (colormap, contrast range,
+  // favorites, decoded log/filter, time mode, sound toggle, help-dismissed, form prefs) back to
+  // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
+  // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
+  _onResetPreferences() {
+    for (const key of ALL_PREF_KEYS) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // Unavailable storage - nothing to clear.
+      }
+    }
+    location.reload();
   }
 
   // Repainting every sweep's history from scratch (_renderSweeps(true), which already replays
@@ -1461,6 +1563,31 @@ class SdrHubPanel extends HTMLElement {
     el.innerHTML = message;
   }
 
+  // A short synthesized beep (Web Audio API oscillator, no external asset) rather than an
+  // <audio> element with a bundled sound file - avoids shipping/loading a binary asset for one
+  // brief tone. The AudioContext is created lazily and reused across calls (not one per alert) -
+  // browsers cap how many can exist at once, and creating one is comparatively expensive.
+  _playBatteryAlertSound() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = this._audioCtx ?? (this._audioCtx = new AudioCtx());
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.4);
+    } catch {
+      // Autoplay policy (no prior user gesture on this page) or an unsupported/unavailable
+      // AudioContext - this is a convenience notification on top of the always-visible banner,
+      // not worth surfacing an error over.
+    }
+  }
+
   _renderDecodedLog() {
     // Independent of the filter text/results below - battery state should stay visible even
     // while a user has the log filtered down to something else entirely.
@@ -1933,7 +2060,7 @@ class SdrHubPanel extends HTMLElement {
   // a running sweep/receiver (which can represent minutes to hours of unsaved capture history)
   // against being stopped by a single stray or misdirected click, without the accessibility/
   // automation-blocking downsides of a native window.confirm() dialog.
-  _wireConfirmButton(button, onConfirm) {
+  _wireConfirmButton(button, onConfirm, confirmText = "Confirm stop?") {
     const CONFIRM_WINDOW_MS = 4000;
     const original = button.textContent;
     let armed = false;
@@ -1946,7 +2073,7 @@ class SdrHubPanel extends HTMLElement {
     button.addEventListener("click", () => {
       if (!armed) {
         armed = true;
-        button.textContent = "Confirm stop?";
+        button.textContent = confirmText;
         timer = setTimeout(disarm, CONFIRM_WINDOW_MS);
         return;
       }
