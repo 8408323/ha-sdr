@@ -1918,7 +1918,6 @@ class SdrHubPanel extends HTMLElement {
     // freshly cleared generation, recreating exactly the stale banner the gap existed to remove.
     const arrivalEpoch = this._batteryEpoch;
     await this._awaitBarrier("battery");
-    if (arrivalEpoch !== this._batteryEpoch) return this._deviceBatteryOk;
     const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
@@ -1928,7 +1927,13 @@ class SdrHubPanel extends HTMLElement {
         // transition ordered *above* the boundary post-dates it - typically one that arrived after
         // a peer's reset and before its notification travelled - and rejecting those outright left
         // a device whose only low report landed in that window permanently unalerted.
-        if (current.gen !== expectedGen) {
+        // Mirrors _persistDecodedEvent exactly, including reacting to an epoch change as well as
+        // a generation mismatch. This path used to abort outright on an epoch change, before the
+        // transaction could classify it - so a transition ordered *above* the boundary, which the
+        // decoded path would have kept, was discarded here purely because an invalidation happened
+        // while it waited. Found by enumerating the invariants and checking both paths against
+        // each, rather than by discovering the failure.
+        if (current.gen !== expectedGen || arrivalEpoch !== this._batteryEpoch) {
           const boundary = current.boundaryOrd;
           if (!Number.isFinite(base.ord) || !Number.isFinite(boundary) || base.ord <= boundary) return undefined;
         }
