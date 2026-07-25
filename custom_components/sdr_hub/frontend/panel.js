@@ -427,6 +427,11 @@ const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
+// User-assigned friendly names, keyed by deviceFavoriteKey (model|id). Deliberately an ordinary
+// preference rather than convergent state: unlike the decoded log or the battery map, this is a
+// direct user choice with no derivation from the event stream, so plain last-writer-wins across
+// tabs is the correct semantics - there is nothing to order or reconcile.
+const DEVICE_ALIASES_KEY = "sdr_hub_device_aliases";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 // Monotonic "generation" counter, bumped by every "Clear log" click (locally or in another
@@ -457,6 +462,7 @@ const ALL_PREF_KEYS = [
   COLORMAP_KEY,
   DB_RANGE_KEY,
   FAVORITE_DEVICES_KEY,
+  DEVICE_ALIASES_KEY,
   DECODED_TIME_MODE_KEY,
   DECODED_LOG_KEY,
   DECODED_LOG_GEN_KEY,
@@ -649,6 +655,81 @@ function loadFavoriteDevices() {
   }
 }
 
+function loadDeviceAliases() {
+  try {
+    const raw = localStorage.getItem(DEVICE_ALIASES_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+    // Values are filtered to non-empty strings: a blank alias would render as a nameless device,
+    // and the editor deletes rather than stores empty, so anything else is corrupt/hand-edited.
+    return new Map(Object.entries(parsed).filter(([, v]) => typeof v === "string" && v.trim() !== ""));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveDeviceAliases(map) {
+  try {
+    localStorage.setItem(DEVICE_ALIASES_KEY, JSON.stringify(Object.fromEntries(map)));
+  } catch {
+    // See saveColormap above.
+  }
+}
+
+// Numeric readings for one device, oldest first, grouped by field. Derived entirely from the
+// in-memory decoded log - no extra storage, and it therefore covers exactly the window the log
+// itself retains (MAX_DECODED_LOG events overall, so a chatty band yields a shorter per-device
+// history than a quiet one). Fields are only charted when at least two points exist, since a
+// single reading has no trend to show.
+function deviceNumericHistory(log, key) {
+  const series = new Map();
+  // The log is newest-first; reversed so each series reads left-to-right in time order.
+  for (const event of [...log].reverse()) {
+    const d = event.device || {};
+    if (deviceFavoriteKey(d) !== key) continue;
+    for (const [field, value] of Object.entries(d)) {
+      if (DECODED_HIDDEN_FIELDS.has(field)) continue;
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      if (!series.has(field)) series.set(field, []);
+      series.get(field).push(value);
+    }
+  }
+  return new Map([...series.entries()].filter(([, values]) => values.length >= 2));
+}
+
+// Inline SVG polyline. Deliberately not a canvas: these are small, numerous, and re-rendered
+// with the log, so markup that the browser can lay out and discard beats managing canvas
+// contexts per field. A flat series (max === min) renders as a centred straight line rather
+// than dividing by zero.
+function sparklineSvg(values, width = 120, height = 24) {
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min;
+  const stepX = values.length > 1 ? width / (values.length - 1) : 0;
+  const points = values
+    .map((v, i) => {
+      const x = i * stepX;
+      const y = span === 0 ? height / 2 : height - ((v - min) / span) * height;
+      // Inset by a pixel so the stroke isn't clipped at the extremes.
+      return `${x.toFixed(1)},${Math.min(height - 1, Math.max(1, y)).toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" preserveAspectRatio="none" ` +
+    `role="img" aria-hidden="true" style="overflow:visible;">` +
+    `<polyline points="${points}" fill="none" stroke="var(--primary-color,#03a9f4)" stroke-width="1.5" ` +
+    `stroke-linejoin="round" stroke-linecap="round"/></svg>`
+  );
+}
+
+// The name to show for a decoded device: the user's alias if set, otherwise the decoder's model
+// string. Callers that need to disambiguate still render id/channel separately.
+function deviceDisplayName(device, aliases) {
+  const alias = aliases.get(deviceFavoriteKey(device || {}));
+  return alias || device?.model || "Unknown device";
+}
+
 function saveFavoriteDevices(set) {
   try {
     localStorage.setItem(FAVORITE_DEVICES_KEY, JSON.stringify([...set]));
@@ -772,6 +853,18 @@ const RECEIVER_PRESETS = [
 // rtl_433's own JSON already carries model/id/channel/time prominently, and mic/protocol/
 // raw_message are internal decode-diagnostic fields, not something an end user reads - shown
 // separately (model/id/channel/relative-time) or hidden entirely, not repeated in the field list.
+// Licence-free bands the rtl_433-class devices this panel targets actually use. Shown behind the
+// coverage bar purely as a reference: "is my sweep pointed anywhere useful?" is otherwise
+// impossible to answer from a bare axis. Ranges are the common regional allocations, not an
+// exhaustive or legally authoritative list - hence the note rendered alongside them.
+const ISM_BANDS = [
+  { name: "315 MHz (US/JP)", start: 314e6, stop: 316e6 },
+  { name: "433 MHz (EU/worldwide)", start: 433.05e6, stop: 434.79e6 },
+  { name: "868 MHz (EU SRD)", start: 868.0e6, stop: 868.6e6 },
+  { name: "915 MHz (US ISM)", start: 902e6, stop: 928e6 },
+];
+
+
 const DECODED_HIDDEN_FIELDS = new Set(["time", "model", "id", "channel", "mic", "protocol", "raw_message"]);
 // Per-field formatters for the handful of fields common enough across rtl_433 device types to
 // be worth a nicer rendering than a bare "key: value" - not exhaustive, everything else falls
@@ -782,6 +875,15 @@ const DECODED_FIELD_FORMATTERS = {
   temperature_F: (v) => `${v}°F`,
   humidity: (v) => `${v}% humidity`,
 };
+
+// Compact numeric rendering for the history detail. Decoded sensor values are mostly small
+// decimals (temperature, humidity, voltage), so trailing zeros and full float noise are just
+// clutter - three significant decimals is well past the precision these sensors actually have,
+// and Number() strips the padding that toFixed leaves behind.
+function fmtDecodedNumber(value) {
+  if (!Number.isFinite(value)) return String(value);
+  return String(Number(value.toFixed(3)));
+}
 
 function fmtDecodedField(key, value) {
   const formatter = DECODED_FIELD_FORMATTERS[key];
@@ -949,6 +1051,9 @@ class SdrHubPanel extends HTMLElement {
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
     this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
+    this._deviceAliases = loadDeviceAliases(); // "model|id" -> user-assigned friendly name
+    this._expandedDevice = null; // deviceFavoriteKey whose history detail is open, if any
+    this._editingAlias = null; // deviceFavoriteKey whose rename editor is open, if any
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
     // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
     // favorite only flashes once per new decode rather than on every unrelated re-render.
@@ -1144,6 +1249,14 @@ class SdrHubPanel extends HTMLElement {
       // The sound preference is a single user choice, not per-tab - keep the checkbox and the
       // in-memory flag in step when it's toggled elsewhere, so a tab left open doesn't keep
       // contending for (or ignoring) the alert based on a setting the user has since changed.
+      // Aliases and favorites are plain preferences: adopt whatever the other tab wrote and
+      // re-render. No merge is needed (and none would be correct) - the last edit wins, which is
+      // what a user changing a name in one tab expects to see in another.
+      if (ev.key === DEVICE_ALIASES_KEY) {
+        this._deviceAliases = loadDeviceAliases();
+        this._renderDecodedLog();
+        return;
+      }
       if (ev.key === BATTERY_SOUND_ALERT_KEY) {
         this._batterySoundEnabled = loadBatterySoundEnabled();
         const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
@@ -1252,6 +1365,7 @@ class SdrHubPanel extends HTMLElement {
     this._batterySoundEnabled = loadBatterySoundEnabled();
     this._decodedTimeMode = loadDecodedTimeMode();
     this._favoriteDevices = loadFavoriteDevices();
+    this._deviceAliases = loadDeviceAliases();
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -2531,7 +2645,14 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps or receivers.</p>`;
       return;
     }
-    const allHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
+    // Bands that overlap what is being covered are included in the extent, so a sweep sitting at
+    // the edge of a band shows the whole band around it rather than a clipped sliver that gives
+    // no sense of how much is uncovered.
+    const ownHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
+    const ownMin = Math.min(...ownHz);
+    const ownMax = Math.max(...ownHz);
+    const overlappingBands = ISM_BANDS.filter((b) => b.stop >= ownMin && b.start <= ownMax);
+    const allHz = [...ownHz, ...overlappingBands.flatMap((b) => [b.start, b.stop])];
     const minHz = Math.min(...allHz);
     const maxHz = Math.max(...allHz);
     // A floor on the considered span, not just (max-min), so a single sweep/receiver (span 0
@@ -2544,6 +2665,18 @@ class SdrHubPanel extends HTMLElement {
     const pct = (hz) => ((hz - rangeStart) / rangeSpan) * 100;
     const SWEEP_COLOR = "var(--primary-color,#03a9f4)";
     const ERROR_COLOR = "var(--error-color,#db4437)";
+    // Drawn first, behind the sweeps, and only for bands that intersect the displayed range -
+    // a 315 MHz marker on a 868 MHz-only setup is noise. These are a reference for "am I
+    // pointed anywhere devices actually transmit", not a claim about local regulations.
+    const bandHtml = overlappingBands
+      .map((b) => {
+        const left = Math.max(0, pct(b.start));
+        const width = Math.min(100, pct(b.stop)) - left;
+        if (width <= 0) return "";
+        return `<div title="${esc(b.name)} (${fmtMHz(b.start)}–${fmtMHz(b.stop)} MHz)"
+          style="position:absolute;left:${left}%;width:${width}%;top:0;bottom:0;background:var(--primary-text-color,#212121);opacity:.07;border-left:1px dashed var(--secondary-text-color,#727272);border-right:1px dashed var(--secondary-text-color,#727272);"></div>`;
+      })
+      .join("");
     const segmentHtml = segments
       .map((s) => {
         const left = pct(s.start);
@@ -2561,6 +2694,7 @@ class SdrHubPanel extends HTMLElement {
       .join("");
     el.innerHTML = `
       <div style="position:relative;height:32px;background:var(--secondary-background-color,#fafafa);border-radius:6px;margin-bottom:4px;">
+        ${bandHtml}
         ${segmentHtml}
         ${pointHtml}
       </div>
@@ -2571,7 +2705,22 @@ class SdrHubPanel extends HTMLElement {
       <div style="display:flex;gap:12px;font-size:.75rem;color:var(--secondary-text-color,#727272);margin-top:4px;flex-wrap:wrap;">
         <span><span style="display:inline-block;width:10px;height:10px;background:${SWEEP_COLOR};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Sweep range</span>
         <span><span style="display:inline-block;width:2px;height:10px;background:var(--secondary-text-color,#727272);vertical-align:middle;margin-right:5px;"></span>Receiver frequency</span>
+        ${
+          overlappingBands.length
+            ? `<span><span style="display:inline-block;width:10px;height:10px;background:var(--primary-text-color,#212121);opacity:.15;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Licence-free band (${overlappingBands
+                .map((b) => esc(b.name))
+                .join(", ")})</span>`
+            : ""
+        }
       </div>
+      ${
+        overlappingBands.length
+          ? `<p style="font-size:.7rem;color:var(--secondary-text-color,#727272);margin:4px 0 0;">
+               Band edges are the common regional allocations, shown for orientation only - check
+               what applies where you are before transmitting on them.
+             </p>`
+          : ""
+      }
     `;
   }
 
@@ -2933,7 +3082,11 @@ class SdrHubPanel extends HTMLElement {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([, { model, id, channel }]) => {
         const parts = [id != null ? `id ${id}` : null, channel != null ? `ch ${channel}` : null].filter(Boolean);
-        return parts.length ? `${model || "Unknown device"} (${parts.join(", ")})` : model || "Unknown device";
+        // Named devices are shown by their alias here as well - a banner that says "Unknown
+        // device (id 12345)" while the log right below it says "Greenhouse sensor" is worse than
+        // no naming at all.
+        const name = deviceDisplayName({ model, id }, this._deviceAliases);
+        return parts.length ? `${name} (${parts.join(", ")})` : name;
       });
     const message = low.length === 0 ? "" : `⚠️ Low battery: ${low.map(esc).join(", ")}`;
     // Every unrelated decoded_device event (and the 30s poll, via _loadState -> _renderDecodedLog
@@ -3040,6 +3193,9 @@ class SdrHubPanel extends HTMLElement {
     const isFavorite = (event) => this._favoriteDevices.has(deviceFavoriteKey(event.device || {}));
     const sorted = [...filtered].sort((a, b) => Number(isFavorite(b)) - Number(isFavorite(a)));
     let flashConsumed = false;
+    // Tracks which device keys have already had a card rendered this pass, so only the newest
+    // entry per device offers the history control.
+    const renderedKeys = new Set();
     el.innerHTML = sorted
       .map((event) => {
         const d = event.device || {};
@@ -3063,18 +3219,48 @@ class SdrHubPanel extends HTMLElement {
             : `-${fmtElapsed(now - shownAt)}`
           : "";
         const cardStyle = fav ? `background:rgba(245,166,35,.1);${flash ? "animation:sdr-hub-flash 1.2s ease-out;" : ""}` : "";
+        const alias = this._deviceAliases.get(key);
+        const editing = this._editingAlias === key;
+        // Only the newest card for a device carries the expand control and detail, so a device
+        // with several entries in the log doesn't offer the same history N times over.
+        const isFirstForKey = !renderedKeys.has(key);
+        renderedKeys.add(key);
+        const expanded = isFirstForKey && this._expandedDevice === key;
+        const history = expanded ? deviceNumericHistory(this._decodedLog, key) : new Map();
+        const nameCell = editing
+          ? `<span style="display:flex;align-items:center;gap:4px;">
+               <input data-alias-input="${esc(key)}" value="${esc(alias || d.model || "")}" maxlength="60"
+                 aria-label="Device name"
+                 style="font:inherit;padding:2px 4px;border:1px solid var(--divider-color,#e0e0e0);border-radius:4px;background:var(--card-background-color,#fff);color:var(--primary-text-color,#212121);">
+               <button data-alias-save="${esc(key)}" style="${BTN_SECONDARY};padding:2px 8px;font-size:.75rem;">Save</button>
+               <button data-alias-cancel="${esc(key)}" style="${BTN_SECONDARY};padding:2px 8px;font-size:.75rem;">Cancel</button>
+             </span>`
+          : `<strong>${esc(deviceDisplayName(d, this._deviceAliases))}</strong>
+             ${alias ? `<span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">(${esc(d.model || "Unknown device")})</span>` : ""}
+             <button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
+               style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`;
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
-            <div style="display:flex;justify-content:space-between;align-items:baseline;">
-              <span style="display:flex;align-items:center;gap:6px;">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
+              <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(key)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
-                <strong>${esc(d.model || "Unknown device")}</strong>
+                ${nameCell}
               </span>
-              <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
+              <span style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
+                <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
+                ${
+                  isFirstForKey
+                    ? `<button data-history-device="${esc(key)}" aria-expanded="${expanded}"
+                         title="${expanded ? "Hide readings history" : "Show readings history"}"
+                         style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.8rem;color:var(--secondary-text-color,#727272);">${expanded ? "▾" : "▸"}</button>`
+                    : ""
+                }
+              </span>
             </div>
             ${idParts.length ? `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(idParts.join(", "))}</div>` : ""}
             ${fields.length ? `<div style="font-size:.85rem;">${fields.map(esc).join(" · ")}</div>` : ""}
+            ${expanded ? this._renderDeviceHistory(history) : ""}
           </div>`;
       })
       .join("");
@@ -3082,6 +3268,95 @@ class SdrHubPanel extends HTMLElement {
     // e.g. the flashed device was filtered out this time) - a flash means "this just happened",
     // not "show it next time this device happens to be visible again".
     this._flashDeviceKey = null;
+    this._wireDecodedLogControls(el);
+  }
+
+  // The expanded per-device detail: one sparkline per numeric field that has at least two
+  // readings in the retained log, with the current value and the observed range beside it.
+  _renderDeviceHistory(history) {
+    if (history.size === 0) {
+      return `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);padding:6px 0 2px;">
+                No numeric readings with enough history yet - a trend appears once this device has
+                reported the same value twice.
+              </div>`;
+    }
+    const rows = [...history.entries()]
+      .map(([field, values]) => {
+        const latest = values[values.length - 1];
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const range = min === max ? "steady" : `${fmtDecodedNumber(min)} – ${fmtDecodedNumber(max)}`;
+        return `
+          <div style="display:flex;align-items:center;gap:8px;padding:2px 0;">
+            <span style="flex:0 0 8.5em;font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(field)}</span>
+            <span style="flex:0 0 auto;">${sparklineSvg(values)}</span>
+            <span style="font-size:.8rem;"><strong>${esc(fmtDecodedNumber(latest))}</strong>
+              <span style="color:var(--secondary-text-color,#727272);">(${esc(range)}, ${values.length} readings)</span></span>
+          </div>`;
+      })
+      .join("");
+    return `<div style="padding:6px 0 2px;">${rows}</div>`;
+  }
+
+  _wireDecodedLogControls(el) {
+    el.querySelectorAll("[data-history-device]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.historyDevice;
+        // Toggle: clicking the open device closes it, so at most one detail is expanded and the
+        // list never grows unboundedly tall.
+        this._expandedDevice = this._expandedDevice === key ? null : key;
+        this._renderDecodedLog();
+      });
+    });
+    el.querySelectorAll("[data-alias-edit]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._editingAlias = btn.dataset.aliasEdit;
+        this._renderDecodedLog();
+        // Focus after the re-render, since the input this refers to is created by it.
+        const input = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      });
+    });
+    el.querySelectorAll("[data-alias-cancel]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._editingAlias = null;
+        this._renderDecodedLog();
+      });
+    });
+    const commitAlias = (key) => {
+      const input = el.querySelector(`[data-alias-input="${CSS.escape(key)}"]`);
+      if (!input) return;
+      const value = input.value.trim();
+      // An empty or model-identical alias is stored as *absent* rather than as a redundant
+      // entry, so clearing the field is how a user reverts to the decoder's own name and the
+      // map doesn't accumulate no-op entries.
+      const event = this._decodedLog.find((e) => deviceFavoriteKey(e.device || {}) === key);
+      const model = event?.device?.model || "";
+      if (value === "" || value === model) this._deviceAliases.delete(key);
+      else this._deviceAliases.set(key, value);
+      saveDeviceAliases(this._deviceAliases);
+      this._editingAlias = null;
+      this._renderDecodedLog();
+      this._renderBatteryAlerts();
+    };
+    el.querySelectorAll("[data-alias-save]").forEach((btn) => {
+      btn.addEventListener("click", () => commitAlias(btn.dataset.aliasSave));
+    });
+    el.querySelectorAll("[data-alias-input]").forEach((input) => {
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          commitAlias(input.dataset.aliasInput);
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          this._editingAlias = null;
+          this._renderDecodedLog();
+        }
+      });
+    });
     el.querySelectorAll("[data-pin-device]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const key = btn.dataset.pinDevice;
