@@ -74,6 +74,46 @@ function sequentialColor(t) {
   return SEQUENTIAL_RAMP[SEQUENTIAL_RAMP.length - 1][1];
 }
 
+// Perceptually-uniform multi-hue ramp (viridis stops) - unlike the default single-hue blue
+// ramp, changes in hue (not just lightness) help distinguish adjacent power levels, which some
+// users find easier to read for busy/noisy spectra.
+const VIRIDIS_RAMP = [
+  [0, [68, 1, 84]],
+  [0.13, [71, 44, 122]],
+  [0.25, [59, 81, 139]],
+  [0.38, [44, 113, 142]],
+  [0.5, [33, 144, 141]],
+  [0.63, [39, 173, 129]],
+  [0.75, [92, 200, 99]],
+  [0.88, [170, 220, 50]],
+  [1, [253, 231, 37]],
+];
+
+function viridisColor(t) {
+  t = Math.max(0, Math.min(1, Number.isFinite(t) ? t : 0));
+  for (let i = 0; i < VIRIDIS_RAMP.length - 1; i++) {
+    const [t0, c0] = VIRIDIS_RAMP[i];
+    const [t1, c1] = VIRIDIS_RAMP[i + 1];
+    if (t >= t0 && t <= t1) {
+      const f = t1 === t0 ? 0 : (t - t0) / (t1 - t0);
+      return c0.map((v, idx) => Math.round(v + (c1[idx] - v) * f));
+    }
+  }
+  return VIRIDIS_RAMP[VIRIDIS_RAMP.length - 1][1];
+}
+
+function grayscaleColor(t) {
+  t = Math.max(0, Math.min(1, Number.isFinite(t) ? t : 0));
+  const v = Math.round(t * 255);
+  return [v, v, v];
+}
+
+const COLORMAPS = {
+  sequential: { label: "Blue (default)", fn: sequentialColor },
+  viridis: { label: "Viridis", fn: viridisColor },
+  grayscale: { label: "Grayscale", fn: grayscaleColor },
+};
+
 // Remembers the last values a user actually submitted in the add-sweep/add-receiver forms
 // (start/stop/gain/frequencies/hop-interval/scroll-mode/dongle), so reopening the panel - or a
 // page reload, which resets all in-memory JS state - doesn't reset a user's typical settings
@@ -83,6 +123,9 @@ function sequentialColor(t) {
 const SWEEP_FORM_PREFS_KEY = "sdr_hub_sweep_form_prefs";
 const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
 const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
+const COLORMAP_KEY = "sdr_hub_colormap";
+const DB_RANGE_KEY = "sdr_hub_db_range";
+const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
 
 function loadFormPrefs(key) {
   try {
@@ -105,6 +148,77 @@ function saveFormPrefs(key, values) {
   } catch {
     // localStorage can throw (private browsing, quota exceeded) - losing this convenience isn't
     // worth failing the actual sweep/receiver submission over.
+  }
+}
+
+function loadColormap() {
+  try {
+    const v = localStorage.getItem(COLORMAP_KEY);
+    // Object.hasOwn (not just truthy COLORMAPS[v]) so a persisted value that happens to match an
+    // inherited Object property name (e.g. "constructor", "toString") from manually-edited or
+    // corrupted storage can't slip through and resolve to something without a usable `.fn`.
+    return v && Object.hasOwn(COLORMAPS, v) ? v : "sequential";
+  } catch {
+    return "sequential";
+  }
+}
+
+function saveColormap(v) {
+  try {
+    localStorage.setItem(COLORMAP_KEY, v);
+  } catch {
+    // Same unavailable-storage case as saveFormPrefs - losing this convenience isn't worth
+    // failing the actual selection over.
+  }
+}
+
+function loadDbRange() {
+  try {
+    const raw = localStorage.getItem(DB_RANGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Guards the same corrupt/nonsensical-value cases as loadFormPrefs, plus a range that
+    // wouldn't make sense to paint with (max <= min divides by <= 0 in _paintRow's t calc).
+    if (parsed && Number.isFinite(parsed.min) && Number.isFinite(parsed.max) && parsed.max > parsed.min) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveDbRange(min, max) {
+  try {
+    localStorage.setItem(DB_RANGE_KEY, JSON.stringify({ min, max }));
+  } catch {
+    // See saveColormap above.
+  }
+}
+
+// Identifies a decoded device by model+id (not the full JSON dump) so "favorite" survives
+// across separate decode events from the same physical sensor, which is the whole point of
+// pinning it - matches the same model/id fields _renderDecodedLog's filter already searches.
+function deviceFavoriteKey(d) {
+  return `${d.model || ""}|${d.id != null ? d.id : ""}`;
+}
+
+function loadFavoriteDevices() {
+  try {
+    const raw = localStorage.getItem(FAVORITE_DEVICES_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveFavoriteDevices(set) {
+  try {
+    localStorage.setItem(FAVORITE_DEVICES_KEY, JSON.stringify([...set]));
+  } catch {
+    // See saveColormap above.
   }
 }
 
@@ -159,6 +273,26 @@ function fmtDecodedField(key, value) {
   const formatter = DECODED_FIELD_FORMATTERS[key];
   if (formatter) return formatter(value);
   return `${key.replace(/_/g, " ")}: ${value}`;
+}
+
+// True only when `field` is actually present on `obj` (own key, so a plain-object backup from
+// JSON.parse) but holds something other than a finite number - e.g. a hand-edited sample_rate
+// stored as a string, or null. An *absent* field is fine (the add-on applies its own default);
+// a present-but-wrong-type one is a sign the entry doesn't mean what it looks like it means, so
+// callers should reject the whole entry rather than silently dropping just this field and
+// letting the default paper over the difference.
+function invalidOptionalNumber(obj, field) {
+  return Object.hasOwn(obj, field) && !Number.isFinite(obj[field]);
+}
+
+// Same reasoning as invalidOptionalNumber, for the one optional field that isn't a plain
+// number: rtl_433's protocols filter (see addon/sdr_hub/app/models.py's `protocols: list[int]`)
+// is a list of integer protocol ids, not just "an array" - a hand-edited `null` or a string
+// would otherwise be silently dropped by the truthy-array check in _receiverImportPayload,
+// falling through to add_receiver's default of decoding *all* protocols instead of the
+// requested subset, while import still reports success.
+function invalidOptionalProtocols(obj) {
+  return Object.hasOwn(obj, "protocols") && !(Array.isArray(obj.protocols) && obj.protocols.every(Number.isInteger));
 }
 
 // Builds a copy-pasteable HA automation/script action snippet for a running sweep/receiver -
@@ -233,6 +367,11 @@ class SdrHubPanel extends HTMLElement {
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
+    this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
+    this._colormap = loadColormap();
+    const dbRange = loadDbRange();
+    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
+    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
     this._unsub = null;
     this._subscribing = false;
     this._loadStateRequestId = 0; // guards against overlapping _loadState() calls resolving out of order
@@ -441,6 +580,15 @@ class SdrHubPanel extends HTMLElement {
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Wideband sweeps</h2>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+            <label style="${LABEL}">Colormap<select id="sdr-hub-colormap" style="${INPUT}">
+              ${Object.entries(COLORMAPS)
+                .map(([key, cm]) => `<option value="${key}" ${key === this._colormap ? "selected" : ""}>${esc(cm.label)}</option>`)
+                .join("")}
+            </select></label>
+            <label style="${LABEL}">Contrast min dB<input id="sdr-hub-db-min" type="number" step="1" value="${esc(this._dbMin)}" style="${INPUT};width:90px"></label>
+            <label style="${LABEL}">Contrast max dB<input id="sdr-hub-db-max" type="number" step="1" value="${esc(this._dbMax)}" style="${INPUT};width:90px"></label>
+          </div>
           <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
@@ -480,6 +628,27 @@ class SdrHubPanel extends HTMLElement {
           <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
         </div>
+
+        <div style="${CARD}">
+          <h2 style="margin:0 0 8px;font-size:1.1rem;">Backup &amp; restore</h2>
+          <p style="margin:0 0 8px;font-size:.85rem;color:var(--secondary-text-color,#727272);">
+            Export every active sweep and receiver as a JSON file, or import one to recreate them.
+          </p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="sdr-hub-export-config" type="button" style="${BTN_SECONDARY}">Export config</button>
+            <label style="${BTN_SECONDARY};display:inline-flex;align-items:center;cursor:pointer;">
+              Import config
+              <!-- Visually hidden via clipping, not display:none - display:none removes the
+                   input from both the focus and accessibility trees, and the wrapping <label>
+                   itself is never in the tab order, so a keyboard-only user would have no way
+                   to reach the file picker at all. This clip-based hiding keeps the input
+                   focusable/operable (Tab + Enter/Space opens the picker) while staying
+                   invisible, matching the visible "Import config" label text. -->
+              <input id="sdr-hub-import-config" type="file" accept="application/json"
+                style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">
+            </label>
+          </div>
+        </div>
       </div>
     `;
 
@@ -504,6 +673,51 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
+    this._wireColormapControls();
+    this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
+    this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
+  }
+
+  // Repainting every sweep's history from scratch (_renderSweeps(true), which already replays
+  // _sweepRowHistory into a fresh canvas for the scroll-mode-toggle case) is reused here rather
+  // than a bespoke repaint path - it's a rare, user-initiated settings change, not a per-row hot
+  // path, so the cost of rebuilding is a non-issue and this keeps a single "redraw everything"
+  // code path instead of two.
+  _wireColormapControls() {
+    const colormapSelect = this.querySelector("#sdr-hub-colormap");
+    const dbMinInput = this.querySelector("#sdr-hub-db-min");
+    const dbMaxInput = this.querySelector("#sdr-hub-db-max");
+    colormapSelect.addEventListener("change", () => {
+      this._colormap = colormapSelect.value;
+      saveColormap(this._colormap);
+      this._renderSweeps(true);
+    });
+    const applyDbRange = () => {
+      // Number("") is 0, not NaN - checking the raw string for emptiness first (rather than
+      // relying on Number.isFinite alone) stops a cleared-then-blurred field from silently
+      // being accepted as a real 0 dB boundary while the input itself still looks blank.
+      if (dbMinInput.value.trim() === "" || dbMaxInput.value.trim() === "") {
+        dbMinInput.value = this._dbMin;
+        dbMaxInput.value = this._dbMax;
+        return;
+      }
+      const min = Number(dbMinInput.value);
+      const max = Number(dbMaxInput.value);
+      // A non-positive span would divide by <= 0 in _paintRow's t calculation, turning the
+      // whole waterfall into a single flat color (or NaN) instead of a clear input error -
+      // reject it here and restore the last-good values instead.
+      if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+        dbMinInput.value = this._dbMin;
+        dbMaxInput.value = this._dbMax;
+        return;
+      }
+      this._dbMin = min;
+      this._dbMax = max;
+      saveDbRange(min, max);
+      this._renderSweeps(true);
+    };
+    dbMinInput.addEventListener("change", applyDbRange);
+    dbMaxInput.addEventListener("change", applyDbRange);
   }
 
   // Fills the form's fields from the chosen preset - a starting point the user can still edit
@@ -728,6 +942,24 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
     }
+    // A forced rebuild (colormap/contrast change, or the scroll-mode toggle) replaces every
+    // scroll container element outright, which would otherwise silently reset scrollTop to 0 -
+    // jumping a user who was mid-history (or intentionally following the bottom) back to the
+    // oldest row and, for the bottom-follow case, leaving them stuck there since
+    // _drawScrollRow's wasAtBottom check reads the *new* container, which starts at scrollTop 0
+    // and hasn't earned "at bottom" yet. Snapshot each sweep's current position (and whether it
+    // was pinned to the bottom) before tearing the containers down, then restore it below once
+    // the replacement containers exist and have their history replayed back in.
+    const preservedScroll = {};
+    for (const s of this._state.sweeps) {
+      const container = el.querySelector(`[data-sweep-scroll-container="${CSS.escape(s.id)}"]`);
+      if (container) {
+        preservedScroll[s.id] = {
+          atBottom: container.scrollTop + container.clientHeight >= container.scrollHeight - 4,
+          scrollTop: container.scrollTop,
+        };
+      }
+    }
     el.innerHTML = this._state.sweeps
       .map((s) => {
         const scroll = !!this._scrollMode[s.id];
@@ -742,6 +974,15 @@ class SdrHubPanel extends HTMLElement {
         const canvasHeight = scroll
           ? Math.max(1, Math.min(historyLen, scrollRowCapForWidth(rowWidth)))
           : WATERFALL_HEIGHT;
+        // The canvas element gets an explicit `width` attribute (matching the actual row
+        // width), not just `height` - without it the bitmap defaults to width=300, and
+        // _drawScrollRow's very first replayed row (below) would then see canvas.width !==
+        // width and take its "range changed" branch, wiping out this pre-set canvasHeight
+        // back down to a 1px canvas. Every subsequent replayed row would then hit the
+        // still-growing incremental-resize path (grow-by-one-row + full-bitmap copy through a
+        // temp canvas) instead of just being drawn straight into the already-correctly-sized
+        // bitmap - turning a full-history repaint (colormap/contrast change) into up to
+        // O(historyLen^2) pixel copies.
         const viewportHeight = this._viewportHeight[s.id] ?? WATERFALL_HEIGHT;
         const rangeText = `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz`;
         const titleHtml = s.label
@@ -765,7 +1006,7 @@ class SdrHubPanel extends HTMLElement {
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
-            <canvas data-sweep-canvas="${esc(s.id)}" height="${canvasHeight}"
+            <canvas data-sweep-canvas="${esc(s.id)}" width="${rowWidth}" height="${canvasHeight}"
               style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
             <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
           </div>
@@ -799,14 +1040,37 @@ class SdrHubPanel extends HTMLElement {
       this._wireCanvasHover(s.id);
       this._wireResizeHandle(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
-      // retained history oldest-to-newest so the full waterfall reappears instead of just
-      // the latest row, matching what hover (which reads the same history) implies is there.
+      // retained history so the full waterfall reappears instead of just the latest row,
+      // matching what hover (which reads the same history) implies is there. Scroll mode
+      // still replays row-by-row via _appendRow (its growth path is already O(n) total, see
+      // the `width` attribute comment above); live mode uses the dedicated bulk repaint below
+      // instead, since _appendRow/_drawLiveRow's per-arrival canvas shift would otherwise be
+      // O(n) full-canvas copies for a single rebuild (see _repaintLiveHistory).
       this._scrollDrawIndex[s.id] = 0;
       const rows = this._sweepRowHistory[s.id];
       if (rows) {
-        for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
+        if (this._scrollMode[s.id]) {
+          for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
+        } else {
+          const canvas = el.querySelector(`[data-sweep-canvas="${CSS.escape(s.id)}"]`);
+          if (canvas) this._repaintLiveHistory(canvas, s.id);
+        }
       }
       this._renderTimeAxis(s.id);
+      // Restore the position captured above, now that the replacement container has its
+      // history replayed back in (so scrollHeight reflects the final content size). A
+      // bottom-pinned view is restored by re-pinning to the new bottom rather than replaying
+      // the raw scrollTop - the canvas's pre-computed height (see the `width` attribute comment
+      // above) already matches the old one for a same-size repaint, but re-deriving "bottom"
+      // from the live scrollHeight is what actually keeps a user who was following live data
+      // still following it, rather than depending on that size staying identical.
+      const preserved = preservedScroll[s.id];
+      if (preserved) {
+        const container = el.querySelector(`[data-sweep-scroll-container="${CSS.escape(s.id)}"]`);
+        if (container) {
+          container.scrollTop = preserved.atBottom ? container.scrollHeight : preserved.scrollTop;
+        }
+      }
     }
   }
 
@@ -872,9 +1136,16 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     const now = Date.now();
-    el.innerHTML = filtered
+    // Favorited devices float to the top (Array.sort is stable, so each group keeps its own
+    // newest-first order) - lets a user watching for one specific sensor find it immediately
+    // instead of scanning past everything else that's decoded more recently.
+    const isFavorite = (event) => this._favoriteDevices.has(deviceFavoriteKey(event.device || {}));
+    const sorted = [...filtered].sort((a, b) => Number(isFavorite(b)) - Number(isFavorite(a)));
+    el.innerHTML = sorted
       .map((event) => {
         const d = event.device || {};
+        const key = deviceFavoriteKey(d);
+        const fav = this._favoriteDevices.has(key);
         const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
           Boolean,
         );
@@ -883,9 +1154,13 @@ class SdrHubPanel extends HTMLElement {
           .map((k) => fmtDecodedField(k, d[k]));
         const age = event._receivedAt ? `-${fmtElapsed(now - event._receivedAt)}` : "";
         return `
-          <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);">
+          <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${fav ? "background:rgba(245,166,35,.1);" : ""}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;">
-              <strong>${esc(d.model || "Unknown device")}</strong>
+              <span style="display:flex;align-items:center;gap:6px;">
+                <button data-pin-device="${esc(key)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
+                  style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
+                <strong>${esc(d.model || "Unknown device")}</strong>
+              </span>
               <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
             </div>
             ${idParts.length ? `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(idParts.join(", "))}</div>` : ""}
@@ -893,6 +1168,15 @@ class SdrHubPanel extends HTMLElement {
           </div>`;
       })
       .join("");
+    el.querySelectorAll("[data-pin-device]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.pinDevice;
+        if (this._favoriteDevices.has(key)) this._favoriteDevices.delete(key);
+        else this._favoriteDevices.add(key);
+        saveFavoriteDevices(this._favoriteDevices);
+        this._renderDecodedLog();
+      });
+    });
   }
 
   // ── waterfall canvas ─────────────────────────────────────────────────────
@@ -1110,6 +1394,30 @@ class SdrHubPanel extends HTMLElement {
     this._paintRow(ctx, row, width, 0, peak);
   }
 
+  // Bulk-repaints a live-mode sweep's whole retained history (used by _renderSweeps' forced
+  // rebuild - colormap/contrast change, or the scroll-mode toggle) by painting each row
+  // directly at its final Y position, instead of replaying via _appendRow/_drawLiveRow one row
+  // at a time. _drawLiveRow's per-arrival "scroll down by one" is right for a single new row
+  // arriving live, but reusing it here would perform a full-width getImageData/putImageData
+  // shift of the whole (up to WATERFALL_HEIGHT-1-row-tall) canvas for *every* retained row -
+  // for a wide sweep with a full 400-row history, that's ~400 full-canvas copies for a single
+  // colormap selection, easily gigabytes of synchronous pixel copying that can freeze the tab.
+  // Since every row's final position is already known up front (newest at y=0, each older row
+  // one below), there's nothing to shift - just paint each one once.
+  _repaintLiveHistory(canvas, sweepId) {
+    const rows = this._sweepRowHistory[sweepId];
+    if (!rows || rows.length === 0 || !rows[0].power_db || rows[0].power_db.length === 0) return;
+    const width = rows[0].power_db.length;
+    if (canvas.width !== width) canvas.width = width;
+    const ctx = canvas.getContext("2d");
+    const count = Math.min(rows.length, canvas.height);
+    for (let i = 0; i < count; i++) {
+      const row = rows[i]; // rows[0] is newest - painted at y=0, same convention as _drawLiveRow
+      this._paintRow(ctx, row, width, i, this._findPeak(row));
+    }
+    this._renderPeakReadout(sweepId, this._findPeak(rows[0]));
+  }
+
   _drawScrollRow(canvas, sweepId, row, peak) {
     const width = row.power_db.length;
     // Captured before any resize below - resizing grows scrollHeight first, which would
@@ -1169,10 +1477,11 @@ class SdrHubPanel extends HTMLElement {
 
   _paintRow(ctx, row, width, y, peak) {
     const rowImage = ctx.createImageData(width, 1);
+    const colorFn = (COLORMAPS[this._colormap] || COLORMAPS.sequential).fn;
     for (let i = 0; i < width; i++) {
       const db = row.power_db[i];
-      const t = Number.isFinite(db) ? (db - WATERFALL_MIN_DB) / (WATERFALL_MAX_DB - WATERFALL_MIN_DB) : 0;
-      const [r, g, b] = sequentialColor(t);
+      const t = Number.isFinite(db) ? (db - this._dbMin) / (this._dbMax - this._dbMin) : 0;
+      const [r, g, b] = colorFn(t);
       rowImage.data[i * 4] = r;
       rowImage.data[i * 4 + 1] = g;
       rowImage.data[i * 4 + 2] = b;
@@ -1182,9 +1491,14 @@ class SdrHubPanel extends HTMLElement {
       // Overwrite the peak bin's pixel with a stark, unmistakable color - baked directly into
       // the bitmap (not a separate overlay), so it stays exactly where it happened even once
       // this row scrolls into history, without needing to track marker positions separately.
+      // Pure red rather than white: white is a real, reachable value in every colormap (it's
+      // exactly what Grayscale clamps to at/above the contrast max), so a strong or
+      // contrast-saturated signal would otherwise paint right over the marker and hide it.
+      // None of COLORMAPS' ramps (blue, viridis, grayscale) ever produce pure red, so it stays
+      // visually distinct regardless of which colormap is active.
       rowImage.data[peak.bin * 4] = 255;
-      rowImage.data[peak.bin * 4 + 1] = 255;
-      rowImage.data[peak.bin * 4 + 2] = 255;
+      rowImage.data[peak.bin * 4 + 1] = 0;
+      rowImage.data[peak.bin * 4 + 2] = 0;
       rowImage.data[peak.bin * 4 + 3] = 255;
     }
     ctx.putImageData(rowImage, 0, y);
@@ -1305,6 +1619,148 @@ class SdrHubPanel extends HTMLElement {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }, "image/png");
+  }
+
+  // Exports only the fields sdr_hub/add_sweep and sdr_hub/add_receiver actually accept (not
+  // the raw state objects, which also carry server-assigned id/status) - so a re-import sends
+  // exactly a valid add_* payload back, and round-tripping export→import produces the same
+  // shape whether or not the file was hand-edited in between.
+  _exportConfig() {
+    const config = {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      sweeps: (this._state.sweeps || []).map((s) => ({
+        dongle_serial: s.dongle_serial,
+        dongle_driver: s.dongle_driver,
+        start_hz: s.start_hz,
+        stop_hz: s.stop_hz,
+        gain: s.gain,
+        sample_rate: s.sample_rate,
+        label: s.label,
+      })),
+      receivers: (this._state.receivers || []).map((r) => ({
+        dongle_serial: r.dongle_serial,
+        dongle_driver: r.dongle_driver,
+        frequencies_hz: r.frequencies_hz,
+        hop_interval_s: r.hop_interval_s,
+        protocols: r.protocols,
+        label: r.label,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sdr-hub-config-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // Builds the WS payload from only the known add_sweep/add_receiver fields, dropping anything
+  // else in the imported JSON (e.g. a stray id/status if the file was edited from exported
+  // state elsewhere) - the websocket_api schema rejects unknown keys outright, so forwarding
+  // the parsed object as-is would fail the whole import on an otherwise-harmless extra field.
+  _sweepImportPayload(s) {
+    const payload = { type: "sdr_hub/add_sweep", dongle_serial: s.dongle_serial, start_hz: s.start_hz, stop_hz: s.stop_hz };
+    if (s.dongle_driver) payload.dongle_driver = s.dongle_driver;
+    if (s.label) payload.label = s.label;
+    if (Number.isFinite(s.gain)) payload.gain = s.gain;
+    if (Number.isFinite(s.sample_rate)) payload.sample_rate = s.sample_rate;
+    return payload;
+  }
+
+  _receiverImportPayload(r) {
+    const payload = { type: "sdr_hub/add_receiver", dongle_serial: r.dongle_serial, frequencies_hz: r.frequencies_hz };
+    if (r.dongle_driver) payload.dongle_driver = r.dongle_driver;
+    if (r.label) payload.label = r.label;
+    if (Number.isFinite(r.hop_interval_s)) payload.hop_interval_s = r.hop_interval_s;
+    if (Array.isArray(r.protocols) && r.protocols.length) payload.protocols = r.protocols;
+    return payload;
+  }
+
+  async _onImportConfigFile(ev) {
+    const file = ev.target.files[0];
+    ev.target.value = ""; // clears the input so re-selecting the same file later still fires "change"
+    if (!file) return;
+    let config;
+    try {
+      config = JSON.parse(await file.text());
+    } catch (err) {
+      this._showError(`Could not read config file: ${err.message || err}`);
+      return;
+    }
+    // Requires the actual shape _exportConfig() writes (a numeric version marker plus real
+    // sweeps/receivers arrays), not just "any object" - a random unrelated JSON file (e.g. a
+    // package.json picked by mistake) would otherwise sail through this check, have its missing
+    // sweeps/receivers default to empty arrays below, and report a successful no-op import,
+    // misleading the user into thinking their actual backup was restored. Empty arrays are
+    // still accepted here (a backup with nothing active is legitimate) - only their absence, or
+    // an unrecognized version, is rejected.
+    if (
+      !config ||
+      typeof config !== "object" ||
+      config.version !== 1 ||
+      !Array.isArray(config.sweeps) ||
+      !Array.isArray(config.receivers)
+    ) {
+      this._showError("Config file is not a valid SDR Hub backup");
+      return;
+    }
+    const sweeps = config.sweeps;
+    const receivers = config.receivers;
+    const errors = [];
+    // Sequential (not Promise.all) so a busy/duplicate dongle rejection on one entry doesn't
+    // race the add-on's per-dongle ownership check against another entry targeting the same
+    // hardware in the same import.
+    for (const s of sweeps) {
+      // typeof check, not truthiness - some SDR devices legitimately omit a serial, so
+      // dongle_serial: "" is a real device's export (the panel itself supports selecting
+      // these; see _renderDongleOptions' hasPreference handling of the same case), not a
+      // malformed entry. A truthy check would reject re-importing the panel's own backup for
+      // exactly those devices.
+      if (!s || typeof s.dongle_serial !== "string" || !Number.isFinite(s.start_hz) || !Number.isFinite(s.stop_hz)) {
+        errors.push(`Skipped an invalid sweep entry (missing dongle_serial/start_hz/stop_hz)`);
+        continue;
+      }
+      // A present-but-malformed optional value (e.g. a hand-edited sample_rate stored as a
+      // string or null) must reject the entry, not silently fall through to add_sweep's
+      // default - _sweepImportPayload only forwards optionals that are already valid numbers,
+      // so without this check a materially different sweep gets created while import still
+      // reports success.
+      if (invalidOptionalNumber(s, "gain") || invalidOptionalNumber(s, "sample_rate")) {
+        errors.push(`Skipped sweep entry ${s.label || s.dongle_serial}: gain/sample_rate must be a number if present`);
+        continue;
+      }
+      try {
+        await this._callWS(this._sweepImportPayload(s));
+      } catch (err) {
+        errors.push(`Sweep ${s.label || s.dongle_serial}: ${err.message || err}`);
+      }
+    }
+    for (const r of receivers) {
+      // See the matching typeof check in the sweep loop above - same "" is a valid serial-less
+      // device reasoning applies here.
+      if (!r || typeof r.dongle_serial !== "string" || !Array.isArray(r.frequencies_hz) || r.frequencies_hz.length === 0) {
+        errors.push(`Skipped an invalid receiver entry (missing dongle_serial/frequencies_hz)`);
+        continue;
+      }
+      // See the matching gain/sample_rate check in the sweep loop above.
+      if (invalidOptionalNumber(r, "hop_interval_s") || invalidOptionalProtocols(r)) {
+        errors.push(
+          `Skipped receiver entry ${r.label || r.dongle_serial}: hop_interval_s must be a number and protocols must be a list of integers, if present`,
+        );
+        continue;
+      }
+      try {
+        await this._callWS(this._receiverImportPayload(r));
+      } catch (err) {
+        errors.push(`Receiver ${r.label || r.dongle_serial}: ${err.message || err}`);
+      }
+    }
+    this._showError(errors.length ? `Imported with ${errors.length} issue(s): ${errors.join("; ")}` : "");
+    await this._loadState();
   }
 
   async _onAddSweep(ev) {
