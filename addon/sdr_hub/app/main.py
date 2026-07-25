@@ -50,7 +50,6 @@ def record_seq_high_water(seq: int) -> None:
     global _seq_high_water_written
     if seq - _seq_high_water_written < SEQ_CHECKPOINT_INTERVAL:
         return
-    _seq_high_water_written = seq
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
@@ -62,6 +61,12 @@ def record_seq_high_water(seq: int) -> None:
         tmp = SEQ_HIGH_WATER_PATH.with_suffix(".tmp")
         tmp.write_text(str(seq))
         os.replace(tmp, SEQ_HIGH_WATER_PATH)
+        # Advanced only after the rename actually lands. Setting it up front meant a transient
+        # failure silently suppressed the next SEQ_CHECKPOINT_INTERVAL retries even once /data
+        # became writable again - so the last durable checkpoint could fall further behind than
+        # one interval, and the `stored + INTERVAL` seed would then overlap sequence values
+        # clients had already persisted.
+        _seq_high_water_written = seq
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
         # rather than taking the decoder thread down over a checkpoint write.

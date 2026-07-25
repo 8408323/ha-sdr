@@ -795,6 +795,7 @@ class SdrHubPanel extends HTMLElement {
     this._deviceBatteryOk = seededBattery.map;
     this._batteryGen = seededBattery.gen;
     this._batteryInvalidationPending = false;
+    this._pendingInvalidatePublish = false;
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -1029,6 +1030,8 @@ class SdrHubPanel extends HTMLElement {
         // transition in any tab re-elects one and republishes, so nothing is stuck.
         if (msg.kind === "battery_transition" && msg.key && msg.entry) {
           if (!this._isStateLeader()) return;
+          // Discard anything observed under a generation an invalidation has since superseded.
+          if (Number.isInteger(msg.gen) && msg.gen < loadBatteryState().gen) return;
           this._leaderWriteBattery(new Map([[msg.key, msg.entry]]));
           return;
         }
@@ -1331,6 +1334,12 @@ class SdrHubPanel extends HTMLElement {
     // asks the leader to publish the generation bump.
     if (!this._isStateLeader()) {
       this._deviceBatteryOk = new Map();
+      // Held until some tab actually publishes the generation bump. If the leader crashed with a
+      // still-fresh lease, this message has no live recipient and nothing else would ever retry -
+      // storage would keep the old generation and a later transition would equal-generation-merge
+      // the stale assertions straight back in. _retryPendingInvalidation drains this once the
+      // lease expires and this tab can take over.
+      this._pendingInvalidatePublish = true;
       this._renderBatteryAlerts();
       this._postSync({ kind: "battery_invalidate" });
       return;
@@ -1338,7 +1347,17 @@ class SdrHubPanel extends HTMLElement {
     this._leaderInvalidateBattery();
   }
 
+  // Called before every leader-path write: if an invalidation was requested while this tab
+  // couldn't publish it, publish it now that leadership is obtainable.
+  _retryPendingInvalidation() {
+    if (!this._pendingInvalidatePublish) return;
+    if (!this._isStateLeader()) return;
+    this._pendingInvalidatePublish = false;
+    this._leaderInvalidateBattery();
+  }
+
   _leaderInvalidateBattery() {
+    this._pendingInvalidatePublish = false;
     const nextGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
     const cleared = saveBatteryState(nextGen, new Map());
     // Only claim the bumped generation once it has actually reached storage - see
@@ -1399,9 +1418,15 @@ class SdrHubPanel extends HTMLElement {
   // and updates its own view optimistically, which the leader's authoritative write then
   // corrects via the storage event. Returns the map this tab should reason about right now.
   _applyBatteryTransition(key, entry) {
+    this._retryPendingInvalidation();
     const incoming = new Map([[key, entry]]);
     if (!this._isStateLeader()) {
-      this._postSync({ kind: "battery_transition", key, entry });
+      // The observed generation travels with the message. BroadcastChannel delivery can lag
+      // behind the leader's own ordered HA subscription, so the leader may process a stream_gap
+      // and bump the generation before this older message arrives - without the tag it would
+      // republish a pre-gap assertion as post-gap state, which could then survive indefinitely
+      // if that device stays silent.
+      this._postSync({ kind: "battery_transition", key, entry, gen: this._batteryGen });
       // Optimistic local update so this tab's own banner and alert decision don't lag a
       // round-trip behind. Never persisted - the leader owns storage.
       this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, incoming);
@@ -1483,12 +1508,12 @@ class SdrHubPanel extends HTMLElement {
     if (!this._claimSoundLeadership()) return;
     const entry = this._deviceBatteryOk.get(key);
     if (entry) {
-      const marked = new Map(this._deviceBatteryOk);
-      marked.set(key, { ...entry, alertedAt: ord });
-      this._deviceBatteryOk = marked;
-      const markWrite = saveBatteryState(this._batteryGen, marked);
-      this._batteryGen = markWrite.gen;
-      this._deviceBatteryOk = markWrite.map;
+      // Routed through the state leader like any other mutation rather than written directly.
+      // The sound leader and the state leader are different roles and can be different tabs, so
+      // writing this tab's whole (possibly lagging) map here would bypass the single-writer
+      // guarantee entirely - e.g. overwriting a recovery the state leader had already persisted
+      // with the stale low entry this tab is still holding.
+      this._applyBatteryTransition(key, { ...entry, alertedAt: ord });
     }
     this._playBatteryAlertSound();
   }
