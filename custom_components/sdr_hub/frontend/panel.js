@@ -415,6 +415,21 @@ const COLORMAPS = {
   grayscale: { label: "Grayscale", fn: grayscaleColor },
 };
 
+// CSS gradient sampled from the same colormap function the waterfall painter uses, so the legend
+// cannot drift from what is actually drawn - a hand-written gradient would silently disagree the
+// moment a ramp changed. Sampled rather than exact: ten stops is visually indistinguishable from
+// a continuous ramp at legend size.
+function colormapGradientCss(name) {
+  const fn = (COLORMAPS[name] || COLORMAPS.sequential).fn;
+  const stops = [];
+  const steps = 10;
+  for (let i = 0; i <= steps; i++) {
+    const [r, g, b] = fn(i / steps);
+    stops.push(`rgb(${r},${g},${b}) ${((i / steps) * 100).toFixed(0)}%`);
+  }
+  return `linear-gradient(to right, ${stops.join(", ")})`;
+}
+
 // Remembers the last values a user actually submitted in the add-sweep/add-receiver forms
 // (start/stop/gain/frequencies/hop-interval/scroll-mode/dongle), so reopening the panel - or a
 // page reload, which resets all in-memory JS state - doesn't reset a user's typical settings
@@ -427,6 +442,23 @@ const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
+// User-assigned friendly names, keyed by deviceInstanceKey (model|id|channel). An ordinary
+// preference rather than convergent state: unlike the decoded log or the battery map, this is a
+// direct user choice with no derivation from the event stream, so last-writer-wins is the right
+// semantics *for concurrent edits to the same device*.
+//
+// It is NOT right for the collection as a whole: two tabs renaming two different devices are not
+// in conflict, and any shared-slot write would drop one of them. Each alias therefore lives under
+// its own storage key - see DEVICE_ALIAS_KEY_PREFIX - so independent renames are independent
+// writes rather than a race that has merely been narrowed.
+const DEVICE_ALIASES_KEY = "sdr_hub_device_aliases";
+// Each alias is stored under its own key, "sdr_hub_device_alias:<deviceInstanceKey>". Two tabs
+// renaming two different devices then write to two different storage slots and cannot conflict at
+// all - which a single shared map cannot achieve, because read-modify-write is not atomic across
+// browsing contexts: both tabs can complete their read before either writes, and the later write
+// still drops the other's rename. Re-reading first narrows that window; it does not close it.
+// DEVICE_ALIASES_KEY above is retained only to migrate and clear the earlier single-map layout.
+const DEVICE_ALIAS_KEY_PREFIX = "sdr_hub_device_alias:";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 // Monotonic "generation" counter, bumped by every "Clear log" click (locally or in another
@@ -457,6 +489,7 @@ const ALL_PREF_KEYS = [
   COLORMAP_KEY,
   DB_RANGE_KEY,
   FAVORITE_DEVICES_KEY,
+  DEVICE_ALIASES_KEY,
   DECODED_TIME_MODE_KEY,
   DECODED_LOG_KEY,
   DECODED_LOG_GEN_KEY,
@@ -560,6 +593,18 @@ function deviceFavoriteKey(d) {
 // deviceFavoriteKey itself is left as-is since it's pre-existing, shared with the favorites
 // feature, and out of scope here.
 function batteryStateKey(d) {
+  return deviceInstanceKey(d);
+}
+
+// Identifies one physical device as precisely as the decoder allows: model, id AND channel. Some
+// families (ones distinguished only by a channel dial/jumper) share a model and omit `id`
+// entirely, so model|id alone collides across genuinely different sensors.
+//
+// Everything keyed on a *device instance* uses this - battery state, per-device history, and
+// aliases. deviceFavoriteKey deliberately still omits channel: it predates this and is what
+// existing users' stored favorites are keyed by, so narrowing it would silently drop them. That
+// asymmetry is intentional and confined to favorites.
+function deviceInstanceKey(d) {
   return `${d.model || ""}|${d.id != null ? d.id : ""}|${d.channel != null ? d.channel : ""}`;
 }
 
@@ -647,6 +692,136 @@ function loadFavoriteDevices() {
   } catch {
     return new Set();
   }
+}
+
+function loadDeviceAliases() {
+  const out = new Map();
+  // The legacy single-map layout is *converted*, not merely read as a fallback. Keeping it as a
+  // fallback made deletions impossible to express: removing the per-device key left the legacy
+  // entry behind, and the next load resurrected it - so a migrated alias could never be cleared,
+  // and one edited under the new layout reverted to its old value when later cleared. Converting
+  // once and removing the old key means there is exactly one place a given alias can live.
+  migrateLegacyDeviceAliases();
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const storageKey = localStorage.key(i);
+      if (!storageKey || !storageKey.startsWith(DEVICE_ALIAS_KEY_PREFIX)) continue;
+      const value = localStorage.getItem(storageKey);
+      // Blank values are treated as absent: a nameless device is worse than the model name, and
+      // the editor removes rather than stores empty, so anything blank is corrupt/hand-edited.
+      if (typeof value === "string" && value.trim() !== "") {
+        out.set(storageKey.slice(DEVICE_ALIAS_KEY_PREFIX.length), value);
+      }
+    }
+  } catch {
+    // Unavailable storage - whatever was read so far stands.
+  }
+  return out;
+}
+
+// One-time conversion of the pre-per-key alias map. Each entry is written to its own key unless
+// one already exists (a newer per-device edit wins), then the old map is removed so nothing can
+// read from it again. A failure here is not fatal: the entries simply stay in the old key and the
+// next load retries.
+function migrateLegacyDeviceAliases() {
+  let legacy = null;
+  try {
+    legacy = JSON.parse(localStorage.getItem(DEVICE_ALIASES_KEY) || "null");
+  } catch {
+    // Corrupt or hand-edited - drop it below rather than letting it block the per-key entries.
+  }
+  try {
+    if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+      for (const [k, v] of Object.entries(legacy)) {
+        if (typeof v !== "string" || v.trim() === "") continue;
+        if (localStorage.getItem(DEVICE_ALIAS_KEY_PREFIX + k) === null) {
+          localStorage.setItem(DEVICE_ALIAS_KEY_PREFIX + k, v);
+        }
+      }
+    }
+    if (localStorage.getItem(DEVICE_ALIASES_KEY) !== null) localStorage.removeItem(DEVICE_ALIASES_KEY);
+  } catch {
+    // Unavailable storage - retried on the next load.
+  }
+}
+
+// Writes exactly one device's alias. Passing null removes it, which is how reverting to the
+// decoder's own model name is expressed.
+function saveDeviceAlias(deviceKey, alias) {
+  try {
+    if (alias) localStorage.setItem(DEVICE_ALIAS_KEY_PREFIX + deviceKey, alias);
+    else localStorage.removeItem(DEVICE_ALIAS_KEY_PREFIX + deviceKey);
+  } catch {
+    // See saveColormap above.
+  }
+}
+
+// Every per-device alias key currently in storage. Used by the reset action, which cannot simply
+// list them in ALL_PREF_KEYS because the set is open-ended.
+function deviceAliasStorageKeys() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const storageKey = localStorage.key(i);
+      if (storageKey && storageKey.startsWith(DEVICE_ALIAS_KEY_PREFIX)) keys.push(storageKey);
+    }
+  } catch {
+    // Unavailable storage - nothing to enumerate.
+  }
+  return keys;
+}
+
+// Numeric readings for one device, oldest first, grouped by field. Derived entirely from the
+// in-memory decoded log - no extra storage, and it therefore covers exactly the window the log
+// itself retains (MAX_DECODED_LOG events overall, so a chatty band yields a shorter per-device
+// history than a quiet one). Fields are only charted when at least two points exist, since a
+// single reading has no trend to show.
+function deviceNumericHistory(log, key) {
+  const series = new Map();
+  // The log is newest-first; reversed so each series reads left-to-right in time order.
+  for (const event of [...log].reverse()) {
+    const d = event.device || {};
+    if (deviceInstanceKey(d) !== key) continue;
+    for (const [field, value] of Object.entries(d)) {
+      if (DECODED_HIDDEN_FIELDS.has(field)) continue;
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      if (!series.has(field)) series.set(field, []);
+      series.get(field).push(value);
+    }
+  }
+  return new Map([...series.entries()].filter(([, values]) => values.length >= 2));
+}
+
+// Inline SVG polyline. Deliberately not a canvas: these are small, numerous, and re-rendered
+// with the log, so markup that the browser can lay out and discard beats managing canvas
+// contexts per field. A flat series (max === min) renders as a centred straight line rather
+// than dividing by zero.
+function sparklineSvg(values, width = 120, height = 24) {
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min;
+  const stepX = values.length > 1 ? width / (values.length - 1) : 0;
+  const points = values
+    .map((v, i) => {
+      const x = i * stepX;
+      const y = span === 0 ? height / 2 : height - ((v - min) / span) * height;
+      // Inset by a pixel so the stroke isn't clipped at the extremes.
+      return `${x.toFixed(1)},${Math.min(height - 1, Math.max(1, y)).toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" preserveAspectRatio="none" ` +
+    `role="img" aria-hidden="true" style="overflow:visible;">` +
+    `<polyline points="${points}" fill="none" stroke="var(--primary-color,#03a9f4)" stroke-width="1.5" ` +
+    `stroke-linejoin="round" stroke-linecap="round"/></svg>`
+  );
+}
+
+// The name to show for a decoded device: the user's alias if set, otherwise the decoder's model
+// string. Callers that need to disambiguate still render id/channel separately.
+function deviceDisplayName(device, aliases) {
+  const alias = aliases.get(deviceInstanceKey(device || {}));
+  return alias || device?.model || "Unknown device";
 }
 
 function saveFavoriteDevices(set) {
@@ -772,6 +947,22 @@ const RECEIVER_PRESETS = [
 // rtl_433's own JSON already carries model/id/channel/time prominently, and mic/protocol/
 // raw_message are internal decode-diagnostic fields, not something an end user reads - shown
 // separately (model/id/channel/relative-time) or hidden entirely, not repeated in the field list.
+// Licence-free bands the rtl_433-class devices this panel targets actually use. Shown behind the
+// coverage bar purely as a reference: "is my sweep pointed anywhere useful?" is otherwise
+// impossible to answer from a bare axis. Ranges are the common regional allocations, not an
+// exhaustive or legally authoritative list - hence the note rendered alongside them.
+const ISM_BANDS = [
+  { name: "315 MHz (US/JP)", start: 314e6, stop: 316e6 },
+  { name: "433 MHz (EU/worldwide)", start: 433.05e6, stop: 434.79e6 },
+  // 863-870 to match SWEEP_PRESETS' "ISM/SRD 868 MHz, EU (863-870 MHz)" and RECEIVER_PRESETS'
+  // 868.95 MHz entry. A narrower 868.0-868.6 marker contradicted the panel's own presets: a
+  // receiver on 868.95 got no marker at all, and the built-in preset drew a band excluding one
+  // of the two frequencies it configures.
+  { name: "868 MHz (EU SRD)", start: 863e6, stop: 870e6 },
+  { name: "915 MHz (US ISM)", start: 902e6, stop: 928e6 },
+];
+
+
 const DECODED_HIDDEN_FIELDS = new Set(["time", "model", "id", "channel", "mic", "protocol", "raw_message"]);
 // Per-field formatters for the handful of fields common enough across rtl_433 device types to
 // be worth a nicer rendering than a bare "key: value" - not exhaustive, everything else falls
@@ -782,6 +973,15 @@ const DECODED_FIELD_FORMATTERS = {
   temperature_F: (v) => `${v}°F`,
   humidity: (v) => `${v}% humidity`,
 };
+
+// Compact numeric rendering for the history detail. Decoded sensor values are mostly small
+// decimals (temperature, humidity, voltage), so trailing zeros and full float noise are just
+// clutter - three significant decimals is well past the precision these sensors actually have,
+// and Number() strips the padding that toFixed leaves behind.
+function fmtDecodedNumber(value) {
+  if (!Number.isFinite(value)) return String(value);
+  return String(Number(value.toFixed(3)));
+}
 
 function fmtDecodedField(key, value) {
   const formatter = DECODED_FIELD_FORMATTERS[key];
@@ -949,6 +1149,24 @@ class SdrHubPanel extends HTMLElement {
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
     this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
+    this._deviceAliases = loadDeviceAliases(); // deviceInstanceKey -> user-assigned friendly name
+    this._expandedDevice = null; // deviceInstanceKey whose history detail is open, if any
+    this._editingAlias = null; // deviceInstanceKey whose rename editor is open, if any
+    // The in-progress rename text, caret, and whether the editor actually held focus. All three
+    // are snapshotted from the live input immediately before the log markup is rebuilt, rather
+    // than accumulated from `input` events: an input event fires only when the *text* changes, so
+    // caret moves via arrow keys, Home/End, a mouse click or a selection gesture were invisible
+    // to it and the restored selection came from the previous edit - putting the next character
+    // in the wrong place, or replacing the whole name when nothing had been recorded yet.
+    this._aliasDraft = null;
+    this._aliasDraftSelection = null;
+    this._aliasHadFocus = false;
+    // True between compositionstart and compositionend on the alias editor. A composition session
+    // belongs to the *DOM node*, so replacing the input destroys it however carefully the value
+    // and selection are snapshotted - the candidate is cancelled or committed early. Ignoring
+    // composing key events was not enough; the rebuild itself has to wait.
+    this._aliasComposing = false;
+    this._decodedRenderDeferred = false;
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
     // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
     // favorite only flashes once per new decode rather than on every unrelated re-render.
@@ -1144,6 +1362,14 @@ class SdrHubPanel extends HTMLElement {
       // The sound preference is a single user choice, not per-tab - keep the checkbox and the
       // in-memory flag in step when it's toggled elsewhere, so a tab left open doesn't keep
       // contending for (or ignoring) the alert based on a setting the user has since changed.
+      // Aliases and favorites are plain preferences: adopt whatever the other tab wrote and
+      // re-render. No merge is needed (and none would be correct) - the last edit wins, which is
+      // what a user changing a name in one tab expects to see in another.
+      if (ev.key === DEVICE_ALIASES_KEY || (ev.key && ev.key.startsWith(DEVICE_ALIAS_KEY_PREFIX))) {
+        this._deviceAliases = loadDeviceAliases();
+        this._renderDecodedLog();
+        return;
+      }
       if (ev.key === BATTERY_SOUND_ALERT_KEY) {
         this._batterySoundEnabled = loadBatterySoundEnabled();
         const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
@@ -1233,6 +1459,28 @@ class SdrHubPanel extends HTMLElement {
   // the storage listener was torn down and change notifications were therefore missed.
   _reconcilePreferences() {
     const hadShell = !!this.querySelector("#sdr-hub-root");
+    // Snapshotted before either path below can replace DOM - the shell-rebuild branch calls
+    // _renderShell(), which discards the whole root including a live rename editor. Only
+    // _renderDecodedLog() used to snapshot, so reattaching with an unsaved rename *and* a
+    // shell-preference change lost the text and selection outright.
+    this._snapshotAliasEditor();
+    // Every persisted preference is re-read here, before the branch, and both paths below only
+    // differ in how they *apply* them. The rebuild branch used to return before this block, so it
+    // reconciled the shell-rendered values while leaving the sound toggle, time mode, favorites,
+    // colormap and dB range at whatever this tab last had in memory - and it then rebuilt the
+    // shell *from* those stale values. Two rounds of review each found one symptom of that split
+    // (aliases, then the editor snapshot); the split itself was the defect.
+    const previousColormap = this._colormap;
+    const previousMin = this._dbMin;
+    const previousMax = this._dbMax;
+    this._deviceAliases = loadDeviceAliases();
+    this._batterySoundEnabled = loadBatterySoundEnabled();
+    this._decodedTimeMode = loadDecodedTimeMode();
+    this._favoriteDevices = loadFavoriteDevices();
+    this._colormap = loadColormap();
+    const dbRange = loadDbRange();
+    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
+    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
     // The sweep/receiver form defaults and the help card's visibility are rendered *into* the
     // shell rather than driven from live state, so no amount of updating existing controls can
     // reconcile them - a stale form would also re-persist the reset-away values on its next
@@ -1246,16 +1494,6 @@ class SdrHubPanel extends HTMLElement {
       this._loadState(true);
       return;
     }
-    const previousColormap = this._colormap;
-    const previousMin = this._dbMin;
-    const previousMax = this._dbMax;
-    this._batterySoundEnabled = loadBatterySoundEnabled();
-    this._decodedTimeMode = loadDecodedTimeMode();
-    this._favoriteDevices = loadFavoriteDevices();
-    this._colormap = loadColormap();
-    const dbRange = loadDbRange();
-    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
-    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
     if (!hadShell) return;
     // Keep the visible controls in step with what was just re-read, and repaint the waterfall
     // only when something it actually depends on changed.
@@ -1360,6 +1598,15 @@ class SdrHubPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    // An IME composition belongs to a DOM node and cannot resume across a detach, so if teardown
+    // preempts compositionend the flag would survive reattach and every later render would take
+    // the deferral early-return forever - freezing the decoded log until the user happened to
+    // close the editor. Focus ownership cannot survive either. The draft and selection are
+    // deliberately kept: those are the user's text, and reattachment can legitimately restore
+    // them.
+    this._aliasComposing = false;
+    this._decodedRenderDeferred = false;
+    this._aliasHadFocus = false;
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
@@ -2375,7 +2622,9 @@ class SdrHubPanel extends HTMLElement {
     // list's own comment. Releasing leadership removes it on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
     // listing it there would make every open tab reload each time any one tab navigated away.
-    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
+    // deviceAliasStorageKeys() is enumerated rather than listed: aliases live under one key per
+    // device, so the set is open-ended and cannot appear in ALL_PREF_KEYS.
+    for (const key of [...ALL_PREF_KEYS, ...deviceAliasStorageKeys(), SOUND_LEADER_KEY]) {
       try {
         localStorage.removeItem(key);
       } catch {
@@ -2531,7 +2780,22 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps or receivers.</p>`;
       return;
     }
-    const allHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
+    // Bands that overlap what is being covered are included in the extent, so a sweep sitting at
+    // the edge of a band shows the whole band around it rather than a clipped sliver that gives
+    // no sense of how much is uncovered.
+    //
+    // Matched against each capture individually, NOT against the global min/max: two disjoint
+    // captures (say a receiver at 100 MHz and another at 1 GHz) span every band in between
+    // without covering any of them, and testing the outer extent would mark all of those as
+    // overlapping - implying monitoring that does not exist, which is the opposite of what this
+    // view is for.
+    const ownHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
+    const overlappingBands = ISM_BANDS.filter(
+      (b) =>
+        segments.some((seg) => seg.stop >= b.start && seg.start <= b.stop) ||
+        points.some((pt) => pt.freq >= b.start && pt.freq <= b.stop),
+    );
+    const allHz = [...ownHz, ...overlappingBands.flatMap((b) => [b.start, b.stop])];
     const minHz = Math.min(...allHz);
     const maxHz = Math.max(...allHz);
     // A floor on the considered span, not just (max-min), so a single sweep/receiver (span 0
@@ -2544,6 +2808,18 @@ class SdrHubPanel extends HTMLElement {
     const pct = (hz) => ((hz - rangeStart) / rangeSpan) * 100;
     const SWEEP_COLOR = "var(--primary-color,#03a9f4)";
     const ERROR_COLOR = "var(--error-color,#db4437)";
+    // Drawn first, behind the sweeps, and only for bands that intersect the displayed range -
+    // a 315 MHz marker on a 868 MHz-only setup is noise. These are a reference for "am I
+    // pointed anywhere devices actually transmit", not a claim about local regulations.
+    const bandHtml = overlappingBands
+      .map((b) => {
+        const left = Math.max(0, pct(b.start));
+        const width = Math.min(100, pct(b.stop)) - left;
+        if (width <= 0) return "";
+        return `<div title="${esc(b.name)} (${fmtMHz(b.start)}–${fmtMHz(b.stop)} MHz)"
+          style="position:absolute;left:${left}%;width:${width}%;top:0;bottom:0;background:var(--primary-text-color,#212121);opacity:.07;border-left:1px dashed var(--secondary-text-color,#727272);border-right:1px dashed var(--secondary-text-color,#727272);"></div>`;
+      })
+      .join("");
     const segmentHtml = segments
       .map((s) => {
         const left = pct(s.start);
@@ -2561,6 +2837,7 @@ class SdrHubPanel extends HTMLElement {
       .join("");
     el.innerHTML = `
       <div style="position:relative;height:32px;background:var(--secondary-background-color,#fafafa);border-radius:6px;margin-bottom:4px;">
+        ${bandHtml}
         ${segmentHtml}
         ${pointHtml}
       </div>
@@ -2571,7 +2848,22 @@ class SdrHubPanel extends HTMLElement {
       <div style="display:flex;gap:12px;font-size:.75rem;color:var(--secondary-text-color,#727272);margin-top:4px;flex-wrap:wrap;">
         <span><span style="display:inline-block;width:10px;height:10px;background:${SWEEP_COLOR};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Sweep range</span>
         <span><span style="display:inline-block;width:2px;height:10px;background:var(--secondary-text-color,#727272);vertical-align:middle;margin-right:5px;"></span>Receiver frequency</span>
+        ${
+          overlappingBands.length
+            ? `<span><span style="display:inline-block;width:10px;height:10px;background:var(--primary-text-color,#212121);opacity:.15;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Licence-free band (${overlappingBands
+                .map((b) => esc(b.name))
+                .join(", ")})</span>`
+            : ""
+        }
       </div>
+      ${
+        overlappingBands.length
+          ? `<p style="font-size:.7rem;color:var(--secondary-text-color,#727272);margin:4px 0 0;">
+               Band edges are the common regional allocations, shown for orientation only - check
+               what applies where you are before transmitting on them.
+             </p>`
+          : ""
+      }
     `;
   }
 
@@ -2730,6 +3022,24 @@ class SdrHubPanel extends HTMLElement {
         <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--secondary-text-color,#727272);">
           <div data-sweep-hover="${esc(s.id)}" style="height:1.2em;"></div>
           <div data-sweep-peak="${esc(s.id)}" style="height:1.2em;"></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:.7rem;color:var(--secondary-text-color,#727272);margin-top:2px;">
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span>${esc(String(this._dbMin))} dB</span>
+            <span data-sweep-scale="${esc(s.id)}" aria-hidden="true"
+              style="display:inline-block;width:110px;height:9px;border-radius:2px;border:1px solid var(--divider-color,#e0e0e0);
+              background:${colormapGradientCss(this._colormap)};"></span>
+            <span>${esc(String(this._dbMax))} dB</span>
+          </span>
+          <span>weaker → stronger</span>
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgb(255,0,0);"></span>
+            peak ≥${PEAK_MIN_DELTA_DB} dB above the row median
+          </span>
+          <span style="display:flex;align-items:center;gap:4px;">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;border:1px solid var(--divider-color,#e0e0e0);background:transparent;"></span>
+            no data
+          </span>
         </div>
       </div>`;
       })
@@ -2933,7 +3243,14 @@ class SdrHubPanel extends HTMLElement {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([, { model, id, channel }]) => {
         const parts = [id != null ? `id ${id}` : null, channel != null ? `ch ${channel}` : null].filter(Boolean);
-        return parts.length ? `${model || "Unknown device"} (${parts.join(", ")})` : model || "Unknown device";
+        // Named devices are shown by their alias here as well - a banner that says "Unknown
+        // device (id 12345)" while the log right below it says "Greenhouse sensor" is worse than
+        // no naming at all.
+        // channel is forwarded: aliases are keyed on deviceInstanceKey, which includes it, so
+        // omitting it here looked up a key that never exists for channel-distinguished devices
+        // and the banner kept showing the decoder model while the log card showed the alias.
+        const name = deviceDisplayName({ model, id, channel }, this._deviceAliases);
+        return parts.length ? `${name} (${parts.join(", ")})` : name;
       });
     const message = low.length === 0 ? "" : `⚠️ Low battery: ${low.map(esc).join(", ")}`;
     // Every unrelated decoded_device event (and the 30s poll, via _loadState -> _renderDecodedLog
@@ -3007,21 +3324,40 @@ class SdrHubPanel extends HTMLElement {
 
   _renderDecodedLog() {
     // Independent of the filter text/results below - battery state should stay visible even
-    // while a user has the log filtered down to something else entirely.
+    // while a user has the log filtered down to something else entirely, and it is not affected
+    // by the composition deferral below.
     this._renderBatteryAlerts();
+    // Deferred while an IME composition is active. Rebuilding replaces the input node the
+    // composition is attached to, which no amount of value/selection snapshotting can survive.
+    // Decodes arriving meanwhile are already in _decodedLog; only the repaint waits, and it runs
+    // on compositionend. Composition is a short, user-driven window, so this cannot stall the log
+    // indefinitely - and the editor closing clears the flag either way.
+    if (this._aliasComposing) {
+      this._decodedRenderDeferred = true;
+      return;
+    }
+    // Snapshot the open editor before anything below can replace it. Every path out of this
+    // method rewrites the log's markup, and the rebuild is usually triggered by something the
+    // user did not do - an incoming decode, or the 30s age tick.
+    this._snapshotAliasEditor();
     const el = this.querySelector("#sdr-hub-decoded");
     if (!el) return;
     if (this._decodedLog.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No devices decoded yet.</p>`;
+      this._reconcileAliasEditorPresence();
       return;
     }
-    // Matches against model and id specifically (not every field) - a substring match across
+    // Matches against model, id and the user's alias (not every field) - a substring match across
     // the *entire* dump (including timestamps, checksums, etc.) would surface confusing false
-    // positives, whereas model/id is what a user actually means by "find this device".
+    // positives, whereas those are what a user actually means by "find this device". The alias is
+    // included because once set it becomes the card's primary visible name, and a search box that
+    // cannot find the name it is displaying is worse than no search at all. Both are searchable,
+    // so a device renamed months ago is still findable by its model.
     const filtered = this._decodedFilter
       ? this._decodedLog.filter((event) => {
           const d = event.device || {};
-          const haystack = `${d.model || ""} ${d.id != null ? d.id : ""}`.toLowerCase();
+          const alias = this._deviceAliases.get(deviceInstanceKey(d)) || "";
+          const haystack = `${d.model || ""} ${d.id != null ? d.id : ""} ${alias}`.toLowerCase();
           return haystack.includes(this._decodedFilter);
         })
       : this._decodedLog;
@@ -3031,6 +3367,7 @@ class SdrHubPanel extends HTMLElement {
       // pending for a device hidden by the current filter would stay queued and fire later
       // (once the filter no longer excludes it) as if it had just decoded.
       this._flashDeviceKey = null;
+      this._reconcileAliasEditorPresence();
       return;
     }
     const now = Date.now();
@@ -3040,15 +3377,22 @@ class SdrHubPanel extends HTMLElement {
     const isFavorite = (event) => this._favoriteDevices.has(deviceFavoriteKey(event.device || {}));
     const sorted = [...filtered].sort((a, b) => Number(isFavorite(b)) - Number(isFavorite(a)));
     let flashConsumed = false;
+    // Tracks which device keys have already had a card rendered this pass, so only the newest
+    // entry per device offers the history control.
+    const renderedKeys = new Set();
     el.innerHTML = sorted
       .map((event) => {
         const d = event.device || {};
-        const key = deviceFavoriteKey(d);
-        const fav = this._favoriteDevices.has(key);
+        // Two distinct identities, deliberately: `favKey` is what favorites have always been
+        // keyed by (model|id), `key` identifies the physical device including channel and is what
+        // history and aliases use. See deviceInstanceKey.
+        const favKey = deviceFavoriteKey(d);
+        const key = deviceInstanceKey(d);
+        const fav = this._favoriteDevices.has(favKey);
         // Only the first (newest, thanks to the favorite sort-to-top above) matching card
         // consumes the pending flash - without this a device with multiple log entries could
         // flash more than once per new decode.
-        const flash = fav && !flashConsumed && key === this._flashDeviceKey;
+        const flash = fav && !flashConsumed && favKey === this._flashDeviceKey;
         if (flash) flashConsumed = true;
         const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
           Boolean,
@@ -3063,18 +3407,56 @@ class SdrHubPanel extends HTMLElement {
             : `-${fmtElapsed(now - shownAt)}`
           : "";
         const cardStyle = fav ? `background:rgba(245,166,35,.1);${flash ? "animation:sdr-hub-flash 1.2s ease-out;" : ""}` : "";
+        const alias = this._deviceAliases.get(key);
+        // Only the newest card for a device carries the expand control and detail, so a device
+        // with several entries in the log doesn't offer the same history N times over.
+        const isFirstForKey = !renderedKeys.has(key);
+        renderedKeys.add(key);
+        const expanded = isFirstForKey && this._expandedDevice === key;
+        // Gated on isFirstForKey for the same reason as the history control, and this one is
+        // load-bearing rather than cosmetic: a device with several retained entries rendered one
+        // input per card all carrying the same data-alias-input selector, so saving from any card
+        // read the *first* matching input in the log and silently discarded what the user typed.
+        const editing = isFirstForKey && this._editingAlias === key;
+        const history = expanded ? deviceNumericHistory(this._decodedLog, key) : new Map();
+        const nameCell = editing
+          ? `<span style="display:flex;align-items:center;gap:4px;">
+               <input data-alias-input="${esc(key)}" value="${esc(this._aliasDraft ?? alias ?? d.model ?? "")}" maxlength="60"
+                 aria-label="Device name"
+                 style="font:inherit;padding:2px 4px;border:1px solid var(--divider-color,#e0e0e0);border-radius:4px;background:var(--card-background-color,#fff);color:var(--primary-text-color,#212121);">
+               <button data-alias-save="${esc(key)}" style="${BTN_SECONDARY};padding:2px 8px;font-size:.75rem;">Save</button>
+               <button data-alias-cancel="${esc(key)}" style="${BTN_SECONDARY};padding:2px 8px;font-size:.75rem;">Cancel</button>
+             </span>`
+          : `<strong>${esc(deviceDisplayName(d, this._deviceAliases))}</strong>
+             ${alias ? `<span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">(${esc(d.model || "Unknown device")})</span>` : ""}
+             ${
+               isFirstForKey
+                 ? `<button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
+                      style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`
+                 : ""
+             }`;
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
-            <div style="display:flex;justify-content:space-between;align-items:baseline;">
-              <span style="display:flex;align-items:center;gap:6px;">
-                <button data-pin-device="${esc(key)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
+              <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
-                <strong>${esc(d.model || "Unknown device")}</strong>
+                ${nameCell}
               </span>
-              <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
+              <span style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
+                <span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">${esc(age)}</span>
+                ${
+                  isFirstForKey
+                    ? `<button data-history-device="${esc(key)}" aria-expanded="${expanded}"
+                         title="${expanded ? "Hide readings history" : "Show readings history"}"
+                         style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.8rem;color:var(--secondary-text-color,#727272);">${expanded ? "▾" : "▸"}</button>`
+                    : ""
+                }
+              </span>
             </div>
             ${idParts.length ? `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(idParts.join(", "))}</div>` : ""}
             ${fields.length ? `<div style="font-size:.85rem;">${fields.map(esc).join(" · ")}</div>` : ""}
+            ${expanded ? this._renderDeviceHistory(history) : ""}
           </div>`;
       })
       .join("");
@@ -3082,6 +3464,183 @@ class SdrHubPanel extends HTMLElement {
     // e.g. the flashed device was filtered out this time) - a flash means "this just happened",
     // not "show it next time this device happens to be visible again".
     this._flashDeviceKey = null;
+    this._wireDecodedLogControls(el);
+  }
+
+  // The expanded per-device detail: one sparkline per numeric field that has at least two
+  // readings in the retained log, with the current value and the observed range beside it.
+  _renderDeviceHistory(history) {
+    if (history.size === 0) {
+      return `<div style="font-size:.8rem;color:var(--secondary-text-color,#727272);padding:6px 0 2px;">
+                No numeric readings with enough history yet - a trend appears once this device has
+                reported the same value twice.
+              </div>`;
+    }
+    const rows = [...history.entries()]
+      .map(([field, values]) => {
+        const latest = values[values.length - 1];
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const range = min === max ? "steady" : `${fmtDecodedNumber(min)} – ${fmtDecodedNumber(max)}`;
+        return `
+          <div style="display:flex;align-items:center;gap:8px;padding:2px 0;">
+            <span style="flex:0 0 8.5em;font-size:.8rem;color:var(--secondary-text-color,#727272);">${esc(field)}</span>
+            <span style="flex:0 0 auto;">${sparklineSvg(values)}</span>
+            <span style="font-size:.8rem;"><strong>${esc(fmtDecodedNumber(latest))}</strong>
+              <span style="color:var(--secondary-text-color,#727272);">(${esc(range)}, ${values.length} readings)</span></span>
+          </div>`;
+      })
+      .join("");
+    return `<div style="padding:6px 0 2px;">${rows}</div>`;
+  }
+
+  _closeAliasEditor() {
+    this._editingAlias = null;
+    this._aliasDraft = null;
+    this._aliasDraftSelection = null;
+    this._aliasHadFocus = false;
+    // Cleared with the editor: the input that owned any composition is going away, so leaving
+    // this set would defer every subsequent log render forever.
+    this._aliasComposing = false;
+  }
+
+  // Reads the live editor's text, selection and focus state. This is the *only* writer of
+  // _aliasHadFocus besides opening the editor, deliberately: an earlier version also tracked it
+  // from focus/blur listeners, and that broke the restore outright - replacing the log's markup
+  // removes the focused input, which fires `blur`, so the listener cleared the flag after the
+  // snapshot had taken it and before the restore could use it. A live check at snapshot time
+  // needs no listeners and cannot be raced by the teardown it is trying to survive.
+  //
+  // Focus is compared against the input's own root, not `document.activeElement`: this panel
+  // renders inside a shadow tree, so document-level activeElement reports the host and would
+  // claim focus for an editor that does not have it.
+  _snapshotAliasEditor() {
+    if (!this._editingAlias) return;
+    // Scoped to the panel rather than the log container because this runs *before* the log's
+    // markup is rebuilt, when the container reference the wiring code uses is not in hand. The
+    // log lives inside this element either way, so both lookups resolve the same node.
+    const input = this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+    // Capture only. Deciding here whether the editor is *gone* cannot work, whatever the
+    // predicate: this runs before the rebuild, and eviction updates _decodedLog before the render
+    // it triggers - so at this moment the device can already be out of the log while its old
+    // input is still in the DOM. A test on _decodedLog is therefore evaluated at exactly the point
+    // where "gone" and "mid-rebuild" are indistinguishable. Invalidation happens after the
+    // rebuild instead, where the absence of an input is unambiguous - see
+    // _reconcileAliasEditorPresence.
+    if (!input) return;
+    this._aliasDraft = input.value;
+    this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
+    this._aliasHadFocus = input.getRootNode().activeElement === input;
+  }
+
+  // Run after the log's markup has been rebuilt, where "no input exists for _editingAlias" can
+  // only mean the editor is genuinely gone - the device was evicted by the log cap, cleared, or
+  // filtered out. Mid-rebuild is not a reachable state here, so no heuristic is needed.
+  //
+  // Focus ownership is dropped but the draft is kept: eviction from a 50-entry cap is transient
+  // on a busy band, and discarding someone's half-typed name because their sensor briefly fell
+  // off the list would be worse than the stale-focus bug this prevents.
+  _reconcileAliasEditorPresence() {
+    if (!this._editingAlias) return;
+    if (!this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`)) {
+      this._aliasHadFocus = false;
+    }
+  }
+
+  _wireDecodedLogControls(el) {
+    this._reconcileAliasEditorPresence();
+    el.querySelectorAll("[data-history-device]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.historyDevice;
+        // Toggle: clicking the open device closes it, so at most one detail is expanded and the
+        // list never grows unboundedly tall.
+        this._expandedDevice = this._expandedDevice === key ? null : key;
+        this._renderDecodedLog();
+      });
+    });
+    el.querySelectorAll("[data-alias-edit]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._editingAlias = btn.dataset.aliasEdit;
+        // Starts from the stored value; subsequent renders reuse the draft instead.
+        this._aliasDraft = null;
+        this._aliasDraftSelection = null;
+        this._aliasHadFocus = true;
+        this._renderDecodedLog();
+        const input = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      });
+    });
+    // Restores the editor after a re-render it did not initiate - a decoded event or the age
+    // tick. Gated on the editor having actually held focus beforehand: the user may deliberately
+    // be typing somewhere else (the decoded-device filter re-renders this log on every
+    // keystroke), and stealing focus back would send the rest of their typing into the rename
+    // field. An open-but-unfocused editor keeps its draft, just not the caret.
+    if (this._editingAlias && this._aliasHadFocus) {
+      const active = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+      if (active && active.getRootNode().activeElement !== active) {
+        active.focus();
+        const sel = this._aliasDraftSelection;
+        if (sel) active.setSelectionRange(sel[0], sel[1]);
+        else active.select();
+      }
+    }
+    el.querySelectorAll("[data-alias-cancel]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._closeAliasEditor();
+        this._renderDecodedLog();
+      });
+    });
+    const commitAlias = (key) => {
+      const input = el.querySelector(`[data-alias-input="${CSS.escape(key)}"]`);
+      if (!input) return;
+      const value = input.value.trim();
+      // An empty or model-identical alias is stored as *absent* rather than as a redundant
+      // entry, so clearing the field is how a user reverts to the decoder's own name and the
+      // map doesn't accumulate no-op entries.
+      const event = this._decodedLog.find((e) => deviceInstanceKey(e.device || {}) === key);
+      const model = event?.device?.model || "";
+      // Writes only this device's own storage key, so a concurrent rename of a different device
+      // in another tab cannot be affected at all - see DEVICE_ALIAS_KEY_PREFIX.
+      saveDeviceAlias(key, value === "" || value === model ? null : value);
+      this._deviceAliases = loadDeviceAliases();
+      this._closeAliasEditor();
+      this._renderDecodedLog();
+      this._renderBatteryAlerts();
+    };
+    el.querySelectorAll("[data-alias-save]").forEach((btn) => {
+      btn.addEventListener("click", () => commitAlias(btn.dataset.aliasSave));
+    });
+    el.querySelectorAll("[data-alias-input]").forEach((input) => {
+      input.addEventListener("compositionstart", () => {
+        this._aliasComposing = true;
+      });
+      input.addEventListener("compositionend", () => {
+        this._aliasComposing = false;
+        // Flush whatever arrived while composing, so the log is not left stale afterwards.
+        if (this._decodedRenderDeferred) {
+          this._decodedRenderDeferred = false;
+          this._renderDecodedLog();
+        }
+      });
+      input.addEventListener("keydown", (ev) => {
+        // An IME emits Enter to accept the current candidate, and Escape to cancel composition,
+        // both with isComposing set. Acting on them here would save or close the editor instead
+        // of confirming the character the user is in the middle of choosing, which makes the
+        // field unusable for Japanese, Chinese and Korean input.
+        if (ev.isComposing) return;
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          commitAlias(input.dataset.aliasInput);
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          this._closeAliasEditor();
+          this._renderDecodedLog();
+        }
+      });
+    });
     el.querySelectorAll("[data-pin-device]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const key = btn.dataset.pinDevice;
@@ -3363,7 +3922,17 @@ class SdrHubPanel extends HTMLElement {
         // earlier getImageData/putImageData round-trip forced a full framebuffer readback on
         // every single row once the cap was reached - not the shift itself, but that readback,
         // was the freeze risk (~100MB copied per row for a narrow/fast sweep at the 200MB cap).
+        // "copy" rather than the default source-over. The rows being shifted contain
+        // transparent pixels now that non-finite bins are drawn that way, and under source-over
+        // a transparent source pixel leaves the destination untouched - so stale coloured signal
+        // would show through wherever a gap moved, and accumulate as the window slid. copy
+        // replaces the destination outright, alpha included. Only this path composites after
+        // _paintRow; the growth branch below draws onto a freshly-cleared bitmap, and
+        // putImageData already replaces alpha.
+        ctx.save();
+        ctx.globalCompositeOperation = "copy";
         ctx.drawImage(canvas, 0, -1);
+        ctx.restore();
         y = canvas.height - 1;
       } else {
         // Still growing (no pre-allocation): canvas resize clears its bitmap, so blit the
@@ -3400,6 +3969,15 @@ class SdrHubPanel extends HTMLElement {
       rowImage.data[i * 4 + 1] = g;
       rowImage.data[i * 4 + 2] = b;
       rowImage.data[i * 4 + 3] = 255;
+    }
+    // Non-finite bins are made transparent rather than painted at t=0. Mapping them to 0 drew
+    // them at the *weakest* end of the ramp, so a gap in the data was indistinguishable from a
+    // genuinely quiet frequency - and the colour legend made that worse, because it explicitly
+    // tells the user the left end means "weaker". Transparency reads as "nothing here" against
+    // the card background in either theme and belongs to no colormap, so it cannot be confused
+    // with a signal level. See issue #16; why the scanner emits them at all is still open.
+    for (let i = 0; i < width; i++) {
+      if (!Number.isFinite(row.power_db[i])) rowImage.data[i * 4 + 3] = 0;
     }
     if (peak) {
       // Overwrite the peak bin's pixel with a stark, unmistakable color - baked directly into
