@@ -75,8 +75,62 @@ const BROADCAST_CHANNEL_NAME = "sdr_hub_panel_sync";
 // heartbeat. A claim older than LEADER_TTL_MS is treated as abandoned (tab closed/crashed/
 // suspended) and may be taken over.
 const SOUND_LEADER_KEY = "sdr_hub_sound_leader";
+// Owner of *writes* to the battery state. Deliberately a separate role from the sound leader:
+// only audio-capable tabs may own the sound, but any attached tab can own the state - if the two
+// were merged, a browser with no audio-capable tab open would have nobody writing state at all.
+//
+// Why a single writer: localStorage offers no compare-and-swap, so "read the generation, then
+// write it back" is a read-modify-write that another document can interleave with - the stored
+// generation could regress and a new tab would then load exactly the low-battery assertions an
+// invalidation had discarded. Web Locks would serialize it, but it is [SecureContext] and so
+// unavailable on the plain-HTTP origins Home Assistant is usually reached over. Funnelling every
+// write through one elected tab removes the concurrency instead of trying to guard it: with a
+// single writer there is no interleaving to lose. The LWW entry merge is retained underneath as
+// defence in depth for the brief windows around a leadership handover.
+const STATE_LEADER_KEY = "sdr_hub_state_leader";
 const LEADER_TTL_MS = 5000;
 const LEADER_HEARTBEAT_MS = 2000;
+
+// Claims `key` for `tabId` unless a different tab holds it and its claim is still fresh.
+// Write-then-verify: if two tabs write in the same instant the last write wins, and re-reading
+// means at most one of them sees its own id and proceeds. A split that still slips through is
+// bounded by the heartbeat below, which steps down on finding the claim is no longer ours.
+function claimLeadership(key, tabId) {
+  try {
+    const now = Date.now();
+    const raw = localStorage.getItem(key);
+    const current = raw ? JSON.parse(raw) : null;
+    const held = current && typeof current.tabId === "string" && Number.isFinite(current.ts);
+    if (held && current.tabId !== tabId && now - current.ts < LEADER_TTL_MS) return false;
+    localStorage.setItem(key, JSON.stringify({ tabId, ts: now }));
+    const after = JSON.parse(localStorage.getItem(key) || "null");
+    return !!after && after.tabId === tabId;
+  } catch {
+    // Storage unusable - there is no shared state to coordinate over anyway, so act
+    // unilaterally rather than freezing this tab out of doing anything at all.
+    return true;
+  }
+}
+
+function holdsLeadership(key, tabId) {
+  try {
+    const raw = localStorage.getItem(key);
+    const current = raw ? JSON.parse(raw) : null;
+    return !!current && current.tabId === tabId && Date.now() - current.ts < LEADER_TTL_MS;
+  } catch {
+    return true;
+  }
+}
+
+function releaseLeadership(key, tabId) {
+  try {
+    const raw = localStorage.getItem(key);
+    const current = raw ? JSON.parse(raw) : null;
+    if (current && current.tabId === tabId) localStorage.removeItem(key);
+  } catch {
+    // Unavailable storage - the claim (if any) simply expires on its own.
+  }
+}
 
 function generateId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -773,6 +827,7 @@ class SdrHubPanel extends HTMLElement {
     // lifetime.
     this._tabId = generateId();
     this._soundLeaderTimer = null;
+    this._stateLeaderTimer = null;
     this._broadcastChannel = null;
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
@@ -961,11 +1016,28 @@ class SdrHubPanel extends HTMLElement {
       this._broadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
       this._broadcastChannel.onmessage = (ev) => {
         const msg = ev.data;
-        if (!msg || msg.kind !== "log_cleared") return;
-        if (!Number.isInteger(msg.gen) || msg.gen <= this._decodedLogGen) return;
-        this._decodedLogGen = msg.gen;
-        this._decodedLog = loadDecodedLog(msg.gen);
-        this._renderDecodedLog();
+        if (!msg) return;
+        if (msg.kind === "log_cleared") {
+          if (!Number.isInteger(msg.gen) || msg.gen <= this._decodedLogGen) return;
+          this._decodedLogGen = msg.gen;
+          this._decodedLog = loadDecodedLog(msg.gen);
+          this._renderDecodedLog();
+          return;
+        }
+        // A peer forwarded a battery transition for the state leader to persist. Ignored unless
+        // this tab currently holds that role - if the leader has since gone away, the next
+        // transition in any tab re-elects one and republishes, so nothing is stuck.
+        if (msg.kind === "battery_transition" && msg.key && msg.entry) {
+          if (!this._isStateLeader()) return;
+          this._leaderWriteBattery(new Map([[msg.key, msg.entry]]));
+          return;
+        }
+        // A peer observed a stream gap. Only the leader publishes the generation bump, so the
+        // clear can't race several tabs writing it at once.
+        if (msg.kind === "battery_invalidate") {
+          if (!this._isStateLeader()) return;
+          this._leaderInvalidateBattery();
+        }
       };
     } catch {
       // No BroadcastChannel (very old browser) - the storage event above still propagates the
@@ -1094,6 +1166,10 @@ class SdrHubPanel extends HTMLElement {
     // longer play anything, and holding the claim until it expires would leave alerts unplayed
     // by any tab for up to LEADER_TTL_MS.
     this._releaseSoundLeadership();
+    // Same for the state-writer role: hand it back immediately so another open tab can take
+    // over writes now rather than after the TTL, during which nothing would be persisted.
+    this._stopStateLeaderHeartbeat();
+    releaseLeadership(STATE_LEADER_KEY, this._tabId);
     // _deviceBatteryOk is just a cache of the canonical, cross-tab-shared BATTERY_LOW_KEY - a
     // detach doesn't need to (and shouldn't) wipe it, since connectedCallback reloads it fresh
     // from storage on reattach regardless, picking up whatever the shared source of truth has
@@ -1250,6 +1326,19 @@ class SdrHubPanel extends HTMLElement {
   // HA-side WebSocket reconnect - in every one of those the loss is upstream of all tabs, so no
   // peer holds a better copy and re-reading shared state would just re-adopt the same staleness.
   _invalidateBatteryState() {
+    // Routed through the single writer like every other mutation. A non-leader clears its own
+    // view immediately (the banner shouldn't keep asserting state this tab knows is stale) and
+    // asks the leader to publish the generation bump.
+    if (!this._isStateLeader()) {
+      this._deviceBatteryOk = new Map();
+      this._renderBatteryAlerts();
+      this._postSync({ kind: "battery_invalidate" });
+      return;
+    }
+    this._leaderInvalidateBattery();
+  }
+
+  _leaderInvalidateBattery() {
     const nextGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
     const cleared = saveBatteryState(nextGen, new Map());
     // Only claim the bumped generation once it has actually reached storage - see
@@ -1287,25 +1376,56 @@ class SdrHubPanel extends HTMLElement {
     // locally sane.
     const ord = Number.isFinite(eventOrder(event)) ? eventOrder(event) : Date.now();
     const previous = this._deviceBatteryOk.get(key);
-    const incoming = new Map([
-      [key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, ord }],
-    ]);
+    const entry = { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, ord };
+    // Every tab receives this same broadcast, so every tab would otherwise perform its own
+    // read-modify-write. Funnel the write through the elected state leader instead - see
+    // STATE_LEADER_KEY. Non-leaders hand the transition over and let the leader's write come
+    // back via the storage event.
+    const applied = this._applyBatteryTransition(key, entry);
+    // Only a transition that is genuinely newer than whatever has already been alerted for this
+    // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
+    // Reads alertedAt off the resulting entry rather than `previous`, since the merge carries it
+    // forward across a low->low refresh (see mergeBatteryLowState); using `previous` alone would
+    // miss a marker another tab had already written.
+    const winner = applied.get(key);
+    if (!winner || !winner.low || winner.ord !== ord) return;
+    const priorAlert = winner.alertedAt ?? previous?.alertedAt;
+    if (Number.isFinite(priorAlert)) return;
+    this._maybePlayLeaderAlert(key, ord);
+  }
+
+  // Applies one transition to the shared battery state. The *write* only happens in the tab
+  // holding STATE_LEADER_KEY; any other tab forwards the transition to it over BroadcastChannel
+  // and updates its own view optimistically, which the leader's authoritative write then
+  // corrects via the storage event. Returns the map this tab should reason about right now.
+  _applyBatteryTransition(key, entry) {
+    const incoming = new Map([[key, entry]]);
+    if (!this._isStateLeader()) {
+      this._postSync({ kind: "battery_transition", key, entry });
+      // Optimistic local update so this tab's own banner and alert decision don't lag a
+      // round-trip behind. Never persisted - the leader owns storage.
+      this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, incoming);
+      this._renderBatteryAlerts();
+      return this._deviceBatteryOk;
+    }
+    return this._leaderWriteBattery(incoming);
+  }
+
+  // Leader-only. Safe to read-modify-write without further guarding precisely because exactly
+  // one tab reaches here at a time.
+  _leaderWriteBattery(incoming) {
     // Re-read the generation at write time (not at event arrival) so a stream_gap that landed in
-    // between is always observed. If another tab bumped it, everything this tab held is
-    // invalidated and only the post-gap storage state plus this event survive.
+    // between is always observed. If it was bumped, everything this tab held is invalidated and
+    // only the post-gap storage state plus this transition survive.
     const reconciled = reconcileBatteryState(
       { gen: this._batteryGen, map: this._deviceBatteryOk },
       loadBatteryState(),
       this._batteryInvalidationPending,
     );
     this._batteryGen = reconciled.gen;
-    const base = reconciled.map;
-    // Merge against both storage *and* this tab's own in-memory view, so a peer's concurrent
-    // write can't erase knowledge this tab already had.
-    const merged = mergeBatteryLowState(base, incoming);
+    const merged = mergeBatteryLowState(reconciled.map, incoming);
     // saveBatteryState returns the authoritative state: normally what was just written, but the
-    // post-gap storage value instead if a peer's clear landed mid-write. Everything below reads
-    // from that rather than `merged`, so a superseded transition can't still trigger an alert.
+    // stored value instead if it already held a higher generation.
     const written = saveBatteryState(this._batteryGen, merged);
     this._batteryGen = written.gen;
     this._deviceBatteryOk = written.map;
@@ -1313,16 +1433,41 @@ class SdrHubPanel extends HTMLElement {
     // hold (see _invalidateBatteryState) is no longer needed.
     if (written.persisted) this._batteryInvalidationPending = false;
     this._renderBatteryAlerts();
-    // Only a transition that is genuinely newer than whatever has already been alerted for this
-    // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
-    // Reads alertedAt off the merged entry rather than `previous`, since the merge carries it
-    // forward across a low->low refresh (see mergeBatteryLowState); using `previous` alone would
-    // miss a marker another tab had already written.
-    const winner = written.map.get(key);
-    if (!winner || !winner.low || winner.ord !== ord) return;
-    const priorAlert = winner.alertedAt ?? previous?.alertedAt;
-    if (Number.isFinite(priorAlert)) return;
-    this._maybePlayLeaderAlert(key, ord);
+    return written.map;
+  }
+
+  // Claims the role opportunistically rather than campaigning for it up front: whichever tab
+  // next needs to write takes it if it's free or stale, so there is no window where a browser
+  // has open panels but nobody willing to persist.
+  _isStateLeader() {
+    if (holdsLeadership(STATE_LEADER_KEY, this._tabId)) {
+      this._startStateLeaderHeartbeat();
+      return true;
+    }
+    if (claimLeadership(STATE_LEADER_KEY, this._tabId)) {
+      this._startStateLeaderHeartbeat();
+      return true;
+    }
+    return false;
+  }
+
+  _startStateLeaderHeartbeat() {
+    if (this._stateLeaderTimer) return;
+    this._stateLeaderTimer = setInterval(() => {
+      // Step down rather than stomp if another tab has legitimately taken over (e.g. this one
+      // was suspended past the TTL) - re-claiming would recreate the split we're avoiding.
+      if (!holdsLeadership(STATE_LEADER_KEY, this._tabId)) {
+        this._stopStateLeaderHeartbeat();
+        return;
+      }
+      claimLeadership(STATE_LEADER_KEY, this._tabId);
+    }, LEADER_HEARTBEAT_MS);
+  }
+
+  _stopStateLeaderHeartbeat() {
+    if (!this._stateLeaderTimer) return;
+    clearInterval(this._stateLeaderTimer);
+    this._stateLeaderTimer = null;
   }
 
   // Plays the alert only in the tab currently holding sound leadership. Only tabs that can
@@ -1695,10 +1840,10 @@ class SdrHubPanel extends HTMLElement {
   // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
   // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
   _onResetPreferences() {
-    // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see that
-    // list's own comment. Releasing leadership removes it on every ordinary detach, and
+    // The two leader keys are cleared here but deliberately kept *out* of ALL_PREF_KEYS - see
+    // that list's own comment. Releasing leadership removes them on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
-    // listing it there would make every open tab reload each time any one tab navigated away.
+    // listing them there would make every open tab reload each time any one tab navigated away.
     // Bump the clear-generation *before* removing anything. Reset and the reload it triggers
     // aren't instantaneous, so another tab (or this one) can persist an in-flight decode in
     // between and resurrect log entries the reset was meant to remove. Entries carrying the
@@ -1706,7 +1851,7 @@ class SdrHubPanel extends HTMLElement {
     // is ignored rather than reappearing.
     const supersededGen = loadDecodedLogGen() + 1;
     saveDecodedLogGen(supersededGen);
-    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
+    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY, STATE_LEADER_KEY]) {
       if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
       try {
         localStorage.removeItem(key);
