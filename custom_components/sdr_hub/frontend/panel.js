@@ -643,12 +643,21 @@ class SdrHubPanel extends HTMLElement {
     // stale, already-superseded entry can't resurface.
     this._decodedLogGen = loadDecodedLogGen();
     this._decodedLog = loadDecodedLog(this._decodedLogGen);
-    // batteryStateKey(device) -> {model, id, channel} for currently-low devices only - the
-    // canonical, cross-tab-shared source of truth (see BATTERY_LOW_KEY). Seeded from persisted
-    // state immediately rather than left empty: every tab derives this from the same event
-    // stream, so what's stored is a value this browser's tabs collectively agreed on, not one
-    // tab's unverifiable guess. A stream_gap (which every tab misses together) is the one case
-    // that can invalidate it, and _handleEvent clears it explicitly there.
+    // batteryStateKey(device) -> {model, id, channel, low, at, alertedAt?} - the canonical,
+    // cross-tab-shared low-battery state (see BATTERY_LOW_KEY and mergeBatteryLowState).
+    //
+    // Deliberately seeded from storage rather than left empty, even though nothing may have been
+    // subscribed since it was written, so it can be arbitrarily stale. That is a real tradeoff
+    // and it's resolved in favour of restoring: the case where restoring is *wrong* (device
+    // recovered while the browser was closed) self-corrects on that device's very next report,
+    // typically within a minute for rtl_433 sensors - whereas the case where blanking is wrong
+    // (the battery actually died, so the device has stopped transmitting entirely) is both the
+    // most important one to surface and the one that would never repair itself, since no further
+    // report is coming. Every entry carries its transition time in `at`, so staleness is at
+    // least representable if this is ever revisited.
+    //
+    // The exception is a stream_gap/reconnect, where the loss is upstream of every tab so no
+    // peer's value is any better - _handleEvent clears it outright there rather than restoring.
     this._deviceBatteryOk = loadBatteryLowState();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
