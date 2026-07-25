@@ -433,14 +433,55 @@ const AUTO_CONTRAST_HIGH_PCT = 0.995;
 const AUTO_CONTRAST_MARGIN_DB = 3;
 const AUTO_CONTRAST_MIN_SPAN_DB = 10;
 
+// Bucket count for the histogram below. dB values span a bounded physical range, so a few
+// thousand buckets put the quantisation error far below the 1 dB the contrast inputs accept.
+const AUTO_CONTRAST_BUCKETS = 4096;
+
 function autoContrastRange(rows) {
-  const values = [];
+  // Deliberately NOT "collect every value and sort". A wide sweep in full-history mode retains up
+  // to scrollRowCapForWidth rows - 2048 rows x 8192 bins is ~16.7M values for a single sweep, and
+  // this runs over every sweep at once. Materialising that as a JS array (repeated reallocation,
+  // ~134MB) and then sorting it with a comparator callback, synchronously on the UI thread with
+  // no yield, could freeze or OOM the Home Assistant tab on one button press.
+  //
+  // Only percentiles are needed, and the values are physically bounded, so two O(n) passes over a
+  // fixed-size histogram give the same answer in constant memory: one pass for the extent, one to
+  // bucket, then a cumulative walk over the buckets.
+  let lo = Infinity;
+  let hi = -Infinity;
+  let count = 0;
   for (const row of rows) {
-    for (const v of row.power_db) if (Number.isFinite(v)) values.push(v);
+    for (const v of row.power_db) {
+      if (!Number.isFinite(v)) continue;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+      count++;
+    }
   }
-  if (values.length < 2) return null;
-  values.sort((a, b) => a - b);
-  const at = (q) => values[Math.min(values.length - 1, Math.max(0, Math.floor(values.length * q)))];
+  if (count < 2) return null;
+  // A completely flat spectrum has no distribution to take percentiles from; the span floor below
+  // is the only sensible answer, so short-circuit rather than dividing by a zero-width extent.
+  if (hi === lo) {
+    return { min: Math.round(lo - AUTO_CONTRAST_MIN_SPAN_DB / 2), max: Math.round(lo + AUTO_CONTRAST_MIN_SPAN_DB / 2) };
+  }
+  const buckets = new Int32Array(AUTO_CONTRAST_BUCKETS);
+  const scale = (AUTO_CONTRAST_BUCKETS - 1) / (hi - lo);
+  for (const row of rows) {
+    for (const v of row.power_db) {
+      if (!Number.isFinite(v)) continue;
+      buckets[Math.round((v - lo) * scale)]++;
+    }
+  }
+  // Walks the cumulative distribution once, resolving every requested quantile in order.
+  const at = (q) => {
+    const target = Math.min(count - 1, Math.max(0, Math.floor(count * q)));
+    let seen = 0;
+    for (let i = 0; i < buckets.length; i++) {
+      seen += buckets[i];
+      if (seen > target) return lo + i / scale;
+    }
+    return hi;
+  };
   let min = at(AUTO_CONTRAST_LOW_PCT) - AUTO_CONTRAST_MARGIN_DB;
   let max = at(AUTO_CONTRAST_HIGH_PCT) + AUTO_CONTRAST_MARGIN_DB;
   if (max - min < AUTO_CONTRAST_MIN_SPAN_DB) {
@@ -1935,6 +1976,11 @@ class SdrHubPanel extends HTMLElement {
   // from the air, and it is written to a file the user is likely to open in Excel.
   _csvCell(value) {
     if (value === null || value === undefined) return "";
+    // Numbers are emitted as-is. Neutralising them broke the common case rather than a corner
+    // one: a negative temperature or RSSI starts with "-", so String()-then-test turned -5.2 into
+    // '-5.2 and every spreadsheet imported it as text - unplottable and uncalculable, which is
+    // exactly what this export exists for. A finite number cannot be a formula.
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
     let text = String(value);
     if (/^[=+\-@]/.test(text)) text = `'${text}`;
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -1950,10 +1996,18 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     const fixed = ["received_at", "name", "model", "id", "channel"];
+    // Excludes only the device fields the fixed columns already carry, derived from `fixed`
+    // itself so the promise made in this method's comment stays true by construction.
+    //
+    // It previously filtered through DECODED_HIDDEN_FIELDS, which exists to keep clutter off the
+    // on-screen cards - so time, mic, protocol and raw_message were silently dropped from the
+    // file. Those are diagnostics a user exporting to a spreadsheet has every reason to want, and
+    // hiding something on a card is a different decision from omitting it from an export.
+    const carriedByFixedColumns = new Set(["model", "id", "channel"]);
     const extras = new Set();
     for (const event of this._decodedLog) {
       for (const key of Object.keys(event.device || {})) {
-        if (!DECODED_HIDDEN_FIELDS.has(key) && !fixed.includes(key)) extras.add(key);
+        if (!carriedByFixedColumns.has(key) && !fixed.includes(key)) extras.add(key);
       }
     }
     const columns = [...fixed, ...[...extras].sort()];
@@ -2790,6 +2844,10 @@ class SdrHubPanel extends HTMLElement {
           this._showError("No spectrum data yet - start a sweep and let a few rows arrive first.");
           return;
         }
+        // Clears the "no spectrum data yet" message this same button may have shown moments ago -
+        // otherwise the panel keeps asserting there is no data while visibly applying a range
+        // derived from it.
+        this._showError("");
         this._dbMin = range.min;
         this._dbMax = range.max;
         dbMinInput.value = range.min;
@@ -4292,7 +4350,13 @@ class SdrHubPanel extends HTMLElement {
   _saveSweepImage(sweepId) {
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     if (!canvas) return;
-    canvas.toBlob((blob) => {
+    // The frequency axis is a sibling DOM element, so exporting the canvas alone produced a PNG
+    // that cannot be located in frequency without outside context - the very problem the axis was
+    // added to solve, reintroduced in the one artefact a user is most likely to keep or share.
+    // Composited here rather than drawn into the live canvas: the canvas is the pixel history and
+    // gets shifted, resized and blitted, so permanent furniture in it would scroll away.
+    const composited = this._compositeSweepImage(sweepId, canvas);
+    (composited || canvas).toBlob((blob) => {
       if (!blob) {
         this._showError("Could not save image: canvas produced no data");
         return;
@@ -4306,6 +4370,43 @@ class SdrHubPanel extends HTMLElement {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }, "image/png");
+  }
+
+  // Canvas carrying the waterfall plus a frequency ruler beneath it. Returns null if the sweep's
+  // range is unknown, in which case the caller falls back to exporting the bare waterfall rather
+  // than failing the save outright.
+  _compositeSweepImage(sweepId, canvas) {
+    const sweep = (this._state.sweeps || []).find((s) => s.id === sweepId);
+    if (!sweep || !Number.isFinite(sweep.start_hz) || !Number.isFinite(sweep.stop_hz)) return null;
+    const axisHeight = 18;
+    const out = document.createElement("canvas");
+    out.width = canvas.width;
+    out.height = canvas.height + axisHeight;
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+    // Opaque background: the waterfall now contains genuinely transparent pixels for blanked
+    // bins, and a PNG with holes in it looks like corruption against whatever the viewer happens
+    // to place behind it.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(canvas, 0, 0);
+    ctx.fillStyle = "#000000";
+    ctx.font = "10px sans-serif";
+    ctx.textBaseline = "top";
+    const ticks = Math.max(2, Math.min(6, Math.floor(out.width / 90)));
+    const span = sweep.stop_hz - sweep.start_hz;
+    for (let i = 0; i < ticks; i++) {
+      const frac = ticks === 1 ? 0 : i / (ticks - 1);
+      const x = frac * out.width;
+      ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), canvas.height, 1, 3);
+      const label = fmtMHz(sweep.start_hz + span * frac);
+      const w = ctx.measureText(label).width;
+      // Same edge handling as the on-screen axis: the end labels are pulled inside the bounds so
+      // neither is clipped by the image border.
+      const tx = i === 0 ? 0 : i === ticks - 1 ? out.width - w : x - w / 2;
+      ctx.fillText(label, Math.min(out.width - w, Math.max(0, tx)), canvas.height + 4);
+    }
+    return out;
   }
 
   // Exports only the fields sdr_hub/add_sweep and sdr_hub/add_receiver actually accept (not
