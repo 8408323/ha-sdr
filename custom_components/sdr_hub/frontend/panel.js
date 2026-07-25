@@ -134,6 +134,10 @@ const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
+// Persists _deviceBatterySoundAlerted (the "already alerted for this low streak" set) on its
+// own, deliberately independent of DECODED_LOG_KEY above - see saveBatterySoundAlerted()'s
+// comment for why the 50-entry display log isn't a reliable source for this.
+const BATTERY_SOUND_ALERTED_KEY = "sdr_hub_battery_sound_alerted";
 // Every localStorage key this panel ever writes - used solely by _onResetPreferences() to wipe
 // them all in one action, so that list and this one can't silently drift apart the way two
 // independently-maintained copies could.
@@ -147,6 +151,7 @@ const ALL_PREF_KEYS = [
   DECODED_TIME_MODE_KEY,
   DECODED_LOG_KEY,
   BATTERY_SOUND_ALERT_KEY,
+  BATTERY_SOUND_ALERTED_KEY,
 ];
 
 function loadFormPrefs(key) {
@@ -235,33 +240,37 @@ function batteryStateKey(d) {
   return `${d.model || ""}|${d.id != null ? d.id : ""}|${d.channel != null ? d.channel : ""}`;
 }
 
-// Reconstructs the in-memory low-battery state a fresh SdrHubPanel instance would otherwise
-// only learn about from live decoded_device events - called once, from the constructor, against
-// the just-restored (persisted) decoded log. Without this, a full page reload (which constructs
-// a brand-new instance, unlike a same-instance panel detach/reattach) forgets every currently-low
-// device even though the log and sound preference it's derived from both survived the reload -
-// so the very next *repeated* low report for a device that was already known-low, and already
-// alerted on in the previous session, would look "newly low" again and replay the sound despite
-// no real recovery having happened. decodedLog is newest-first, so the first entry seen for a
-// given device's key is authoritative for its current state.
-function deriveInitialBatteryState(decodedLog) {
-  const ok = new Map();
-  const alerted = new Set();
-  const seen = new Set();
-  for (const event of decodedLog) {
-    const device = event.device || {};
-    if (!Object.hasOwn(device, "battery_ok")) continue;
-    const key = batteryStateKey(device);
-    if (seen.has(key)) continue; // a more recent entry for this device already decided its state
-    seen.add(key);
-    if (!device.battery_ok) {
-      ok.set(key, { ok: false, model: device.model, id: device.id, channel: device.channel });
-      // Already known-low as of the last session - don't replay the sound for it again until an
-      // actual recovery (battery_ok:true) is observed.
-      alerted.add(key);
-    }
+// Loads the persisted _deviceBatterySoundAlerted set (see its field comment) for a fresh
+// SdrHubPanel instance - e.g. after a full page reload, which constructs a brand-new instance
+// rather than reattaching the existing one, so in-memory-only state can't survive it. Restores
+// *only* the sound-dedup set, never the live low-battery banner map (_deviceBatteryOk) - that
+// map is intentionally left empty for a fresh instance/reconnect (mirroring what
+// disconnectedCallback already does on a same-instance detach) because there's no way to know a
+// persisted-as-low device hasn't actually recovered while this browser was closed/away; showing
+// a banner built from that stale guess would risk it being wrong, possibly indefinitely if the
+// device stops transmitting. A stale sound-dedup entry has no such visible downside - at worst
+// it silently skips one alert for a device that happens to have (very recently) recovered and
+// gone low again, which is a much smaller cost than restoring a live-looking but possibly-false
+// banner. Deliberately its own key/array, not derived from the (capped at MAX_DECODED_LOG)
+// decoded log - a device's low report can easily be the log's oldest surviving entry or already
+// evicted from it entirely by 50 other devices' events, well before the low streak itself ends.
+function loadBatterySoundAlerted() {
+  try {
+    const raw = localStorage.getItem(BATTERY_SOUND_ALERTED_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.filter((k) => typeof k === "string")) : new Set();
+  } catch {
+    return new Set();
   }
-  return { ok, alerted };
+}
+
+function saveBatterySoundAlerted(set) {
+  try {
+    localStorage.setItem(BATTERY_SOUND_ALERTED_KEY, JSON.stringify([...set]));
+  } catch {
+    // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
+  }
 }
 
 function loadFavoriteDevices() {
@@ -505,7 +514,14 @@ class SdrHubPanel extends HTMLElement {
     // silently cleared - it's only cleared by an actual battery_ok:true recovery event, never by
     // the log simply rolling past it. Recovered/healthy devices are deleted rather than stored
     // (see _handleEvent), and MAX_TRACKED_LOW_BATTERY_DEVICES bounds the rest, so this can't grow
-    // without limit the way naively caching every seen device's state would.
+    // without limit the way naively caching every seen device's state would. Deliberately starts
+    // empty even on a freshly constructed instance (e.g. right after a full page reload) rather
+    // than being seeded from persisted state the way _deviceBatterySoundAlerted below is - there
+    // is no way to know whether a device that was last reported low has since recovered while
+    // this browser was away/closed, and showing a banner built from that stale guess risks it
+    // being wrong, possibly indefinitely if the device stops transmitting. This mirrors what
+    // disconnectedCallback already does to this same map on an ordinary same-instance detach.
+    this._deviceBatteryOk = new Map();
     // batteryStateKey(device) -> true for devices already alerted-on for their *current* low
     // streak. Deliberately separate from, and NOT cleared alongside, _deviceBatteryOk in
     // disconnectedCallback: that map is wiped on detach because there's no authoritative
@@ -513,13 +529,12 @@ class SdrHubPanel extends HTMLElement {
     // mean the very next low report for a device that was already known-low (e.g. from ordinary
     // dashboard navigation away and back, or an HA reload) re-plays the sound even though the
     // device never actually recovered - see the wasAlreadyLow check in _handleEvent. Only an
-    // actual battery_ok:true recovery event clears an entry here. Seeded (along with
-    // _deviceBatteryOk below) from the restored decoded log so a full page reload - which
-    // constructs a brand-new instance, unlike a same-instance detach/reattach - doesn't forget
-    // the current low streaks either.
-    const initialBattery = deriveInitialBatteryState(this._decodedLog);
-    this._deviceBatteryOk = initialBattery.ok;
-    this._deviceBatterySoundAlerted = initialBattery.alerted;
+    // actual battery_ok:true recovery event clears an entry here. Unlike _deviceBatteryOk above,
+    // this IS seeded from persisted state (loadBatterySoundAlerted(), saved on every change - see
+    // its own comment for why that's a separate key rather than derived from _decodedLog) even
+    // on a freshly constructed instance - a stale dedup entry has no risky "looks live but might
+    // be wrong" downside the way a restored banner would, so there's nothing to lose by trusting it.
+    this._deviceBatterySoundAlerted = loadBatterySoundAlerted();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -542,10 +557,11 @@ class SdrHubPanel extends HTMLElement {
     // gesture-initiated Web Audio. Reset to false in disconnectedCallback (which also closes
     // _audioCtx) so a detach/reattach re-arms it - the closed context needs a fresh gesture too.
     this._audioUnlockWired = false;
-    // Whether the cross-tab "another tab just reset preferences" storage listener (see
-    // _wireStorageResetSync) is currently attached - same re-arm-on-reattach reasoning as
-    // _audioUnlockWired above, since it's a page-wide `window` listener, not a per-element one.
-    this._storageResetSyncWired = false;
+    // Whether the cross-tab storage listener (see _wireStorageSync - reconciles this tab's
+    // in-memory state when another open SDR Hub tab either resets preferences or updates the
+    // decoded log) is currently attached - same re-arm-on-reattach reasoning as _audioUnlockWired
+    // above, since it's a page-wide `window` listener, not a per-element one.
+    this._storageSyncWired = false;
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
     this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
@@ -635,28 +651,42 @@ class SdrHubPanel extends HTMLElement {
   }
 
   // Mirrors _wireAudioUnlock's re-arm-on-reattach handling for the `window`-level "storage"
-  // event listener below - see _storageResetSyncWired's field comment for why this needs its own
+  // event listener below - see _storageSyncWired's field comment for why this needs its own
   // guarded wire/unwire pair rather than being set up once forever.
-  _wireStorageResetSync() {
-    if (this._storageResetSyncWired) return;
-    this._storageResetSyncWired = true;
-    this._onStorageReset = (ev) => {
+  _wireStorageSync() {
+    if (this._storageSyncWired) return;
+    this._storageSyncWired = true;
+    this._onStorageEvent = (ev) => {
       // "storage" only ever fires in *other* tabs/documents than the one that made the change
-      // (per spec) - so this is specifically about another open SDR Hub tab resetting
-      // preferences, not this tab's own _onResetPreferences() (which already reloads itself
-      // directly). ev.key === null means localStorage.clear() was used rather than individual
-      // removeItem() calls; either way, a key this panel cares about being removed elsewhere
-      // means this tab's in-memory state (_decodedLog, _favoriteDevices, etc.) is now stale -
-      // most importantly, this tab's next decoded_device event would otherwise call
-      // saveDecodedLog() with that stale in-memory log and silently resurrect the exact history
-      // the other tab's reset just cleared. Reloading (matching _onResetPreferences()'s own
-      // approach) is the simplest way to guarantee this tab picks up the reset instead of racing
-      // it.
-      if (ev.storageArea === localStorage && (ev.key === null || ALL_PREF_KEYS.includes(ev.key)) && ev.newValue === null) {
+      // (per spec), never the tab that called setItem/removeItem/clear itself - so everything
+      // below is specifically about reconciling this tab's in-memory state with a change some
+      // *other* open SDR Hub tab just made.
+      if (ev.storageArea !== localStorage) return;
+      // ev.key === null means localStorage.clear() was used rather than an individual
+      // removeItem() call; either way, a key this panel cares about being removed elsewhere means
+      // this tab's in-memory state (_decodedLog, _favoriteDevices, etc.) is now stale - most
+      // importantly, this tab's next decoded_device event would otherwise call saveDecodedLog()
+      // with that stale in-memory log and silently resurrect the exact history the other tab's
+      // reset just cleared. Reloading (matching _onResetPreferences()'s own approach) is the
+      // simplest way to guarantee this tab picks up the reset instead of racing it.
+      if (ev.newValue === null && (ev.key === null || ALL_PREF_KEYS.includes(ev.key))) {
         location.reload();
+        return;
+      }
+      // A plain *update* (not removal) to the decoded log specifically - most commonly another
+      // tab's "Clear log" button, which calls saveDecodedLog([]) and so never hits the
+      // newValue === null branch above at all (an empty array is still a value, not a removal).
+      // Without this, that other tab's clear would only reach this tab the next time *this* tab
+      // itself decodes something and overwrites localStorage with its own still-stale in-memory
+      // log - reconstructing the exact history the other tab just cleared. Adopting the new log
+      // directly (rather than a full reload, which would be disruptive for something this
+      // routine) keeps every open tab's decoded log in sync live.
+      if (ev.key === DECODED_LOG_KEY) {
+        this._decodedLog = loadDecodedLog();
+        this._renderDecodedLog();
       }
     };
-    window.addEventListener("storage", this._onStorageReset);
+    window.addEventListener("storage", this._onStorageEvent);
   }
 
   connectedCallback() {
@@ -691,7 +721,7 @@ class SdrHubPanel extends HTMLElement {
     // _renderShell() above may have already wired them for a from-scratch reattach), and both
     // need re-arming after a same-instance detach/reattach where the shell itself wasn't rebuilt.
     this._wireAudioUnlock();
-    this._wireStorageResetSync();
+    this._wireStorageSync();
   }
 
   disconnectedCallback() {
@@ -726,9 +756,9 @@ class SdrHubPanel extends HTMLElement {
     // window.addEventListener("storage", ...) outlives this element the same way
     // hass.connection's listeners do - remove it on detach, and clear the guard so a reattach
     // re-wires it instead of leaving this instance silently unsynced with other tabs.
-    if (this._storageResetSyncWired) {
-      window.removeEventListener("storage", this._onStorageReset);
-      this._storageResetSyncWired = false;
+    if (this._storageSyncWired) {
+      window.removeEventListener("storage", this._onStorageEvent);
+      this._storageSyncWired = false;
     }
     // _deviceBatteryOk is populated purely from the decoded_device event stream - there's no
     // authoritative server-side battery snapshot in get_state to reconcile against on
@@ -876,6 +906,10 @@ class SdrHubPanel extends HTMLElement {
           }
           if (!wasAlreadyLow && this._batterySoundEnabled) this._playBatteryAlertSound();
         }
+        // Persisted independently of, and every time it changes alongside, _decodedLog below -
+        // see loadBatterySoundAlerted()'s comment for why this can't just be reconstructed from
+        // that (capped, unrelated-purpose) log on the next fresh instance.
+        saveBatterySoundAlerted(this._deviceBatterySoundAlerted);
       }
       saveDecodedLog(this._decodedLog);
       this._renderDecodedLog();
@@ -1147,7 +1181,7 @@ class SdrHubPanel extends HTMLElement {
     // including when the initial get_state call fails outright.
     this._renderDecodedLog();
     this._wireAudioUnlock();
-    this._wireStorageResetSync();
+    this._wireStorageSync();
   }
 
   // A full page reload after clearing every known key is far simpler and more robust than
