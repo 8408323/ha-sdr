@@ -1483,6 +1483,10 @@ class SdrHubPanel extends HTMLElement {
       : this._decodedLog;
     if (filtered.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No decoded devices match "${esc(this._decodedFilter)}".</p>`;
+      // Cleared here too, same as the end of the normal render path below - otherwise a flash
+      // pending for a device hidden by the current filter would stay queued and fire later
+      // (once the filter no longer excludes it) as if it had just decoded.
+      this._flashDeviceKey = null;
       return;
     }
     const now = Date.now();
@@ -2233,13 +2237,27 @@ class SdrHubPanel extends HTMLElement {
     await this._loadState();
   }
 
-  // Snapshots ids up front rather than iterating this._state.sweeps directly - each
-  // _onRemoveSweep call's own _loadState() reassigns this._state (and thus .sweeps) as it goes,
-  // so iterating the live array while removing from it would skip entries. Sequential (not
-  // Promise.all) so overlapping _loadState() calls can't resolve out of order and reintroduce
-  // a sweep that was already removed - see _loadState's own request-id-guard comment.
+  // Snapshots ids up front rather than iterating this._state.sweeps directly - each removal's
+  // own _loadState() reassigns this._state (and thus .sweeps) as it goes, so iterating the live
+  // array while removing from it would skip entries. Sequential (not Promise.all) so overlapping
+  // _loadState() calls can't resolve out of order and reintroduce a sweep that was already
+  // removed - see _loadState's own request-id-guard comment.
+  //
+  // Doesn't delegate to _onRemoveSweep here (unlike a single stop click) because that method
+  // calls _showError() on every iteration - a later successful removal would erase an earlier
+  // failure's message even though that sweep is still running. Errors are accumulated instead
+  // and reported together once the whole loop finishes.
   async _onStopAllSweeps() {
-    for (const id of this._state.sweeps.map((s) => s.id)) await this._onRemoveSweep(id);
+    const errors = [];
+    for (const id of this._state.sweeps.map((s) => s.id)) {
+      try {
+        await this._callWS({ type: "sdr_hub/remove_sweep", sweep_id: id });
+      } catch (err) {
+        errors.push(err.message || err);
+      }
+      await this._loadState();
+    }
+    this._showError(errors.length ? `Could not stop all sweeps: ${errors.join("; ")}` : "");
   }
 
   async _onAddReceiver(ev) {
@@ -2285,9 +2303,19 @@ class SdrHubPanel extends HTMLElement {
     await this._loadState();
   }
 
-  // See _onStopAllSweeps above - same snapshot-ids-then-sequentially-remove reasoning.
+  // See _onStopAllSweeps above - same snapshot-ids-then-sequentially-remove reasoning, and same
+  // reason for accumulating errors instead of delegating to _onRemoveReceiver.
   async _onStopAllReceivers() {
-    for (const id of this._state.receivers.map((r) => r.id)) await this._onRemoveReceiver(id);
+    const errors = [];
+    for (const id of this._state.receivers.map((r) => r.id)) {
+      try {
+        await this._callWS({ type: "sdr_hub/remove_receiver", receiver_id: id });
+      } catch (err) {
+        errors.push(err.message || err);
+      }
+      await this._loadState();
+    }
+    this._showError(errors.length ? `Could not stop all receivers: ${errors.join("; ")}` : "");
   }
 }
 
