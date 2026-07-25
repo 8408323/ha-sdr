@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import threading
 import os
 import time
 import uuid
@@ -29,6 +30,11 @@ SEQ_HIGH_WATER_PATH = Path("/data/event_seq")
 SEQ_CHECKPOINT_INTERVAL = 100
 _seq_high_water_written = 0
 _seq_scheduled_high_water = 0
+# Serializes the whole check-write-mark sequence. The guard alone was not enough: two executor
+# jobs can both pass a bare comparison before either updates the mark, and the fsyncs inside the
+# critical section yield for long enough to make that interleaving realistic - after which the
+# lower job can land last and replace both the file and the mark with its lower value.
+_seq_checkpoint_lock = threading.Lock()
 
 
 def resolve_seq_seed() -> int:
@@ -49,12 +55,17 @@ def resolve_seq_seed() -> int:
 
 def _write_seq_checkpoint(seq: int) -> None:
     """Durably records `seq`. Blocking - must not run on the event loop."""
-    global _seq_high_water_written
-    # Executor jobs are not guaranteed to complete in submission order, so a delayed lower
-    # checkpoint could otherwise overwrite a higher one and leave the stored mark behind the
-    # true high water. Never move it backwards.
-    if seq <= _seq_high_water_written:
-        return
+    global _seq_high_water_written, _seq_scheduled_high_water
+    with _seq_checkpoint_lock:
+        # Re-checked *inside* the lock: executor jobs can complete out of order, and only holding
+        # the check, the write and the mark update together prevents a lower job landing last.
+        if seq <= _seq_high_water_written:
+            return
+        _write_seq_checkpoint_locked(seq)
+
+
+def _write_seq_checkpoint_locked(seq: int) -> None:
+    global _seq_high_water_written, _seq_scheduled_high_water
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
@@ -87,8 +98,12 @@ def _write_seq_checkpoint(seq: int) -> None:
         _seq_high_water_written = seq
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
-        # rather than failing the decode over a checkpoint write.
-        pass
+        # rather than failing the decode over a checkpoint write. Roll the *scheduled* mark back
+        # to what is actually durable, so the next interval retries instead of being suppressed:
+        # otherwise a single transient failure could let the durable checkpoint fall arbitrarily
+        # far behind the issued sequence, and a restart with a rolled-back clock would then seed
+        # from it and reissue values clients already hold.
+        _seq_scheduled_high_water = _seq_high_water_written
 
 
 def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:

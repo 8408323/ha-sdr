@@ -860,8 +860,12 @@ class SdrHubPanel extends HTMLElement {
     this._hass = hass;
     if (first) {
       this._renderShell();
-      this._hydrateDecodedLog();
-      this._hydrateBatteryState();
+      // Captured as a promise and awaited by every mutation path before it reads a generation.
+      // These were previously started but not awaited before _subscribe() opened the live
+      // stream, so a decode arriving in that window captured generation 0, no-opped against a
+      // higher stored generation, and then had its own optimistic update overwritten by the
+      // empty settled record it read back - the event vanished from the tab that saw it.
+      this._hydrated = Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState()]);
       this._loadState();
       this._subscribe();
       this._wireConnectionStatus();
@@ -1027,13 +1031,17 @@ class SdrHubPanel extends HTMLElement {
         if (msg.kind === "state_reset") {
           // A peer cleared the IndexedDB-backed state. Its own localStorage removals may have
           // been no-ops (everything already at defaults), so this is the only signal.
+          // Cleared locally for immediate feedback, then re-read from IndexedDB rather than
+          // left at generation 0. The reset writes empty records at *previous generation + 1*,
+          // so pinning the caches to 0 made this tab's next event stamp expectedGen 0, no-op
+          // against the higher stored generation, and lose that first post-reset report. adopt
+          // because a reset is authoritative - merging would resurrect what it removed.
           this._clearEpoch++;
           this._decodedLog = [];
-          this._decodedLogGen = 0;
           this._deviceBatteryOk = new Map();
-          this._batteryGen = 0;
           this._renderDecodedLog();
           this._renderBatteryAlerts();
+          this._hydrated = Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState({ adopt: true })]);
           return;
         }
       };
@@ -1091,9 +1099,8 @@ class SdrHubPanel extends HTMLElement {
     // tab's own writes were blocked by quota), so replacing would lose it.
     // Both are re-read from IndexedDB, which is authoritative - see the storage-layer comment.
     // adopt:true because a detached element's battery cache is strictly stale (see the method).
-    this._hydrateBatteryState({ adopt: true });
+    this._hydrated = Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]);
     this._renderBatteryAlerts();
-    this._hydrateDecodedLog();
     if (!this._unsub && !this._subscribing) {
       this._loadState();
       this._subscribe();
@@ -1227,7 +1234,7 @@ class SdrHubPanel extends HTMLElement {
     this._renderReceivers();
   }
 
-  _handleEvent(event) {
+  async _handleEvent(event) {
     if (event.type === "sweep_row") {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
@@ -1273,7 +1280,7 @@ class SdrHubPanel extends HTMLElement {
       // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
-      this._invalidateBatteryState();
+      await this._invalidateBatteryState();
       this._loadState();
     }
   }
@@ -1310,6 +1317,19 @@ class SdrHubPanel extends HTMLElement {
   // Re-reads the authoritative decoded log from IndexedDB. Used on first load, on reattach, and
   // whenever a peer signals a change - IndexedDB has no cross-document change event of its own,
   // so BroadcastChannel carries the notification while the database remains the source of truth.
+  // Resolves once the in-flight hydration has settled, so callers read a generation that came
+  // from storage rather than the constructor's 0. Never rejects and never blocks indefinitely:
+  // the hydrate methods swallow their own failures, and if hydration has not been started (an
+  // element mutating before its hass setter ran) there is simply nothing to wait for.
+  async _awaitHydration() {
+    try {
+      await this._hydrated;
+    } catch {
+      // Hydration failing means storage is unusable - the mutation below will fail too and fall
+      // back to its optimistic in-memory state. Not a reason to drop the event here.
+    }
+  }
+
   async _hydrateDecodedLog() {
     const epoch = this._clearEpoch;
     try {
@@ -1359,6 +1379,10 @@ class SdrHubPanel extends HTMLElement {
       MAX_DECODED_LOG,
     );
     this._renderDecodedLog();
+    // Read *after* hydration settles. The optimistic render above is deliberately kept ahead of
+    // it so the card still appears immediately; only the generation the write is stamped with
+    // has to wait, since a generation read before hydration is a guess (0) rather than a fact.
+    await this._awaitHydration();
     const epoch = this._clearEpoch;
     const expectedGen = this._decodedLogGen;
     try {
@@ -1400,9 +1424,18 @@ class SdrHubPanel extends HTMLElement {
   async _invalidateBatteryState() {
     this._deviceBatteryOk = new Map();
     this._renderBatteryAlerts();
+    await this._awaitHydration();
+    const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
         const current = normalizeBatteryRecord(raw);
+        // Conditional on the generation this tab last observed, which makes the invalidation
+        // idempotent across tabs. Every tab receives the same stream_gap and every tab used to
+        // bump unconditionally, so a slow tab's bump could land *after* a fast tab had already
+        // invalidated and persisted a valid post-gap transition - erasing it. Now the first bump
+        // wins and the rest see a generation they did not expect and no-op, while a genuinely
+        // later gap observes the newer generation and bumps correctly.
+        if (current.gen !== expectedGen) return undefined;
         return serializeBatteryRecord(current.gen + 1, new Map());
       });
       const settled = normalizeBatteryRecord(record);
@@ -1472,6 +1505,8 @@ class SdrHubPanel extends HTMLElement {
     // Optimistic local update so the banner and alert decision don't lag a round-trip.
     this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]));
     this._renderBatteryAlerts();
+    // See _persistDecodedEvent - the generation is only meaningful once hydration has settled.
+    await this._awaitHydration();
     const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
@@ -1863,22 +1898,16 @@ class SdrHubPanel extends HTMLElement {
   // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
   // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
   async _onResetPreferences() {
-    // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see
-    // that list's own comment. Releasing leadership removes it on every ordinary detach, and
-    // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
-    // listing it there would make every open tab reload each time any one tab navigated away.
     this._clearEpoch++;
-    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
-      if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
-      try {
-        localStorage.removeItem(key);
-      } catch {
-        // Unavailable storage - nothing to clear.
-      }
-    }
-    // Awaited, not fired-and-forgotten: the reload can tear the page down before the
-    // transaction commits - it first yields at `await openIdb()` - which would leave the log and
-    // battery map that Reset was supposed to clear intact on the next load.
+    // The IndexedDB writes come first, before any localStorage removal. removeItem emits a
+    // storage event, and _onStorageEvent reloads peers on any ALL_PREF_KEYS removal - so doing
+    // it first made peers reload *while these transactions were still uncommitted*, hydrate the
+    // pre-reset records, and then miss the one-shot state_reset message because the listener
+    // they would have received it on was torn down by their own reload.
+    //
+    // Awaited, not fired-and-forgotten, for the same class of reason: the reload below can tear
+    // the page down before the transaction commits - it first yields at `await openIdb()` -
+    // which would leave the log and battery map that Reset was supposed to clear intact.
     try {
       // Deliberately *not* a delete. Deleting returns both records to an absent state that
       // normalizes to generation 0 - indistinguishable from a fresh install - so a mutation
@@ -1890,6 +1919,18 @@ class SdrHubPanel extends HTMLElement {
       await idbMutate(IDB_KEY_BATTERY, (raw) => serializeBatteryRecord(normalizeBatteryRecord(raw).gen + 1, new Map()));
     } catch {
       // No usable store - nothing persisted to clear.
+    }
+    // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see that
+    // list's own comment. Releasing leadership removes it on every ordinary detach, and
+    // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
+    // listing it there would make every open tab reload each time any one tab navigated away.
+    for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
+      if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        // Unavailable storage - nothing to clear.
+      }
     }
     // Peers get no signal otherwise: IndexedDB has no cross-document change event, and if every
     // localStorage preference was already at its default then removeItem is a no-op that emits
