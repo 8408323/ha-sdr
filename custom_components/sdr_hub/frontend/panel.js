@@ -1598,6 +1598,15 @@ class SdrHubPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    // An IME composition belongs to a DOM node and cannot resume across a detach, so if teardown
+    // preempts compositionend the flag would survive reattach and every later render would take
+    // the deferral early-return forever - freezing the decoded log until the user happened to
+    // close the editor. Focus ownership cannot survive either. The draft and selection are
+    // deliberately kept: those are the user's text, and reattachment can legitimately restore
+    // them.
+    this._aliasComposing = false;
+    this._decodedRenderDeferred = false;
+    this._aliasHadFocus = false;
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
@@ -3335,6 +3344,7 @@ class SdrHubPanel extends HTMLElement {
     if (!el) return;
     if (this._decodedLog.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No devices decoded yet.</p>`;
+      this._reconcileAliasEditorPresence();
       return;
     }
     // Matches against model, id and the user's alias (not every field) - a substring match across
@@ -3357,6 +3367,7 @@ class SdrHubPanel extends HTMLElement {
       // pending for a device hidden by the current filter would stay queued and fire later
       // (once the filter no longer excludes it) as if it had just decoded.
       this._flashDeviceKey = null;
+      this._reconcileAliasEditorPresence();
       return;
     }
     const now = Date.now();
@@ -3509,31 +3520,35 @@ class SdrHubPanel extends HTMLElement {
     // markup is rebuilt, when the container reference the wiring code uses is not in hand. The
     // log lives inside this element either way, so both lookups resolve the same node.
     const input = this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
-    if (!input) {
-      // Absent for two very different reasons, and only one of them means the editor is over.
-      //
-      // Genuinely gone: the device was evicted from the capped log, or another tab cleared it.
-      // Focus ownership must be dropped, or the editor silently reappears when that device next
-      // reports and steals focus from whatever the user moved on to.
-      //
-      // Transiently absent: the markup is mid-rebuild. _renderShell() replaces the whole root and
-      // then re-renders the decoded log itself, so a snapshot taken by _reconcilePreferences
-      // before the rebuild was immediately undone by the nested render clearing this flag - the
-      // draft survived but focus and caret did not, which is the very thing the snapshot exists
-      // to preserve.
-      //
-      // The device still being in _decodedLog is what separates them: the log is state, not
-      // markup, and a rebuild does not touch it.
-      const stillLogged = this._decodedLog.some((e) => deviceInstanceKey(e.device || {}) === this._editingAlias);
-      if (!stillLogged) this._aliasHadFocus = false;
-      return;
-    }
+    // Capture only. Deciding here whether the editor is *gone* cannot work, whatever the
+    // predicate: this runs before the rebuild, and eviction updates _decodedLog before the render
+    // it triggers - so at this moment the device can already be out of the log while its old
+    // input is still in the DOM. A test on _decodedLog is therefore evaluated at exactly the point
+    // where "gone" and "mid-rebuild" are indistinguishable. Invalidation happens after the
+    // rebuild instead, where the absence of an input is unambiguous - see
+    // _reconcileAliasEditorPresence.
+    if (!input) return;
     this._aliasDraft = input.value;
     this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
     this._aliasHadFocus = input.getRootNode().activeElement === input;
   }
 
+  // Run after the log's markup has been rebuilt, where "no input exists for _editingAlias" can
+  // only mean the editor is genuinely gone - the device was evicted by the log cap, cleared, or
+  // filtered out. Mid-rebuild is not a reachable state here, so no heuristic is needed.
+  //
+  // Focus ownership is dropped but the draft is kept: eviction from a 50-entry cap is transient
+  // on a busy band, and discarding someone's half-typed name because their sensor briefly fell
+  // off the list would be worse than the stale-focus bug this prevents.
+  _reconcileAliasEditorPresence() {
+    if (!this._editingAlias) return;
+    if (!this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`)) {
+      this._aliasHadFocus = false;
+    }
+  }
+
   _wireDecodedLogControls(el) {
+    this._reconcileAliasEditorPresence();
     el.querySelectorAll("[data-history-device]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const key = btn.dataset.historyDevice;
