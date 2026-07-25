@@ -1010,6 +1010,11 @@ class SdrHubPanel extends HTMLElement {
         // that history indefinitely. Merged rather than adopted - this tab stayed attached and
         // its own in-memory log is not stale, just incomplete.
         this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]));
+        // Re-read state as well: _loadState is the only path that compares the coordinator's
+        // session_id, and resubscribing emits no event carrying it. Without this, a panel coming
+        // back after a full Home Assistant restart kept the battery map it had adopted until the
+        // next 30s poll happened to refresh - or indefinitely while refreshes were failing.
+        this._loadState();
       }
     };
     this._onConnDisconnected = () => {
@@ -1140,15 +1145,6 @@ class SdrHubPanel extends HTMLElement {
           this._trackBarrier("decoded", this._hydrateDecodedLog());
           return;
         }
-        if (msg.kind === "legacy_alert") {
-          // Applied only within the same episode, so a marker delayed past a recovery can't
-          // silence the next one. Local-only, exactly like the transition it refers to.
-          const entry = this._deviceBatteryOk.get(msg.key);
-          if (entry && entry.low && (entry.lowSince ?? entry.ord) === msg.lowSince && !Number.isFinite(entry.alertedAt)) {
-            this._deviceBatteryOk = new Map(this._deviceBatteryOk).set(msg.key, { ...entry, alertedAt: msg.ord });
-          }
-          return;
-        }
         if (msg.kind === "battery_changed") {
           this._trackBarrier("battery", this._hydrateBatteryState());
           return;
@@ -1161,7 +1157,11 @@ class SdrHubPanel extends HTMLElement {
           // so pinning the caches to 0 made this tab's next event stamp expectedGen 0, no-op
           // against the higher stored generation, and lose that first post-reset report. adopt
           // because a reset is authoritative - merging would resurrect what it removed.
+          // Both epochs: a reset is authoritative for both stores, and a battery transition
+          // already waiting on a barrier would otherwise pass its arrival-epoch check and write
+          // a pre-reset entry into the fresh generation, resurrecting what the user just reset.
           this._clearEpoch++;
+          this._batteryEpoch++;
           this._decodedLog = [];
           this._deviceBatteryOk = new Map();
           this._renderDecodedLog();
@@ -1436,17 +1436,16 @@ class SdrHubPanel extends HTMLElement {
   // invalidation, where discarding entries is the entire point.
   _applySettledDecoded(settled) {
     const sameGen = settled.gen === this._decodedLogGen;
-    const convergent = sameGen
-      ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
-      : settled.log;
-    // Legacy (pre-upgrade) entries exist only in this tab's memory and carry no generation, so
-    // an IndexedDB clear can't remove them - they must be dropped explicitly when the generation
-    // advances, or a peer would keep showing history the user explicitly cleared.
-    const legacy = sameGen ? this._decodedLog.filter((e) => !isConvergentEvent(e)) : [];
-    // Convergent events come first: they are the newly-arrived ones, and legacy entries are by
-    // definition older. Putting legacy first meant a full pre-upgrade log pushed every new event
-    // past the cap, freezing the visible feed until reload.
-    this._decodedLog = [...convergent, ...legacy].slice(0, MAX_DECODED_LOG);
+    // A generation change observed here means some tab cleared or reset. Recorded as an epoch
+    // bump so an event already waiting on a barrier can tell that a clear happened: with barriers
+    // aggregating, that event's post-wait generation read would otherwise match and the
+    // clearedOrd boundary would be skipped, writing it back into the log the clear emptied.
+    // Hydration is the only place a peer's clear becomes visible, so it has to mark it.
+    if (!sameGen) this._clearEpoch++;
+    this._decodedLog = (sameGen ? mergeDecodedLog(this._decodedLog, settled.log) : settled.log).slice(
+      0,
+      MAX_DECODED_LOG,
+    );
     this._decodedLogGen = settled.gen;
     this._renderDecodedLog();
   }
@@ -1562,25 +1561,33 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
+  // One-shot notice that the add-on predates server-assigned event identity. Shown once per
+  // panel session rather than per event, since an outdated add-on emits these continuously.
+  _noteOutdatedAddon() {
+    if (this._outdatedAddonNoticeShown) return;
+    this._outdatedAddonNoticeShown = true;
+    this._showError(
+      "The SDR Hub add-on is out of date: decoded events arrive without a server-assigned id, " +
+        "so the decoded log and low-battery alerts are disabled. Update the add-on to re-enable them.",
+    );
+  }
+
   async _persistDecodedEvent(event) {
     const seenOrder = eventOrder(event);
     if (Number.isFinite(seenOrder)) this._maxSeenOrd = Math.max(this._maxSeenOrd ?? 0, seenOrder);
-    // Pre-add-on-upgrade events have no shared identity to converge on - show them in this tab
-    // (so a newer panel against an older add-on still works) but never persist them, since a
-    // fabricated client-side id would duplicate the same decode once per open tab.
+    // Events without a server-assigned id and order are ignored outright. Every cross-tab
+    // guarantee in this panel - dedup, ordering, clear boundaries, episode identity - is built on
+    // that identity, so a client-fabricated substitute does not degrade gracefully: it diverges
+    // silently between tabs. Surfacing an explicit "update the add-on" notice is honest about
+    // the requirement, where a half-working local-only view was not.
     if (!isConvergentEvent(event)) {
-      this._decodedLog = [event, ...this._decodedLog].slice(0, MAX_DECODED_LOG);
-      this._renderDecodedLog();
+      this._noteOutdatedAddon();
       return;
     }
     // Legacy (non-convergent) entries from an older add-on are kept in the local view - they
     // only need excluding from *persistence*, and dropping them here would blank the visible
     // history the moment the add-on is upgraded mid-session.
-    const legacy = this._decodedLog.filter((e) => !isConvergentEvent(e));
-    this._decodedLog = [...mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event]), ...legacy].slice(
-      0,
-      MAX_DECODED_LOG,
-    );
+    this._decodedLog = mergeDecodedLog(this._decodedLog, [event]).slice(0, MAX_DECODED_LOG);
     this._renderDecodedLog();
     // Read *after* hydration settles. The optimistic render above is deliberately kept ahead of
     // it so the card still appears immediately; only the generation the write is stamped with
@@ -1747,31 +1754,10 @@ class SdrHubPanel extends HTMLElement {
     // a lagging tab's earlier event could be stamped later than another tab's subsequent
     // recovery and overwrite it, pinning a low-battery warning that nothing would clear.
     if (!isConvergentEvent(event)) {
-      // Waited on even though nothing is persisted: an adopting hydration in flight (first load,
-      // reattach, HA reconnect) replaces _deviceBatteryOk wholesale with its snapshot, and since
-      // this branch deliberately never writes, the report would simply vanish until the device
-      // transmitted again.
-      await this._awaitBarrier("battery");
-      // Forced strictly increasing. Date.now() has millisecond resolution, so two legacy reports
-      // in the same millisecond produced equal orders and the LWW merge rejected the second as
-      // not-newer - a recovery immediately followed by a low would leave the recovery standing
-      // and never alert. Only ever local, so a per-tab counter is sufficient here.
-      const localOrd = Math.max(Number.isFinite(ord) ? ord : Date.now(), (this._lastLegacyOrd ?? 0) + 1);
-      this._lastLegacyOrd = localOrd;
-      const localBase = { ...base, ord: localOrd };
-      this._deviceBatteryOk = mergeBatteryLowState(
-        this._deviceBatteryOk,
-        new Map([[key, withEpisode(localBase, this._deviceBatteryOk.get(key))]]),
-        this._batteryEvicted,
-      ).map;
-      this._renderBatteryAlerts();
-      // The same first-low alert decision the convergent path makes below, against this tab's own
-      // map. Returning early without it meant an enabled sound preference produced no tone at all
-      // for any legacy low-battery transition - the banner updated silently.
-      const localWinner = this._deviceBatteryOk.get(key);
-      if (localWinner && localWinner.low && localWinner.ord === localOrd && !Number.isFinite(localWinner.alertedAt)) {
-        this._maybePlayLeaderAlert(key, localOrd, { local: true });
-      }
+      // Same requirement as the decoded log: no server order means no way to reconcile this
+      // against another tab's view, and the previous local-only handling produced episode
+      // identities, alert markers and orderings that were per-tab by construction.
+      this._noteOutdatedAddon();
       return;
     }
     const applied = await this._applyBatteryTransition(key, base);
@@ -1862,23 +1848,11 @@ class SdrHubPanel extends HTMLElement {
   // Recording alertedAt is done here, by the winning tab only, rather than in the shared state
   // write - that separation is what keeps a silent tab's state update from marking a transition
   // as already-alerted.
-  _maybePlayLeaderAlert(key, ord, { local = false } = {}) {
+  _maybePlayLeaderAlert(key, ord) {
     if (!this._canPlayAlertSound()) return;
     if (!this._claimSoundLeadership()) return;
     const entry = this._deviceBatteryOk.get(key);
-    if (entry && local) {
-      // Legacy events carry no server order and are deliberately never persisted, so the marker
-      // stays in this tab's map. Writing it through _applyBatteryTransition would push exactly
-      // the unordered entry into shared state that the legacy branch exists to keep out. Sound
-      // leadership is still honoured, so multiple open tabs don't each beep for the same report.
-      this._deviceBatteryOk = new Map(this._deviceBatteryOk).set(key, { ...entry, alertedAt: ord });
-      // Announced to peers so followers record it too. Only the leader beeps, so only the leader
-      // was marking the episode alerted; if that tab then closed or lost its lease, the next
-      // repeat report let a follower claim leadership and beep again with no recovery in between.
-      // Carried over BroadcastChannel rather than IndexedDB - the entry is unordered and must
-      // stay out of shared state, but the marker still needs to reach every tab.
-      this._postSync({ kind: "legacy_alert", key, ord, lowSince: entry.lowSince ?? entry.ord });
-    } else if (entry) {
+    if (entry) {
       // Routed through the state leader like any other mutation rather than written directly.
       // The sound leader and the state leader are different roles and can be different tabs, so
       // writing this tab's whole (possibly lagging) map here would bypass the single-writer
