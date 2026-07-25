@@ -212,16 +212,6 @@ async function idbGet(key) {
   });
 }
 
-async function idbDelete(keys) {
-  const db = await openIdb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    const store = tx.objectStore(IDB_STORE);
-    for (const k of keys) store.delete(k);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
 
 // Normalizes whatever came out of the store into the shapes the merge helpers expect. Guards the
 // same corrupt/hand-edited cases the localStorage loaders did.
@@ -496,12 +486,18 @@ function mergeBatteryLowState(current, incoming) {
       // single transmission, rather than once when it first went low.
       const keepAlerted = existing && existing.low && entry.low ? existing.alertedAt : undefined;
       out.set(key, keepAlerted !== undefined ? { ...entry, alertedAt: keepAlerted } : entry);
-    } else if (entry.ord === existing.ord && Number.isFinite(entry.alertedAt) && !Number.isFinite(existing.alertedAt)) {
-      // Same transition, but the incoming copy is marked as alerted and this one isn't - that's
-      // the sound leader's marker propagating. The greater-than test above rejects it (equal
-      // ord), so without adopting it here a tab holding the unmarked copy would carry no marker
-      // into the next low->low refresh and re-play the alert once the original leader closed,
-      // even though the device never recovered.
+    } else if (
+      Number.isFinite(entry.alertedAt) &&
+      existing.low &&
+      entry.low &&
+      !(Number.isFinite(existing.alertedAt) && existing.alertedAt >= entry.alertedAt)
+    ) {
+      // The incoming copy carries an alert marker this one lacks (or a newer one) - the sound
+      // leader's marker propagating. Deliberately *not* gated on equal ord: the leader writes
+      // the marker without awaiting, so a repeat low with a newer ord can commit first, and an
+      // ord-gated adoption would then reject the marker entirely. The device is still in the
+      // same low episode either way, so keep the newer state and carry the marker onto it -
+      // otherwise the episode looks unalerted once that leader closes and another tab beeps again.
       out.set(key, { ...existing, alertedAt: entry.alertedAt });
     }
   }
@@ -1289,12 +1285,18 @@ class SdrHubPanel extends HTMLElement {
   // permanently if the write failed. A generation change is the exception: that means a clear or
   // invalidation, where discarding entries is the entire point.
   _applySettledDecoded(settled) {
-    const legacy = this._decodedLog.filter((e) => !isConvergentEvent(e));
-    const convergent =
-      settled.gen === this._decodedLogGen
-        ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
-        : settled.log;
-    this._decodedLog = [...legacy, ...convergent].slice(0, MAX_DECODED_LOG);
+    const sameGen = settled.gen === this._decodedLogGen;
+    const convergent = sameGen
+      ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
+      : settled.log;
+    // Legacy (pre-upgrade) entries exist only in this tab's memory and carry no generation, so
+    // an IndexedDB clear can't remove them - they must be dropped explicitly when the generation
+    // advances, or a peer would keep showing history the user explicitly cleared.
+    const legacy = sameGen ? this._decodedLog.filter((e) => !isConvergentEvent(e)) : [];
+    // Convergent events come first: they are the newly-arrived ones, and legacy entries are by
+    // definition older. Putting legacy first meant a full pre-upgrade log pushed every new event
+    // past the cap, freezing the visible feed until reload.
+    this._decodedLog = [...convergent, ...legacy].slice(0, MAX_DECODED_LOG);
     this._decodedLogGen = settled.gen;
     this._renderDecodedLog();
   }
@@ -1340,7 +1342,7 @@ class SdrHubPanel extends HTMLElement {
     // only need excluding from *persistence*, and dropping them here would blank the visible
     // history the moment the add-on is upgraded mid-session.
     const legacy = this._decodedLog.filter((e) => !isConvergentEvent(e));
-    this._decodedLog = [...legacy, ...mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event])].slice(
+    this._decodedLog = [...mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event]), ...legacy].slice(
       0,
       MAX_DECODED_LOG,
     );
@@ -1834,11 +1836,18 @@ class SdrHubPanel extends HTMLElement {
         // Unavailable storage - nothing to clear.
       }
     }
-    // Awaited, not fired-and-forgotten: the reload can tear the page down before the delete
-    // transaction commits - especially as idbDelete first yields at `await openIdb()` - which
-    // would leave the log and battery map that Reset was supposed to clear intact on next load.
+    // Awaited, not fired-and-forgotten: the reload can tear the page down before the
+    // transaction commits - it first yields at `await openIdb()` - which would leave the log and
+    // battery map that Reset was supposed to clear intact on the next load.
     try {
-      await idbDelete([IDB_KEY_BATTERY, IDB_KEY_DECODED]);
+      // Deliberately *not* a delete. Deleting returns both records to an absent state that
+      // normalizes to generation 0 - indistinguishable from a fresh install - so a mutation
+      // already awaiting IndexedDB in another tab would commit afterwards, read generation 0,
+      // and recreate exactly the state the reset removed. Writing an empty record at an advanced
+      // generation is durable and observable: a pending mutation sees the higher generation and
+      // its result is discarded, and peers hydrate into a replace rather than a merge.
+      await idbMutate(IDB_KEY_DECODED, (raw) => ({ gen: normalizeDecodedRecord(raw).gen + 1, entries: [] }));
+      await idbMutate(IDB_KEY_BATTERY, (raw) => serializeBatteryRecord(normalizeBatteryRecord(raw).gen + 1, new Map()));
     } catch {
       // No usable store - nothing persisted to clear.
     }
