@@ -1690,6 +1690,16 @@ class SdrHubPanel extends HTMLElement {
       for (const entry of this._sweepResizeObservers.values()) entry.observer.disconnect();
       this._sweepResizeObservers.clear();
     }
+    // Cleared with them. _renderSweeps skips its rebuild when the sweep id set is unchanged, and
+    // that rebuild is the only path that re-registers observers - so tearing them down while
+    // leaving the memo key intact meant a reattached panel never got them back. The axis then
+    // stopped following sidebar, rotation and window resizes until some later row forced a
+    // rebuild, which for a stopped or errored sweep never comes.
+    //
+    // Invalidating the cache that gates recreation belongs with the teardown itself; the two are
+    // one operation, and separating them is what made this reachable at all.
+    this._renderedSweepIdsKey = null;
+    this._renderedSweepStatusKey = null;
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
@@ -4026,11 +4036,16 @@ class SdrHubPanel extends HTMLElement {
     for (let i = 0; i < ticks; i++) {
       const frac = ticks === 1 ? 0 : i / (ticks - 1);
       const hz = sweep.start_hz + span * frac;
+      // Same convention as the exported ruler. On screen the sweep heading a few pixels above
+      // already shows the unit, so this is latent rather than a live defect - but the axis should
+      // not depend on a sibling element for its meaning, and the two rulers reading differently
+      // would be its own small confusion.
+      const unit = i === ticks - 1 ? " MHz" : "";
       // The first and last labels are pulled inside the bounds rather than centred, so neither
       // is clipped by the card edge.
       const align = i === 0 ? "left:0;text-align:left;" : i === ticks - 1 ? "right:0;text-align:right;" : `left:${(frac * 100).toFixed(2)}%;transform:translateX(-50%);`;
       parts.push(
-        `<span style="position:absolute;top:0;${align}white-space:nowrap;">${esc(fmtMHz(hz))}</span>` +
+        `<span style="position:absolute;top:0;${align}white-space:nowrap;">${esc(fmtMHz(hz) + unit)}</span>` +
           `<span style="position:absolute;top:-3px;left:${(frac * 100).toFixed(2)}%;width:1px;height:3px;background:var(--divider-color,#e0e0e0);"></span>`,
       );
     }
@@ -4539,7 +4554,16 @@ class SdrHubPanel extends HTMLElement {
       const x = frac * out.width;
       ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), drawnHeight, 1, 3);
       if (!drawLabels) continue;
-      const label = fmtMHz(sweep.start_hz + span * frac);
+      // The unit rides on the last label. fmtMHz returns a bare number and every other call site
+      // appends " MHz" itself, but this one is a standalone artifact: the sweep heading that
+      // supplies the unit on screen does not travel with the PNG, and the filename carries only
+      // the sweep id. Labelling the final tick is the usual axis convention and avoids repeating
+      // the unit across every tick in a strip this short.
+      //
+      // This is the same critique that created this composite one level down - the exported image
+      // could not be located in frequency without outside context, and the ruler added to fix
+      // that inherited the identical dependency.
+      const label = fmtMHz(sweep.start_hz + span * frac) + (i === ticks - 1 ? " MHz" : "");
       const w = ctx.measureText(label).width;
       // Same edge handling as the on-screen axis: the end labels are pulled inside the bounds so
       // neither is clipped by the image border.
