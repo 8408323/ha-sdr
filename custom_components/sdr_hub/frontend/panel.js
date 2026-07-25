@@ -1091,8 +1091,18 @@ class SdrHubPanel extends HTMLElement {
       // path is the one taken when BroadcastChannel is unavailable, so leaving it untracked made
       // the protection depend on which notification mechanism happened to be in use.
       if (ev.key === SYNC_NONCE_KEY) {
-        this._trackBarrier("decoded", this._hydrateDecodedLog());
-        this._trackBarrier("battery", this._hydrateBatteryState());
+        let msg = null;
+        try {
+          msg = JSON.parse(ev.newValue || "null");
+        } catch {
+          // A pre-upgrade peer still writing a bare nonce, or a hand-edited value. Fall back to
+          // the old behaviour of re-reading both stores rather than ignoring the signal.
+        }
+        if (msg && msg.kind) this._handleSyncMessage(msg);
+        else {
+          this._trackBarrier("decoded", this._hydrateDecodedLog());
+          this._trackBarrier("battery", this._hydrateBatteryState());
+        }
         return;
       }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
@@ -1133,49 +1143,83 @@ class SdrHubPanel extends HTMLElement {
     // available in insecure contexts (see BROADCAST_CHANNEL_NAME's comment).
     try {
       this._broadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-      this._broadcastChannel.onmessage = (ev) => {
-        const msg = ev.data;
-        if (!msg) return;
-        // Tracked with the barrier, exactly like initial and reconnect hydration: a peer's clear
-        // or invalidation advances the generation, so an untracked read here leaves a decode
-        // arriving mid-read free to capture the old generation, no-op against the bumped one, and
-        // then lose its optimistic entry when the empty record is applied. If the peer that
-        // cleared has since closed, nothing else would ever persist that event.
-        if (msg.kind === "decoded_changed") {
-          this._trackBarrier("decoded", this._hydrateDecodedLog());
-          return;
-        }
-        if (msg.kind === "battery_changed") {
-          this._trackBarrier("battery", this._hydrateBatteryState());
-          return;
-        }
-        if (msg.kind === "state_reset") {
-          // A peer cleared the IndexedDB-backed state. Its own localStorage removals may have
-          // been no-ops (everything already at defaults), so this is the only signal.
-          // Cleared locally for immediate feedback, then re-read from IndexedDB rather than
-          // left at generation 0. The reset writes empty records at *previous generation + 1*,
-          // so pinning the caches to 0 made this tab's next event stamp expectedGen 0, no-op
-          // against the higher stored generation, and lose that first post-reset report. adopt
-          // because a reset is authoritative - merging would resurrect what it removed.
-          // Both epochs: a reset is authoritative for both stores, and a battery transition
-          // already waiting on a barrier would otherwise pass its arrival-epoch check and write
-          // a pre-reset entry into the fresh generation, resurrecting what the user just reset.
-          this._clearEpoch++;
-          this._batteryEpoch++;
-          this._decodedLog = [];
-          this._deviceBatteryOk = new Map();
-          this._renderDecodedLog();
-          this._renderBatteryAlerts();
-          this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState({ adopt: true })]));
-          return;
-        }
-      };
+      this._broadcastChannel.onmessage = (ev) => this._handleSyncMessage(ev.data);
     } catch {
       // No BroadcastChannel (very old browser). _postSync falls back to bumping a localStorage
       // nonce, which does emit a storage event peers can act on - the earlier claim that the
       // storage handler already covered this was wrong once the state moved to IndexedDB, since
       // nothing in localStorage changes on a clear any more.
       this._broadcastChannel = null;
+    }
+  }
+
+  // Shared by both transports. The BroadcastChannel path and the localStorage fallback must
+  // apply identical handling: reducing the fallback to a generic "something changed" hydration
+  // lost the *kind*, so a reset arrived as an ordinary re-read that advanced neither epoch, and a
+  // pre-reset transition waiting on a barrier could follow it and write into the reset
+  // generation - resurrecting exactly what Reset removed, but only in browsers without
+  // BroadcastChannel.
+  _handleSyncMessage(msg) {
+    if (!msg) return;
+    // Tracked with the barrier, exactly like initial and reconnect hydration: a peer's clear
+    // or invalidation advances the generation, so an untracked read here leaves a decode
+    // arriving mid-read free to capture the old generation, no-op against the bumped one, and
+    // then lose its optimistic entry when the empty record is applied. If the peer that
+    // cleared has since closed, nothing else would ever persist that event.
+    if (msg.kind === "decoded_changed") {
+      this._trackBarrier("decoded", this._hydrateDecodedLog());
+      return;
+    }
+    if (msg.kind === "battery_changed") {
+      this._trackBarrier("battery", this._hydrateBatteryState());
+      return;
+    }
+    if (msg.kind === "state_reset") {
+      // A peer cleared the IndexedDB-backed state. Its own localStorage removals may have been
+      // no-ops (everything already at defaults), so this is the only signal. Cleared locally for
+      // immediate feedback, then re-read from IndexedDB rather than left at generation 0 - the
+      // reset writes empty records at *previous generation + 1*, so pinning the caches to 0 made
+      // the next event stamp expectedGen 0 and lose that first post-reset report. Both epochs
+      // advance: a reset is authoritative for both stores, and a battery transition already
+      // waiting on a barrier would otherwise pass its arrival-epoch check and write a pre-reset
+      // entry into the fresh generation.
+      this._clearEpoch++;
+      this._batteryEpoch++;
+      this._decodedLog = [];
+      this._deviceBatteryOk = new Map();
+      this._renderDecodedLog();
+      this._renderBatteryAlerts();
+      this._hydrated = this._trackBarrier(
+        "both",
+        Promise.all([this._hydrateDecodedLog(), this._hydrateBatteryState({ adopt: true })]),
+      );
+    }
+  }
+
+  // Re-reads every persisted preference this element caches in memory. Used on reattach, where
+  // the storage listener was torn down and change notifications were therefore missed.
+  _reconcilePreferences() {
+    const hadShell = !!this.querySelector("#sdr-hub-root");
+    const previousColormap = this._colormap;
+    const previousMin = this._dbMin;
+    const previousMax = this._dbMax;
+    this._batterySoundEnabled = loadBatterySoundEnabled();
+    this._decodedTimeMode = loadDecodedTimeMode();
+    this._favoriteDevices = loadFavoriteDevices();
+    this._colormap = loadColormap();
+    const dbRange = loadDbRange();
+    this._dbMin = dbRange ? dbRange.min : WATERFALL_MIN_DB;
+    this._dbMax = dbRange ? dbRange.max : WATERFALL_MAX_DB;
+    if (!hadShell) return;
+    // Keep the visible controls in step with what was just re-read, and repaint the waterfall
+    // only when something it actually depends on changed.
+    const soundToggle = this.querySelector("#sdr-hub-battery-sound-toggle");
+    if (soundToggle) soundToggle.checked = this._batterySoundEnabled;
+    const timeToggle = this.querySelector("#sdr-hub-decoded-time-toggle");
+    if (timeToggle) timeToggle.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
+    this._renderDecodedLog();
+    if (previousColormap !== this._colormap || previousMin !== this._dbMin || previousMax !== this._dbMax) {
+      this._renderSweeps(true);
     }
   }
 
@@ -1189,8 +1233,14 @@ class SdrHubPanel extends HTMLElement {
       // Channel closed mid-teardown - fall through to the nonce below.
     }
     try {
-      // No channel: bump a nonce so peers get a storage event and re-read from IndexedDB.
-      localStorage.setItem(SYNC_NONCE_KEY, `${Date.now()}-${Math.random()}`);
+      // No channel: write the whole message, not just a nonce. Peers get a storage event and
+      // apply it through the same handler, so a reset stays a reset instead of degrading into a
+      // generic re-read. The nonce is kept inside the payload so two identical messages still
+      // differ and reliably fire the event.
+      localStorage.setItem(
+        SYNC_NONCE_KEY,
+        JSON.stringify({ ...message, _nonce: `${Date.now()}-${Math.random()}` }),
+      );
     } catch {
       // Nothing left to notify with; peers reconcile on their next reattach or event.
     }
@@ -1198,6 +1248,12 @@ class SdrHubPanel extends HTMLElement {
 
   connectedCallback() {
     if (!this._hass) return;
+    // Re-read the shared preferences before reusing an existing shell. disconnectedCallback
+    // removes the storage listener, so anything another tab changed while this element was
+    // detached was never observed - leaving a tab that keeps playing alerts after sound was
+    // disabled elsewhere, stays silent after it was enabled, or shows a colormap/range another
+    // tab has since reset, until the page is manually reloaded.
+    this._reconcilePreferences();
     if (!this.querySelector("#sdr-hub-root")) this._renderShell();
     // hass's own "first assignment" branch only fires once ever, but HA can detach and
     // reattach this same element (e.g. navigating away and back) without recreating it —
