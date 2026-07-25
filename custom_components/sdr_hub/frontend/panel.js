@@ -1213,6 +1213,8 @@ class SdrHubPanel extends HTMLElement {
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
     this._deviceBatteryOk = new Map();
     this._maxSeenOrd = 0;
+    // Monotonic counter identifying the currently displayed error - see _showError.
+    this._errorEpoch = 0;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
     // from "an invalidation ran while I waited" - the generation alone cannot, since after the
@@ -1684,6 +1686,10 @@ class SdrHubPanel extends HTMLElement {
     this._aliasComposing = false;
     this._decodedRenderDeferred = false;
     this._aliasHadFocus = false;
+    if (this._sweepResizeObservers) {
+      for (const entry of this._sweepResizeObservers.values()) entry.observer.disconnect();
+      this._sweepResizeObservers.clear();
+    }
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
@@ -2021,11 +2027,20 @@ class SdrHubPanel extends HTMLElement {
     // duplicating it - the fixed ones hold the *alias* and the *event* timestamp, which are not
     // the same data. Such a field is emitted under a "device_" prefix instead of being discarded,
     // since a decoder emitting either is losing real information otherwise.
+    // Headers are made unique against everything already claimed, not just against the fixed
+    // list. A device carrying both `name` and `device_name` would otherwise produce two columns
+    // headed device_name, which a header-based importer resolves arbitrarily - one prefix pass is
+    // not collision-free on its own.
+    const taken = new Set(fixed);
+    const uniqueHeader = (key) => {
+      let header = fixed.includes(key) ? `device_${key}` : key;
+      while (taken.has(header)) header = `device_${header}`;
+      taken.add(header);
+      return header;
+    };
     const columnDefs = [
       ...fixed.map((header) => ({ header, fixed: true, key: header })),
-      ...[...extras]
-        .sort()
-        .map((key) => ({ header: fixed.includes(key) ? `device_${key}` : key, fixed: false, key })),
+      ...[...extras].sort().map((key) => ({ header: uniqueHeader(key), fixed: false, key })),
     ];
     const columns = columnDefs.map((c) => c.header);
     const rows = [columns.map((c) => this._csvCell(c)).join(",")];
@@ -2467,6 +2482,13 @@ class SdrHubPanel extends HTMLElement {
     releaseLeadership(SOUND_LEADER_KEY, this._tabId);
   }
 
+  // Clears the banner only if nothing newer has been displayed since `epoch` was captured. Async
+  // success paths use this instead of _showError("") so a slow clipboard or image save cannot wipe
+  // out an error raised by a different action while it was pending.
+  _clearErrorIfCurrent(epoch) {
+    if ((this._errorEpoch || 0) === epoch) this._showError("");
+  }
+
   _showError(message, { isLoadError = false } = {}) {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
@@ -2476,6 +2498,12 @@ class SdrHubPanel extends HTMLElement {
     // out the next time a background state refresh happens to succeed, even though the user
     // still needs to see it. Whichever call to _showError ran most recently determines this.
     this._loadStateErrorShowing = isLoadError && !!message;
+    // Bumped on every *display*, so an async operation can tell whether the banner it is about to
+    // clear is still its own. Synchronous handlers clear and act in one tick and cannot be
+    // interleaved, but clipboard writes await a permission prompt and toBlob runs in a callback -
+    // an unrelated failure can appear in between, and an unconditional clear would erase a newer,
+    // still-relevant message. See _errorEpoch's readers.
+    if (message) this._errorEpoch = (this._errorEpoch || 0) + 1;
     el.textContent = message;
     el.style.display = message ? "block" : "none";
   }
@@ -3241,6 +3269,7 @@ class SdrHubPanel extends HTMLElement {
       </div>`;
       })
       .join("");
+    this._pruneSweepResizeObservers();
     for (const s of this._state.sweeps) {
       this._wireConfirmButton(el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`), () =>
         this._onRemoveSweep(s.id),
@@ -3978,6 +4007,12 @@ class SdrHubPanel extends HTMLElement {
       axisEl.style.marginLeft = `${Math.max(0, canvasBox.left - axisBox.left)}px`;
       axisEl.style.width = `${width}px`;
     }
+    // Pinning the width fixed the scrollbar offset but gave up the fluidity the old
+    // axisEl.clientWidth measurement had for free: the canvas still follows its container via
+    // width:100%, so toggling HA's sidebar, rotating a device or resizing the window moved the
+    // waterfall while the ticks stayed put - until the next row arrived, which for a slow or
+    // errored sweep is never. An observer restores what the substituted mechanism used to provide.
+    this._observeSweepResize(sweepId, canvas);
     // ~90px per label keeps them from colliding at the smallest widths the card reaches.
     const ticks = Math.max(2, Math.min(6, Math.floor(width / 90)));
     const span = sweep.stop_hz - sweep.start_hz;
@@ -3994,6 +4029,32 @@ class SdrHubPanel extends HTMLElement {
       );
     }
     axisEl.innerHTML = parts.join("");
+  }
+
+  // One ResizeObserver per sweep canvas, re-registered idempotently. Observes the canvas rather
+  // than the axis, since the canvas is the element whose width the ticks must match.
+  _observeSweepResize(sweepId, canvas) {
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    this._sweepResizeObservers ??= new Map();
+    const existing = this._sweepResizeObservers.get(sweepId);
+    if (existing && existing.canvas === canvas) return;
+    if (existing) existing.observer.disconnect();
+    const observer = new ResizeObserver(() => this._renderFrequencyAxis(sweepId));
+    observer.observe(canvas);
+    this._sweepResizeObservers.set(sweepId, { observer, canvas });
+  }
+
+  // Disconnects observers for sweeps that no longer exist, so a removed sweep's observer does not
+  // outlive its canvas and keep the element alive.
+  _pruneSweepResizeObservers() {
+    if (!this._sweepResizeObservers) return;
+    const live = new Set((this._state.sweeps || []).map((s) => s.id));
+    for (const [id, entry] of this._sweepResizeObservers) {
+      if (!live.has(id)) {
+        entry.observer.disconnect();
+        this._sweepResizeObservers.delete(id);
+      }
+    }
   }
 
   _renderTimeAxis(sweepId) {
@@ -4329,6 +4390,8 @@ class SdrHubPanel extends HTMLElement {
     button.addEventListener("click", async () => {
       const original = button.textContent;
       const text = textFn();
+      // Captured before the await below - see _clearErrorIfCurrent.
+      const errorEpoch = this._errorEpoch || 0;
       try {
         // navigator.clipboard requires a secure context (HTTPS or localhost) - it's simply
         // undefined otherwise, which is exactly the case for the plain-HTTP HA installs this
@@ -4340,10 +4403,10 @@ class SdrHubPanel extends HTMLElement {
         } else if (!this._copyViaExecCommand(text)) {
           throw new Error("Clipboard access unavailable in this browser context");
         }
-        // Completes the stale-banner sweep. Weaker than the other cases since the button gives
-        // its own feedback, but a previous copy failure otherwise stays on screen contradicting
-        // the "Copied!" right beside it.
-        this._showError("");
+        // Completes the stale-banner sweep. Conditional rather than unconditional: this runs after
+        // an await, so an unrelated action may have raised a newer error while the permission
+        // prompt was open, and clearing that would hide something the user still needs.
+        this._clearErrorIfCurrent(errorEpoch);
         button.textContent = "Copied!";
       } catch (err) {
         this._showError(`Could not copy to clipboard: ${err.message || err}`);
@@ -4389,14 +4452,16 @@ class SdrHubPanel extends HTMLElement {
     // Composited here rather than drawn into the live canvas: the canvas is the pixel history and
     // gets shifted, resized and blitted, so permanent furniture in it would scroll away.
     const composited = this._compositeSweepImage(sweepId, canvas);
+    // Captured before toBlob's callback - same asynchronous ordering problem as the clipboard.
+    const errorEpoch = this._errorEpoch || 0;
     (composited || canvas).toBlob((blob) => {
       if (!blob) {
         this._showError("Could not save image: canvas produced no data");
         return;
       }
-      // Same stale-banner class as the CSV export and the Auto contrast handler - swept here
-      // together rather than one per review round.
-      this._showError("");
+      // Same stale-banner class as the CSV export and the Auto contrast handler, but conditional:
+      // toBlob is asynchronous, so an unrelated failure may have been raised since.
+      this._clearErrorIfCurrent(errorEpoch);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -4415,9 +4480,24 @@ class SdrHubPanel extends HTMLElement {
     const sweep = (this._state.sweeps || []).find((s) => s.id === sweepId);
     if (!sweep || !Number.isFinite(sweep.start_hz) || !Number.isFinite(sweep.stop_hz)) return null;
     const axisHeight = 18;
+    // The source canvas may already be sitting exactly on a cap: scrollRowCapForWidth returns
+    // min(MAX_CANVAS_HEIGHT_PX, memoryCap, areaCap), so when the area cap binds,
+    // width x height *equals* MAX_CANVAS_AREA_PX and any added row overflows it. Growing blindly
+    // produced a canvas the browser may refuse - getContext, drawing or toBlob can fail - so Save
+    // image would report no data or silently drop the ruler on exactly the longest histories.
+    //
+    // The ruler is worth more than the oldest few rows of a scrollback that is already thousands
+    // deep, so when there is no headroom the waterfall is cropped from the top by the strip's
+    // height rather than the export being abandoned.
+    const heightBudget = Math.min(MAX_CANVAS_HEIGHT_PX, Math.floor(MAX_CANVAS_AREA_PX / Math.max(1, canvas.width)));
+    const outHeight = Math.min(canvas.height + axisHeight, heightBudget);
+    const drawnHeight = outHeight - axisHeight;
+    // No room for even the strip - fall back to the bare waterfall rather than export a sliver.
+    if (drawnHeight <= 0) return null;
+    const sourceY = Math.max(0, canvas.height - drawnHeight);
     const out = document.createElement("canvas");
     out.width = canvas.width;
-    out.height = canvas.height + axisHeight;
+    out.height = outHeight;
     const ctx = out.getContext("2d");
     if (!ctx) return null;
     ctx.font = "10px sans-serif";
@@ -4441,21 +4521,23 @@ class SdrHubPanel extends HTMLElement {
     // strongest signal, so missing capture data would have exported as maximum signal. Leaving the
     // waterfall region transparent keeps "no data" distinguishable in the PNG, which is the whole
     // point of issue #16's fix.
-    ctx.drawImage(canvas, 0, 0);
+    // Cropped from the top (oldest rows) when the budget bound, so the newest history - the part
+    // a user is looking at - always survives.
+    ctx.drawImage(canvas, 0, sourceY, canvas.width, drawnHeight, 0, 0, canvas.width, drawnHeight);
     ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, canvas.height, out.width, axisHeight);
+    ctx.fillRect(0, drawnHeight, out.width, axisHeight);
     ctx.fillStyle = "#000000";
     for (let i = 0; i < ticks; i++) {
       const frac = ticks === 1 ? 0 : i / (ticks - 1);
       const x = frac * out.width;
-      ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), canvas.height, 1, 3);
+      ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), drawnHeight, 1, 3);
       if (!drawLabels) continue;
       const label = fmtMHz(sweep.start_hz + span * frac);
       const w = ctx.measureText(label).width;
       // Same edge handling as the on-screen axis: the end labels are pulled inside the bounds so
       // neither is clipped by the image border.
       const tx = i === 0 ? 0 : i === ticks - 1 ? out.width - w : x - w / 2;
-      ctx.fillText(label, Math.min(out.width - w, Math.max(0, tx)), canvas.height + 4);
+      ctx.fillText(label, Math.min(out.width - w, Math.max(0, tx)), drawnHeight + 4);
     }
     return out;
   }
