@@ -30,6 +30,13 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass, _LOGGER, config_entry=config_entry, name="sdr_hub", update_interval=UPDATE_INTERVAL
         )
         self.api = api
+        # Identifies *this* coordinator instance. A full Home Assistant restart builds a new one,
+        # so a panel that sees a different id across a reconnect knows the add-on event stream was
+        # interrupted for every tab - not just its own socket. Without that distinction the panel
+        # treated a global restart as a tab-local drop and adopted a peer's persisted battery map,
+        # even though no peer could have stayed connected either, so a recovery transmitted during
+        # the restart could leave a low-battery banner asserted indefinitely.
+        self.session_id = uuid.uuid4().hex
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
         self._suppress_broadcast_count = 0

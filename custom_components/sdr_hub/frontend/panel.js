@@ -903,6 +903,11 @@ class SdrHubPanel extends HTMLElement {
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
     this._deviceBatteryOk = new Map();
     this._maxSeenOrd = 0;
+    // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
+    // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
+    // from "an invalidation ran while I waited" - the generation alone cannot, since after the
+    // wait it already reads the post-invalidation value.
+    this._batteryEpoch = 0;
     this._batteryGen = 0;
     // Per-key evicted-tombstone knowledge, mirrored from the durable record (see mergeEvicted).
     this._batteryEvicted = new Map();
@@ -1135,6 +1140,15 @@ class SdrHubPanel extends HTMLElement {
           this._trackBarrier("decoded", this._hydrateDecodedLog());
           return;
         }
+        if (msg.kind === "legacy_alert") {
+          // Applied only within the same episode, so a marker delayed past a recovery can't
+          // silence the next one. Local-only, exactly like the transition it refers to.
+          const entry = this._deviceBatteryOk.get(msg.key);
+          if (entry && entry.low && (entry.lowSince ?? entry.ord) === msg.lowSince && !Number.isFinite(entry.alertedAt)) {
+            this._deviceBatteryOk = new Map(this._deviceBatteryOk).set(msg.key, { ...entry, alertedAt: msg.ord });
+          }
+          return;
+        }
         if (msg.kind === "battery_changed") {
           this._trackBarrier("battery", this._hydrateBatteryState());
           return;
@@ -1338,6 +1352,18 @@ class SdrHubPanel extends HTMLElement {
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
     // action error isn't wiped out just because this background refresh happened to succeed.
     if (this._loadStateErrorShowing) this._showError("");
+    // A different coordinator session means Home Assistant restarted, so the add-on event stream
+    // was interrupted for *every* tab - not just this one's socket. The reconnect path otherwise
+    // treats the loss as tab-local and adopts the shared battery map from a peer that could not
+    // have stayed connected either, so a recovery transmitted during the restart could leave a
+    // low-battery banner asserted indefinitely if the device then went quiet. Keyed on the
+    // session id so all tabs converge on handling it exactly once, like a stream gap.
+    if (state.session_id) {
+      if (this._coordinatorSession && this._coordinatorSession !== state.session_id) {
+        this._invalidateBatteryState(`session:${state.session_id}`);
+      }
+      this._coordinatorSession = state.session_id;
+    }
     this._state = state;
     this._renderDongles();
     this._renderCoverage();
@@ -1504,6 +1530,12 @@ class SdrHubPanel extends HTMLElement {
   // transaction, so a decode being persisted concurrently either lands before the bump (and is
   // discarded with the old generation) or after it (and is kept) - never half-applied.
   async _runDecodedClear(previous) {
+    // Bumped here rather than only in the click handler, synchronously before any await. Leaving
+    // it to the caller meant the epoch signal depended on who initiated the clear, so a clear
+    // reached by any other path left in-flight events unable to tell a clear had happened - and
+    // with barriers aggregating, their post-wait generation read matches and the boundary check
+    // is skipped, writing them back into the log the clear just emptied.
+    this._clearEpoch++;
     if (previous) await previous;
     try {
       const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
@@ -1553,8 +1585,12 @@ class SdrHubPanel extends HTMLElement {
     // Read *after* hydration settles. The optimistic render above is deliberately kept ahead of
     // it so the card still appears immediately; only the generation the write is stamped with
     // has to wait, since a generation read before hydration is a guess (0) rather than a fact.
+    // Captured BEFORE the wait, for the same reason as the battery path: an aggregated barrier
+    // now carries a clear registered after this event arrived, so afterwards the generation
+    // matches and the boundary check would be skipped - letting an event the clear covered be
+    // written back into the just-cleared log.
+    const arrivalEpoch = this._clearEpoch;
     await this._awaitBarrier("decoded");
-    const epoch = this._clearEpoch;
     const expectedGen = this._decodedLogGen;
     try {
       // The whole get-merge-put happens inside one readwrite transaction, so a concurrent tab
@@ -1572,7 +1608,10 @@ class SdrHubPanel extends HTMLElement {
         // clearedOrd is what separates the two cases: the clear records the highest order its tab
         // had seen, so anything ordered above it post-dates the clear and belongs in the new
         // generation. Anything at or below it is what the user actually asked to remove.
-        if (current.gen !== expectedGen) {
+        // Applied whenever a clear happened at all - either observed as a generation change, or
+        // as an epoch change while this event was waiting. The latter is invisible to the
+        // generation comparison but means the same thing: a clear covered this event.
+        if (current.gen !== expectedGen || arrivalEpoch !== this._clearEpoch) {
           const order = eventOrder(event);
           const boundary = current.clearedOrd;
           if (!Number.isFinite(order) || !Number.isFinite(boundary) || order <= boundary) return undefined;
@@ -1586,10 +1625,12 @@ class SdrHubPanel extends HTMLElement {
         const merged = mergeDecodedLog(current.log, [{ ...convergent, _gen: current.gen }]);
         return { gen: current.gen, clearedOrd: current.clearedOrd, entries: merged };
       });
-      // A clear landed while this was in flight - its result is pre-clear, so applying it would
-      // repopulate exactly what the clear removed.
-      if (epoch !== this._clearEpoch) return;
       const settled = normalizeDecodedRecord(record);
+      // A clear landed while this was in flight. Applying a pre-clear snapshot would repopulate
+      // exactly what the clear removed - unless this event itself survived the boundary check
+      // above, in which case the snapshot legitimately contains it and dropping it would discard
+      // a post-clear event that was correctly written.
+      if (arrivalEpoch !== this._clearEpoch && !settled.log.some((e) => e.event_id === event.event_id)) return;
       this._applySettledDecoded(settled);
       this._postSync({ kind: "decoded_changed" });
     } catch {
@@ -1615,6 +1656,9 @@ class SdrHubPanel extends HTMLElement {
   // generation, and was discarded. Chaining is done by handing the previous barrier to the
   // worker instead, which also avoids it awaiting its own promise and deadlocking.
   _invalidateBatteryState(gapId = null) {
+    // Bumped before any await so an already-in-flight transition can detect it, mirroring
+    // _clearEpoch on the decoded side.
+    this._batteryEpoch++;
     this._deviceBatteryOk = new Map();
     this._renderBatteryAlerts();
     const previous = this._barriers.battery;
@@ -1762,9 +1806,13 @@ class SdrHubPanel extends HTMLElement {
     this._deviceBatteryOk = optimistic.map;
     this._batteryEvicted = optimistic.evicted;
     this._renderBatteryAlerts();
-    // See _persistDecodedEvent - the generation is only meaningful once no clear/invalidation
-    // is still in flight.
+    // Captured BEFORE the wait. Since barriers now aggregate, the wait follows an invalidation
+    // registered *after* this transition arrived all the way through, so the generation read
+    // afterwards is the post-invalidation one - and a pre-gap transition would sail into the
+    // freshly cleared generation, recreating exactly the stale banner the gap existed to remove.
+    const arrivalEpoch = this._batteryEpoch;
     await this._awaitBarrier("battery");
+    if (arrivalEpoch !== this._batteryEpoch) return this._deviceBatteryOk;
     const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
@@ -1824,6 +1872,12 @@ class SdrHubPanel extends HTMLElement {
       // the unordered entry into shared state that the legacy branch exists to keep out. Sound
       // leadership is still honoured, so multiple open tabs don't each beep for the same report.
       this._deviceBatteryOk = new Map(this._deviceBatteryOk).set(key, { ...entry, alertedAt: ord });
+      // Announced to peers so followers record it too. Only the leader beeps, so only the leader
+      // was marking the episode alerted; if that tab then closed or lost its lease, the next
+      // repeat report let a follower claim leadership and beep again with no recovery in between.
+      // Carried over BroadcastChannel rather than IndexedDB - the entry is unordered and must
+      // stay out of shared state, but the marker still needs to reach every tab.
+      this._postSync({ kind: "legacy_alert", key, ord, lowSince: entry.lowSince ?? entry.ord });
     } else if (entry) {
       // Routed through the state leader like any other mutation rather than written directly.
       // The sound leader and the state leader are different roles and can be different tabs, so
@@ -2086,9 +2140,6 @@ class SdrHubPanel extends HTMLElement {
       // genuine user action rather than convergent derived state, so it's also announced over
       // BroadcastChannel for tabs to pick up immediately. See DECODED_LOG_GEN_KEY.
       this._decodedLog = [];
-      // Bumped before any await so an already-in-flight persist/hydrate can tell a clear
-      // happened and discard its now-pre-clear result instead of repopulating the list.
-      this._clearEpoch++;
       this._renderDecodedLog();
       // Published as a barrier so a decode arriving after the click waits for the bump. Without
       // it that decode read the pre-clear generation, its transaction (opened second) saw the
