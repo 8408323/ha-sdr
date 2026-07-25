@@ -1708,7 +1708,12 @@ class SdrHubPanel extends HTMLElement {
       // this branch deliberately never writes, the report would simply vanish until the device
       // transmitted again.
       await this._awaitBarrier("battery");
-      const localOrd = Number.isFinite(ord) ? ord : Date.now();
+      // Forced strictly increasing. Date.now() has millisecond resolution, so two legacy reports
+      // in the same millisecond produced equal orders and the LWW merge rejected the second as
+      // not-newer - a recovery immediately followed by a low would leave the recovery standing
+      // and never alert. Only ever local, so a per-tab counter is sufficient here.
+      const localOrd = Math.max(Number.isFinite(ord) ? ord : Date.now(), (this._lastLegacyOrd ?? 0) + 1);
+      this._lastLegacyOrd = localOrd;
       const localBase = { ...base, ord: localOrd };
       this._deviceBatteryOk = mergeBatteryLowState(
         this._deviceBatteryOk,
@@ -1716,6 +1721,13 @@ class SdrHubPanel extends HTMLElement {
         this._batteryEvicted,
       ).map;
       this._renderBatteryAlerts();
+      // The same first-low alert decision the convergent path makes below, against this tab's own
+      // map. Returning early without it meant an enabled sound preference produced no tone at all
+      // for any legacy low-battery transition - the banner updated silently.
+      const localWinner = this._deviceBatteryOk.get(key);
+      if (localWinner && localWinner.low && localWinner.ord === localOrd && !Number.isFinite(localWinner.alertedAt)) {
+        this._maybePlayLeaderAlert(key, localOrd, { local: true });
+      }
       return;
     }
     const applied = await this._applyBatteryTransition(key, base);
@@ -1802,11 +1814,17 @@ class SdrHubPanel extends HTMLElement {
   // Recording alertedAt is done here, by the winning tab only, rather than in the shared state
   // write - that separation is what keeps a silent tab's state update from marking a transition
   // as already-alerted.
-  _maybePlayLeaderAlert(key, ord) {
+  _maybePlayLeaderAlert(key, ord, { local = false } = {}) {
     if (!this._canPlayAlertSound()) return;
     if (!this._claimSoundLeadership()) return;
     const entry = this._deviceBatteryOk.get(key);
-    if (entry) {
+    if (entry && local) {
+      // Legacy events carry no server order and are deliberately never persisted, so the marker
+      // stays in this tab's map. Writing it through _applyBatteryTransition would push exactly
+      // the unordered entry into shared state that the legacy branch exists to keep out. Sound
+      // leadership is still honoured, so multiple open tabs don't each beep for the same report.
+      this._deviceBatteryOk = new Map(this._deviceBatteryOk).set(key, { ...entry, alertedAt: ord });
+    } else if (entry) {
       // Routed through the state leader like any other mutation rather than written directly.
       // The sound leader and the state leader are different roles and can be different tabs, so
       // writing this tab's whole (possibly lagging) map here would bypass the single-writer
