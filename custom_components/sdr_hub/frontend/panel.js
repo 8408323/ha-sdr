@@ -673,16 +673,19 @@ class SdrHubPanel extends HTMLElement {
         location.reload();
         return;
       }
-      // A plain *update* (not removal) to the decoded log specifically - most commonly another
-      // tab's "Clear log" button, which calls saveDecodedLog([]) and so never hits the
-      // newValue === null branch above at all (an empty array is still a value, not a removal).
-      // Without this, that other tab's clear would only reach this tab the next time *this* tab
-      // itself decodes something and overwrites localStorage with its own still-stale in-memory
-      // log - reconstructing the exact history the other tab just cleared. Adopting the new log
-      // directly (rather than a full reload, which would be disruptive for something this
-      // routine) keeps every open tab's decoded log in sync live.
-      if (ev.key === DECODED_LOG_KEY) {
-        this._decodedLog = loadDecodedLog();
+      // Specifically an empty-array write to the decoded log - i.e. another tab's "Clear log"
+      // button, which calls saveDecodedLog([]) and so never hits the newValue === null branch
+      // above at all (an empty array is still a value, not a removal). Deliberately narrower than
+      // "any decoded-log update": every open tab independently subscribes to and receives the
+      // same decoded_device broadcast over its own WebSocket connection, so a *regular* new-entry
+      // write in tab A is already about to happen in tab B too, from B's own copy of the same
+      // event - adopting A's write here as well would race that and double-prepend the same
+      // event into B's in-memory log (then B would persist *that* duplicate, which every tab
+      // including A would in turn adopt). "Clear log" has no such WS-driven counterpart in other
+      // tabs, so it's the one write this needs to actively propagate rather than leave to each
+      // tab's own event stream.
+      if (ev.key === DECODED_LOG_KEY && ev.newValue === "[]") {
+        this._decodedLog = [];
         this._renderDecodedLog();
       }
     };
@@ -879,6 +882,14 @@ class SdrHubPanel extends HTMLElement {
           // after ordinary dashboard navigation. Only an actual battery_ok:true recovery (above)
           // clears the sound-dedup entry.
           const wasAlreadyLow = this._deviceBatterySoundAlerted.has(key);
+          // Delete-then-add (not a plain add on an existing key, which Set leaves in its
+          // original position) so this set's iteration order tracks _deviceBatteryOk's own
+          // delete-then-set below - both need to agree on which device is "oldest" for their
+          // eviction loops (this one, and _deviceBatteryOk's further down) not to disagree and
+          // evict two *different* devices, which could otherwise drop a still-actively-reporting
+          // device's dedup entry while an actually-stale one is retained, letting the sound
+          // replay for a device that's still low without ever having recovered.
+          this._deviceBatterySoundAlerted.delete(key);
           this._deviceBatterySoundAlerted.add(key);
           // Bounded independently of _deviceBatteryOk's own eviction loop below - that one only
           // fires based on _deviceBatteryOk's size, but disconnectedCallback clears
