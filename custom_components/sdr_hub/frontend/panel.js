@@ -427,10 +427,14 @@ const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
-// User-assigned friendly names, keyed by deviceInstanceKey (model|id|channel). Deliberately an ordinary
+// User-assigned friendly names, keyed by deviceInstanceKey (model|id|channel). An ordinary
 // preference rather than convergent state: unlike the decoded log or the battery map, this is a
-// direct user choice with no derivation from the event stream, so plain last-writer-wins across
-// tabs is the correct semantics - there is nothing to order or reconcile.
+// direct user choice with no derivation from the event stream, so last-writer-wins is the right
+// semantics *for concurrent edits to the same device*.
+//
+// It is NOT right for the map as a whole: two tabs renaming two different devices are not in
+// conflict, and writing a whole stale snapshot would drop one of them. Writes therefore re-read
+// and update a single entry rather than serializing the in-memory map - see commitAlias.
 const DEVICE_ALIASES_KEY = "sdr_hub_device_aliases";
 const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 const DECODED_LOG_KEY = "sdr_hub_decoded_log";
@@ -872,7 +876,11 @@ const RECEIVER_PRESETS = [
 const ISM_BANDS = [
   { name: "315 MHz (US/JP)", start: 314e6, stop: 316e6 },
   { name: "433 MHz (EU/worldwide)", start: 433.05e6, stop: 434.79e6 },
-  { name: "868 MHz (EU SRD)", start: 868.0e6, stop: 868.6e6 },
+  // 863-870 to match SWEEP_PRESETS' "ISM/SRD 868 MHz, EU (863-870 MHz)" and RECEIVER_PRESETS'
+  // 868.95 MHz entry. A narrower 868.0-868.6 marker contradicted the panel's own presets: a
+  // receiver on 868.95 got no marker at all, and the built-in preset drew a band excluding one
+  // of the two frequencies it configures.
+  { name: "868 MHz (EU SRD)", start: 863e6, stop: 870e6 },
   { name: "915 MHz (US ISM)", start: 902e6, stop: 928e6 },
 ];
 
@@ -1065,7 +1073,13 @@ class SdrHubPanel extends HTMLElement {
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
     this._deviceAliases = loadDeviceAliases(); // deviceInstanceKey -> user-assigned friendly name
     this._expandedDevice = null; // deviceFavoriteKey whose history detail is open, if any
-    this._editingAlias = null; // deviceFavoriteKey whose rename editor is open, if any
+    this._editingAlias = null; // deviceInstanceKey whose rename editor is open, if any
+    // The in-progress rename text and caret. Held in state rather than read from the DOM because
+    // _renderDecodedLog() rebuilds the whole log on every decoded event and on the 30s age tick -
+    // on an active receiver that replaced the editor mid-typing, discarding the draft and the
+    // focus before the user could reach Save.
+    this._aliasDraft = null;
+    this._aliasDraftSelection = null;
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
     // device, or null - consumed (cleared) the next time _renderDecodedLog() draws it, so a
     // favorite only flashes once per new decode rather than on every unrelated re-render.
@@ -3105,7 +3119,10 @@ class SdrHubPanel extends HTMLElement {
         // Named devices are shown by their alias here as well - a banner that says "Unknown
         // device (id 12345)" while the log right below it says "Greenhouse sensor" is worse than
         // no naming at all.
-        const name = deviceDisplayName({ model, id }, this._deviceAliases);
+        // channel is forwarded: aliases are keyed on deviceInstanceKey, which includes it, so
+        // omitting it here looked up a key that never exists for channel-distinguished devices
+        // and the banner kept showing the decoder model while the log card showed the alias.
+        const name = deviceDisplayName({ model, id, channel }, this._deviceAliases);
         return parts.length ? `${name} (${parts.join(", ")})` : name;
       });
     const message = low.length === 0 ? "" : `⚠️ Low battery: ${low.map(esc).join(", ")}`;
@@ -3188,13 +3205,17 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No devices decoded yet.</p>`;
       return;
     }
-    // Matches against model and id specifically (not every field) - a substring match across
+    // Matches against model, id and the user's alias (not every field) - a substring match across
     // the *entire* dump (including timestamps, checksums, etc.) would surface confusing false
-    // positives, whereas model/id is what a user actually means by "find this device".
+    // positives, whereas those are what a user actually means by "find this device". The alias is
+    // included because once set it becomes the card's primary visible name, and a search box that
+    // cannot find the name it is displaying is worse than no search at all. Both are searchable,
+    // so a device renamed months ago is still findable by its model.
     const filtered = this._decodedFilter
       ? this._decodedLog.filter((event) => {
           const d = event.device || {};
-          const haystack = `${d.model || ""} ${d.id != null ? d.id : ""}`.toLowerCase();
+          const alias = this._deviceAliases.get(deviceInstanceKey(d)) || "";
+          const haystack = `${d.model || ""} ${d.id != null ? d.id : ""} ${alias}`.toLowerCase();
           return haystack.includes(this._decodedFilter);
         })
       : this._decodedLog;
@@ -3257,7 +3278,7 @@ class SdrHubPanel extends HTMLElement {
         const history = expanded ? deviceNumericHistory(this._decodedLog, key) : new Map();
         const nameCell = editing
           ? `<span style="display:flex;align-items:center;gap:4px;">
-               <input data-alias-input="${esc(key)}" value="${esc(alias || d.model || "")}" maxlength="60"
+               <input data-alias-input="${esc(key)}" value="${esc(this._aliasDraft ?? alias ?? d.model ?? "")}" maxlength="60"
                  aria-label="Device name"
                  style="font:inherit;padding:2px 4px;border:1px solid var(--divider-color,#e0e0e0);border-radius:4px;background:var(--card-background-color,#fff);color:var(--primary-text-color,#212121);">
                <button data-alias-save="${esc(key)}" style="${BTN_SECONDARY};padding:2px 8px;font-size:.75rem;">Save</button>
@@ -3330,6 +3351,12 @@ class SdrHubPanel extends HTMLElement {
     return `<div style="padding:6px 0 2px;">${rows}</div>`;
   }
 
+  _closeAliasEditor() {
+    this._editingAlias = null;
+    this._aliasDraft = null;
+    this._aliasDraftSelection = null;
+  }
+
   _wireDecodedLogControls(el) {
     el.querySelectorAll("[data-history-device]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -3343,8 +3370,10 @@ class SdrHubPanel extends HTMLElement {
     el.querySelectorAll("[data-alias-edit]").forEach((btn) => {
       btn.addEventListener("click", () => {
         this._editingAlias = btn.dataset.aliasEdit;
+        // Starts from the stored value; subsequent renders reuse the draft instead.
+        this._aliasDraft = null;
+        this._aliasDraftSelection = null;
         this._renderDecodedLog();
-        // Focus after the re-render, since the input this refers to is created by it.
         const input = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
         if (input) {
           input.focus();
@@ -3352,9 +3381,21 @@ class SdrHubPanel extends HTMLElement {
         }
       });
     });
+    // Restores the editor after any re-render that happened while it was open - a decoded event
+    // or the age tick, neither of which the user initiated. Without this the field reverted and
+    // lost focus mid-typing, which on a busy receiver made renaming effectively impossible.
+    if (this._editingAlias) {
+      const active = el.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
+      if (active && document.activeElement !== active) {
+        active.focus();
+        const sel = this._aliasDraftSelection;
+        if (sel) active.setSelectionRange(sel[0], sel[1]);
+        else active.select();
+      }
+    }
     el.querySelectorAll("[data-alias-cancel]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        this._editingAlias = null;
+        this._closeAliasEditor();
         this._renderDecodedLog();
       });
     });
@@ -3367,10 +3408,17 @@ class SdrHubPanel extends HTMLElement {
       // map doesn't accumulate no-op entries.
       const event = this._decodedLog.find((e) => deviceInstanceKey(e.device || {}) === key);
       const model = event?.device?.model || "";
-      if (value === "" || value === model) this._deviceAliases.delete(key);
-      else this._deviceAliases.set(key, value);
-      saveDeviceAliases(this._deviceAliases);
-      this._editingAlias = null;
+      // Re-read before writing, and change only this device's entry. Serializing the whole
+      // in-memory map would carry a snapshot taken before another tab renamed a *different*
+      // device, and the write would silently remove that unrelated edit. Last-writer-wins is the
+      // right semantics for two tabs renaming the same device; it is not right for independent
+      // keys that merely share a storage slot.
+      const stored = loadDeviceAliases();
+      if (value === "" || value === model) stored.delete(key);
+      else stored.set(key, value);
+      saveDeviceAliases(stored);
+      this._deviceAliases = stored;
+      this._closeAliasEditor();
       this._renderDecodedLog();
       this._renderBatteryAlerts();
     };
@@ -3378,13 +3426,17 @@ class SdrHubPanel extends HTMLElement {
       btn.addEventListener("click", () => commitAlias(btn.dataset.aliasSave));
     });
     el.querySelectorAll("[data-alias-input]").forEach((input) => {
+      input.addEventListener("input", () => {
+        this._aliasDraft = input.value;
+        this._aliasDraftSelection = [input.selectionStart, input.selectionEnd];
+      });
       input.addEventListener("keydown", (ev) => {
         if (ev.key === "Enter") {
           ev.preventDefault();
           commitAlias(input.dataset.aliasInput);
         } else if (ev.key === "Escape") {
           ev.preventDefault();
-          this._editingAlias = null;
+          this._closeAliasEditor();
           this._renderDecodedLog();
         }
       });
