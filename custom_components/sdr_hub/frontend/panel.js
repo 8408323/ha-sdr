@@ -42,6 +42,11 @@ const fmtElapsed = (ms) => {
   return `${Math.floor(s / 60)}m${(s % 60).toString().padStart(2, "0")}s`;
 };
 
+// Local wall-clock (the browser's own timezone), not UTC - "absolute" is meant to match what a
+// user's own clock already shows elsewhere (their OS, HA's own header clock), not to be a
+// portable/unambiguous format.
+const fmtAbsoluteTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
 // Sequential (single-hue, light→dark) ramp — dataviz skill's blue sequential steps 100→700.
 // Power near the noise floor recedes toward pale; strong signals go dark blue. Deliberately
 // not a rainbow/jet colormap.
@@ -126,6 +131,7 @@ const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
+const DECODED_TIME_MODE_KEY = "sdr_hub_decoded_time_mode";
 
 function loadFormPrefs(key) {
   try {
@@ -232,6 +238,22 @@ function saveFavoriteDevices(set) {
   }
 }
 
+function loadDecodedTimeMode() {
+  try {
+    return localStorage.getItem(DECODED_TIME_MODE_KEY) === "absolute" ? "absolute" : "relative";
+  } catch {
+    return "relative";
+  }
+}
+
+function saveDecodedTimeMode(mode) {
+  try {
+    localStorage.setItem(DECODED_TIME_MODE_KEY, mode);
+  } catch {
+    // See saveColormap above.
+  }
+}
+
 function loadHelpDismissed() {
   try {
     // Some browsers/WebViews (notably with DOM storage disabled) throw a SecurityError just
@@ -328,6 +350,17 @@ function yamlServiceCall(service, data) {
   return lines.join("\n");
 }
 
+// Turns a single yamlServiceCall() block into one item of a YAML sequence (indenting every
+// line after the first by 2 spaces so it nests correctly under the leading "- ") - used to
+// combine several sweeps'/receivers' actions into one automation `action:` list, since a bare
+// list of top-level "service:"/"data:" mappings back to back isn't valid YAML on its own.
+function yamlAsListItem(yamlText) {
+  return yamlText
+    .split("\n")
+    .map((line, i) => (i === 0 ? `- ${line}` : `  ${line}`))
+    .join("\n");
+}
+
 const WATERFALL_MIN_DB = -20;
 const WATERFALL_MAX_DB = 60;
 const WATERFALL_HEIGHT = 400;
@@ -391,6 +424,7 @@ class SdrHubPanel extends HTMLElement {
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
+    this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
@@ -707,7 +741,11 @@ class SdrHubPanel extends HTMLElement {
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Decoded devices</h2>
-          <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+            <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
+            <button id="sdr-hub-decoded-time-toggle" type="button" title="Toggle between relative and absolute timestamps" style="${BTN_SECONDARY};white-space:nowrap;">${this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time"}</button>
+            <button id="sdr-hub-clear-decoded" type="button" style="${BTN_SECONDARY};white-space:nowrap;">Clear log</button>
+          </div>
           <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
         </div>
 
@@ -729,6 +767,7 @@ class SdrHubPanel extends HTMLElement {
               <input id="sdr-hub-import-config" type="file" accept="application/json"
                 style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">
             </label>
+            <button id="sdr-hub-copy-all-yaml" type="button" title="Copy every active sweep and receiver as a single automation action list" style="${BTN_SECONDARY}">Copy all as YAML</button>
           </div>
         </div>
       </div>
@@ -736,6 +775,19 @@ class SdrHubPanel extends HTMLElement {
 
     this.querySelector("#sdr-hub-decoded-filter").addEventListener("input", (ev) => {
       this._decodedFilter = ev.target.value.trim().toLowerCase();
+      this._renderDecodedLog();
+    });
+    this.querySelector("#sdr-hub-decoded-time-toggle").addEventListener("click", (ev) => {
+      this._decodedTimeMode = this._decodedTimeMode === "absolute" ? "relative" : "absolute";
+      saveDecodedTimeMode(this._decodedTimeMode);
+      ev.target.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
+      this._renderDecodedLog();
+    });
+    this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", () => {
+      // Only clears the *displayed* log, not _deviceBatteryOk - a device that's genuinely still
+      // reporting low battery should keep showing in the alert banner even after the user clears
+      // this view, since that's a real hardware condition independent of what's on screen.
+      this._decodedLog = [];
       this._renderDecodedLog();
     });
     const helpEl = this.querySelector("#sdr-hub-help");
@@ -766,6 +818,7 @@ class SdrHubPanel extends HTMLElement {
     this._wireColormapControls();
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
+    this._wireCopyButton(this.querySelector("#sdr-hub-copy-all-yaml"), () => this._allConfigYaml());
   }
 
   // Repainting every sweep's history from scratch (_renderSweeps(true), which already replays
@@ -1365,7 +1418,11 @@ class SdrHubPanel extends HTMLElement {
         const fields = Object.keys(d)
           .filter((k) => !DECODED_HIDDEN_FIELDS.has(k))
           .map((k) => fmtDecodedField(k, d[k]));
-        const age = event._receivedAt ? `-${fmtElapsed(now - event._receivedAt)}` : "";
+        const age = event._receivedAt
+          ? this._decodedTimeMode === "absolute"
+            ? fmtAbsoluteTime(event._receivedAt)
+            : `-${fmtElapsed(now - event._receivedAt)}`
+          : "";
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${fav ? "background:rgba(245,166,35,.1);" : ""}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;">
@@ -1761,6 +1818,18 @@ class SdrHubPanel extends HTMLElement {
     });
   }
 
+  // Combines every currently active sweep and receiver into one YAML action list - the per-item
+  // "Copy as YAML" buttons already cover recreating a single one; this is for pasting a whole
+  // dashboard's worth of captures into one automation/script at once instead of copying each
+  // action separately and assembling the list by hand.
+  _allConfigYaml() {
+    const items = [
+      ...(this._state.sweeps || []).map((s) => yamlAsListItem(this._sweepYaml(s))),
+      ...(this._state.receivers || []).map((r) => yamlAsListItem(this._receiverYaml(r))),
+    ];
+    return items.length ? items.join("\n") : "# No active sweeps or receivers to copy.";
+  }
+
   // Requires a second click within CONFIRM_WINDOW_MS before actually invoking onConfirm - guards
   // a running sweep/receiver (which can represent minutes to hours of unsaved capture history)
   // against being stopped by a single stray or misdirected click, without the accessibility/
@@ -2004,7 +2073,13 @@ class SdrHubPanel extends HTMLElement {
 
   async _onAddSweep(ev) {
     ev.preventDefault();
-    const form = new FormData(ev.target);
+    // Captured once, synchronously, rather than reading `ev.target` again after the `await`
+    // below - some environments null out an Event's `target` once its dispatch has finished,
+    // which silently threw from the second `_selectedDongleDriver(ev.target)` call below (inside
+    // saveFormPrefs's arguments), skipping saveFormPrefs entirely and surfacing a confusing
+    // "Could not start sweep: Cannot read properties of null" error even on a successful submit.
+    const formEl = ev.target;
+    const form = new FormData(formEl);
     const wantsScroll = form.get("scroll_mode") === "on"; // unchecked checkboxes are absent from FormData
     // Only true once a new sweep id actually exists and had scroll mode applied to it - a
     // rejected add_sweep (busy dongle, validation error) has no sweep to apply it to, and
@@ -2016,7 +2091,7 @@ class SdrHubPanel extends HTMLElement {
       const sweep = await this._callWS({
         type: "sdr_hub/add_sweep",
         dongle_serial: form.get("dongle_serial"),
-        dongle_driver: this._selectedDongleDriver(ev.target),
+        dongle_driver: this._selectedDongleDriver(formEl),
         start_hz: Number(form.get("start_mhz")) * 1e6,
         stop_hz: Number(form.get("stop_mhz")) * 1e6,
         gain: Number(form.get("gain")),
@@ -2033,7 +2108,7 @@ class SdrHubPanel extends HTMLElement {
       // (validation error) shouldn't overwrite a previously-working set of defaults.
       saveFormPrefs(SWEEP_FORM_PREFS_KEY, {
         dongle_serial: form.get("dongle_serial"),
-        dongle_driver: this._selectedDongleDriver(ev.target) ?? "",
+        dongle_driver: this._selectedDongleDriver(formEl) ?? "",
         start_mhz: form.get("start_mhz"),
         stop_mhz: form.get("stop_mhz"),
         gain: form.get("gain"),
@@ -2065,7 +2140,9 @@ class SdrHubPanel extends HTMLElement {
 
   async _onAddReceiver(ev) {
     ev.preventDefault();
-    const form = new FormData(ev.target);
+    // See _onAddSweep's identical formEl capture above - same reasoning.
+    const formEl = ev.target;
+    const form = new FormData(formEl);
     const frequenciesHz = String(form.get("frequencies_mhz"))
       .split(",")
       .map((s) => s.trim())
@@ -2075,7 +2152,7 @@ class SdrHubPanel extends HTMLElement {
       await this._callWS({
         type: "sdr_hub/add_receiver",
         dongle_serial: form.get("dongle_serial"),
-        dongle_driver: this._selectedDongleDriver(ev.target),
+        dongle_driver: this._selectedDongleDriver(formEl),
         frequencies_hz: frequenciesHz,
         hop_interval_s: Number(form.get("hop_interval_s")) || 10,
         label: form.get("label") || undefined,
@@ -2083,7 +2160,7 @@ class SdrHubPanel extends HTMLElement {
       // Only remembered once the add-on actually accepted these values - see _onAddSweep.
       saveFormPrefs(RECEIVER_FORM_PREFS_KEY, {
         dongle_serial: form.get("dongle_serial"),
-        dongle_driver: this._selectedDongleDriver(ev.target) ?? "",
+        dongle_driver: this._selectedDongleDriver(formEl) ?? "",
         frequencies_mhz: form.get("frequencies_mhz"),
         hop_interval_s: form.get("hop_interval_s"),
       });
