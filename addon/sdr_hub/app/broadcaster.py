@@ -25,14 +25,25 @@ class Broadcaster:
         self._queue_maxsize = queue_maxsize
         self._queues: dict[WebSocket, asyncio.Queue] = {}
         self._writers: dict[WebSocket, asyncio.Task] = {}
+        # Set for a client whenever broadcast() had to drop a message for it (queue full).
+        # A dropped message could be anything, including a state transition a consumer treats
+        # as authoritative until told otherwise (e.g. the frontend's low-battery tracking, which
+        # only clears an alert on an explicit battery_ok:true event) - if that exact message is
+        # the one dropped, the consumer would otherwise never find out and could show stale
+        # state indefinitely. _writer_loop checks this before its next send and, if set,
+        # notifies the client a gap happened so it can invalidate/resync anything it derived
+        # purely from the event stream, instead of silently continuing as if nothing was lost.
+        self._gap_pending: dict[WebSocket, bool] = {}
 
     def add(self, ws: WebSocket) -> None:
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_maxsize)
         self._queues[ws] = queue
+        self._gap_pending[ws] = False
         self._writers[ws] = asyncio.create_task(self._writer_loop(ws, queue))
 
     def discard(self, ws: WebSocket) -> None:
         self._queues.pop(ws, None)
+        self._gap_pending.pop(ws, None)
         writer = self._writers.pop(ws, None)
         if writer is not None:
             writer.cancel()
@@ -44,15 +55,25 @@ class Broadcaster:
                     queue.get_nowait()  # drop oldest to bound memory under backpressure
                 except asyncio.QueueEmpty:
                     pass
+                else:
+                    self._gap_pending[ws] = True
             try:
                 queue.put_nowait(message)
             except asyncio.QueueFull:
-                pass  # lost the race with another producer for the freed slot; drop it too
+                # Lost the race with another producer for the freed slot; drop it too.
+                self._gap_pending[ws] = True
 
     async def _writer_loop(self, ws: WebSocket, queue: asyncio.Queue) -> None:
         try:
             while True:
                 message = await queue.get()
+                if self._gap_pending.get(ws):
+                    # Send the gap notice ahead of the queued message it displaced, not through
+                    # the (already full, that's how we got here) queue itself - a client that
+                    # sees this before the next real message knows any event-derived state it's
+                    # been building up may now be incomplete.
+                    self._gap_pending[ws] = False
+                    await ws.send_json({"type": "stream_gap"})
                 await ws.send_json(message)
         except Exception:  # noqa: BLE001 - a broken client shouldn't affect others
             # Visible by default (not debug-only): a send failure here means this client
@@ -65,3 +86,4 @@ class Broadcaster:
             # removed these entries (e.g. it triggered this task's cancellation).
             self._queues.pop(ws, None)
             self._writers.pop(ws, None)
+            self._gap_pending.pop(ws, None)
