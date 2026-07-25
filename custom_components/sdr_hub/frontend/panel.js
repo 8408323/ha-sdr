@@ -285,6 +285,16 @@ function invalidOptionalNumber(obj, field) {
   return Object.hasOwn(obj, field) && !Number.isFinite(obj[field]);
 }
 
+// Same reasoning as invalidOptionalNumber, for the one optional field that isn't a plain
+// number: rtl_433's protocols filter (see addon/sdr_hub/app/models.py's `protocols: list[int]`)
+// is a list of integer protocol ids, not just "an array" - a hand-edited `null` or a string
+// would otherwise be silently dropped by the truthy-array check in _receiverImportPayload,
+// falling through to add_receiver's default of decoding *all* protocols instead of the
+// requested subset, while import still reports success.
+function invalidOptionalProtocols(obj) {
+  return Object.hasOwn(obj, "protocols") && !(Array.isArray(obj.protocols) && obj.protocols.every(Number.isInteger));
+}
+
 // Builds a copy-pasteable HA automation/script action snippet for a running sweep/receiver -
 // bridges "ad-hoc thing I started from the panel" to "permanent thing an automation manages",
 // without the user needing to look up the service's field names themselves.
@@ -1030,12 +1040,21 @@ class SdrHubPanel extends HTMLElement {
       this._wireCanvasHover(s.id);
       this._wireResizeHandle(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
-      // retained history oldest-to-newest so the full waterfall reappears instead of just
-      // the latest row, matching what hover (which reads the same history) implies is there.
+      // retained history so the full waterfall reappears instead of just the latest row,
+      // matching what hover (which reads the same history) implies is there. Scroll mode
+      // still replays row-by-row via _appendRow (its growth path is already O(n) total, see
+      // the `width` attribute comment above); live mode uses the dedicated bulk repaint below
+      // instead, since _appendRow/_drawLiveRow's per-arrival canvas shift would otherwise be
+      // O(n) full-canvas copies for a single rebuild (see _repaintLiveHistory).
       this._scrollDrawIndex[s.id] = 0;
       const rows = this._sweepRowHistory[s.id];
       if (rows) {
-        for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
+        if (this._scrollMode[s.id]) {
+          for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
+        } else {
+          const canvas = el.querySelector(`[data-sweep-canvas="${CSS.escape(s.id)}"]`);
+          if (canvas) this._repaintLiveHistory(canvas, s.id);
+        }
       }
       this._renderTimeAxis(s.id);
       // Restore the position captured above, now that the replacement container has its
@@ -1375,6 +1394,30 @@ class SdrHubPanel extends HTMLElement {
     this._paintRow(ctx, row, width, 0, peak);
   }
 
+  // Bulk-repaints a live-mode sweep's whole retained history (used by _renderSweeps' forced
+  // rebuild - colormap/contrast change, or the scroll-mode toggle) by painting each row
+  // directly at its final Y position, instead of replaying via _appendRow/_drawLiveRow one row
+  // at a time. _drawLiveRow's per-arrival "scroll down by one" is right for a single new row
+  // arriving live, but reusing it here would perform a full-width getImageData/putImageData
+  // shift of the whole (up to WATERFALL_HEIGHT-1-row-tall) canvas for *every* retained row -
+  // for a wide sweep with a full 400-row history, that's ~400 full-canvas copies for a single
+  // colormap selection, easily gigabytes of synchronous pixel copying that can freeze the tab.
+  // Since every row's final position is already known up front (newest at y=0, each older row
+  // one below), there's nothing to shift - just paint each one once.
+  _repaintLiveHistory(canvas, sweepId) {
+    const rows = this._sweepRowHistory[sweepId];
+    if (!rows || rows.length === 0 || !rows[0].power_db || rows[0].power_db.length === 0) return;
+    const width = rows[0].power_db.length;
+    if (canvas.width !== width) canvas.width = width;
+    const ctx = canvas.getContext("2d");
+    const count = Math.min(rows.length, canvas.height);
+    for (let i = 0; i < count; i++) {
+      const row = rows[i]; // rows[0] is newest - painted at y=0, same convention as _drawLiveRow
+      this._paintRow(ctx, row, width, i, this._findPeak(row));
+    }
+    this._renderPeakReadout(sweepId, this._findPeak(rows[0]));
+  }
+
   _drawScrollRow(canvas, sweepId, row, peak) {
     const width = row.power_db.length;
     // Captured before any resize below - resizing grows scrollHeight first, which would
@@ -1704,8 +1747,10 @@ class SdrHubPanel extends HTMLElement {
         continue;
       }
       // See the matching gain/sample_rate check in the sweep loop above.
-      if (invalidOptionalNumber(r, "hop_interval_s")) {
-        errors.push(`Skipped receiver entry ${r.label || r.dongle_serial}: hop_interval_s must be a number if present`);
+      if (invalidOptionalNumber(r, "hop_interval_s") || invalidOptionalProtocols(r)) {
+        errors.push(
+          `Skipped receiver entry ${r.label || r.dongle_serial}: hop_interval_s must be a number and protocols must be a list of integers, if present`,
+        );
         continue;
       }
       try {
