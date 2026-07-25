@@ -427,7 +427,7 @@ const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
 const FAVORITE_DEVICES_KEY = "sdr_hub_favorite_devices";
-// User-assigned friendly names, keyed by deviceFavoriteKey (model|id). Deliberately an ordinary
+// User-assigned friendly names, keyed by deviceInstanceKey (model|id|channel). Deliberately an ordinary
 // preference rather than convergent state: unlike the decoded log or the battery map, this is a
 // direct user choice with no derivation from the event stream, so plain last-writer-wins across
 // tabs is the correct semantics - there is nothing to order or reconcile.
@@ -566,6 +566,18 @@ function deviceFavoriteKey(d) {
 // deviceFavoriteKey itself is left as-is since it's pre-existing, shared with the favorites
 // feature, and out of scope here.
 function batteryStateKey(d) {
+  return deviceInstanceKey(d);
+}
+
+// Identifies one physical device as precisely as the decoder allows: model, id AND channel. Some
+// families (ones distinguished only by a channel dial/jumper) share a model and omit `id`
+// entirely, so model|id alone collides across genuinely different sensors.
+//
+// Everything keyed on a *device instance* uses this - battery state, per-device history, and
+// aliases. deviceFavoriteKey deliberately still omits channel: it predates this and is what
+// existing users' stored favorites are keyed by, so narrowing it would silently drop them. That
+// asymmetry is intentional and confined to favorites.
+function deviceInstanceKey(d) {
   return `${d.model || ""}|${d.id != null ? d.id : ""}|${d.channel != null ? d.channel : ""}`;
 }
 
@@ -687,7 +699,7 @@ function deviceNumericHistory(log, key) {
   // The log is newest-first; reversed so each series reads left-to-right in time order.
   for (const event of [...log].reverse()) {
     const d = event.device || {};
-    if (deviceFavoriteKey(d) !== key) continue;
+    if (deviceInstanceKey(d) !== key) continue;
     for (const [field, value] of Object.entries(d)) {
       if (DECODED_HIDDEN_FIELDS.has(field)) continue;
       if (typeof value !== "number" || !Number.isFinite(value)) continue;
@@ -726,7 +738,7 @@ function sparklineSvg(values, width = 120, height = 24) {
 // The name to show for a decoded device: the user's alias if set, otherwise the decoder's model
 // string. Callers that need to disambiguate still render id/channel separately.
 function deviceDisplayName(device, aliases) {
-  const alias = aliases.get(deviceFavoriteKey(device || {}));
+  const alias = aliases.get(deviceInstanceKey(device || {}));
   return alias || device?.model || "Unknown device";
 }
 
@@ -1051,7 +1063,7 @@ class SdrHubPanel extends HTMLElement {
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
     this._decodedTimeMode = loadDecodedTimeMode(); // "relative" ("-Xs" ago) or "absolute" (wall-clock)
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
-    this._deviceAliases = loadDeviceAliases(); // "model|id" -> user-assigned friendly name
+    this._deviceAliases = loadDeviceAliases(); // deviceInstanceKey -> user-assigned friendly name
     this._expandedDevice = null; // deviceFavoriteKey whose history detail is open, if any
     this._editingAlias = null; // deviceFavoriteKey whose rename editor is open, if any
     // deviceFavoriteKey of the most recently arrived decoded_device event for a favorited
@@ -2648,10 +2660,18 @@ class SdrHubPanel extends HTMLElement {
     // Bands that overlap what is being covered are included in the extent, so a sweep sitting at
     // the edge of a band shows the whole band around it rather than a clipped sliver that gives
     // no sense of how much is uncovered.
+    //
+    // Matched against each capture individually, NOT against the global min/max: two disjoint
+    // captures (say a receiver at 100 MHz and another at 1 GHz) span every band in between
+    // without covering any of them, and testing the outer extent would mark all of those as
+    // overlapping - implying monitoring that does not exist, which is the opposite of what this
+    // view is for.
     const ownHz = [...segments.flatMap((s) => [s.start, s.stop]), ...points.map((p) => p.freq)];
-    const ownMin = Math.min(...ownHz);
-    const ownMax = Math.max(...ownHz);
-    const overlappingBands = ISM_BANDS.filter((b) => b.stop >= ownMin && b.start <= ownMax);
+    const overlappingBands = ISM_BANDS.filter(
+      (b) =>
+        segments.some((seg) => seg.stop >= b.start && seg.start <= b.stop) ||
+        points.some((pt) => pt.freq >= b.start && pt.freq <= b.stop),
+    );
     const allHz = [...ownHz, ...overlappingBands.flatMap((b) => [b.start, b.stop])];
     const minHz = Math.min(...allHz);
     const maxHz = Math.max(...allHz);
@@ -3199,12 +3219,16 @@ class SdrHubPanel extends HTMLElement {
     el.innerHTML = sorted
       .map((event) => {
         const d = event.device || {};
-        const key = deviceFavoriteKey(d);
-        const fav = this._favoriteDevices.has(key);
+        // Two distinct identities, deliberately: `favKey` is what favorites have always been
+        // keyed by (model|id), `key` identifies the physical device including channel and is what
+        // history and aliases use. See deviceInstanceKey.
+        const favKey = deviceFavoriteKey(d);
+        const key = deviceInstanceKey(d);
+        const fav = this._favoriteDevices.has(favKey);
         // Only the first (newest, thanks to the favorite sort-to-top above) matching card
         // consumes the pending flash - without this a device with multiple log entries could
         // flash more than once per new decode.
-        const flash = fav && !flashConsumed && key === this._flashDeviceKey;
+        const flash = fav && !flashConsumed && favKey === this._flashDeviceKey;
         if (flash) flashConsumed = true;
         const idParts = [d.id != null ? `id ${d.id}` : null, d.channel != null ? `ch ${d.channel}` : null].filter(
           Boolean,
@@ -3220,12 +3244,16 @@ class SdrHubPanel extends HTMLElement {
           : "";
         const cardStyle = fav ? `background:rgba(245,166,35,.1);${flash ? "animation:sdr-hub-flash 1.2s ease-out;" : ""}` : "";
         const alias = this._deviceAliases.get(key);
-        const editing = this._editingAlias === key;
         // Only the newest card for a device carries the expand control and detail, so a device
         // with several entries in the log doesn't offer the same history N times over.
         const isFirstForKey = !renderedKeys.has(key);
         renderedKeys.add(key);
         const expanded = isFirstForKey && this._expandedDevice === key;
+        // Gated on isFirstForKey for the same reason as the history control, and this one is
+        // load-bearing rather than cosmetic: a device with several retained entries rendered one
+        // input per card all carrying the same data-alias-input selector, so saving from any card
+        // read the *first* matching input in the log and silently discarded what the user typed.
+        const editing = isFirstForKey && this._editingAlias === key;
         const history = expanded ? deviceNumericHistory(this._decodedLog, key) : new Map();
         const nameCell = editing
           ? `<span style="display:flex;align-items:center;gap:4px;">
@@ -3237,13 +3265,17 @@ class SdrHubPanel extends HTMLElement {
              </span>`
           : `<strong>${esc(deviceDisplayName(d, this._deviceAliases))}</strong>
              ${alias ? `<span style="font-size:.75rem;color:var(--secondary-text-color,#727272);">(${esc(d.model || "Unknown device")})</span>` : ""}
-             <button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
-               style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`;
+             ${
+               isFirstForKey
+                 ? `<button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
+                      style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`
+                 : ""
+             }`;
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
               <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-                <button data-pin-device="${esc(key)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
+                <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
                 ${nameCell}
               </span>
@@ -3333,7 +3365,7 @@ class SdrHubPanel extends HTMLElement {
       // An empty or model-identical alias is stored as *absent* rather than as a redundant
       // entry, so clearing the field is how a user reverts to the decoder's own name and the
       // map doesn't accumulate no-op entries.
-      const event = this._decodedLog.find((e) => deviceFavoriteKey(e.device || {}) === key);
+      const event = this._decodedLog.find((e) => deviceInstanceKey(e.device || {}) === key);
       const model = event?.device?.model || "";
       if (value === "" || value === model) this._deviceAliases.delete(key);
       else this._deviceAliases.set(key, value);
