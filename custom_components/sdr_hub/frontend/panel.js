@@ -75,6 +75,11 @@ const BROADCAST_CHANNEL_NAME = "sdr_hub_panel_sync";
 // heartbeat. A claim older than LEADER_TTL_MS is treated as abandoned (tab closed/crashed/
 // suspended) and may be taken over.
 const SOUND_LEADER_KEY = "sdr_hub_sound_leader";
+// Written purely to provoke a "storage" event in other tabs when BroadcastChannel is
+// unavailable. The shared state itself lives in IndexedDB, which has no cross-document change
+// event, so without this a browser lacking BroadcastChannel would leave peers rendering state
+// that has since been cleared or updated.
+const SYNC_NONCE_KEY = "sdr_hub_sync_nonce";
 const LEADER_TTL_MS = 5000;
 const LEADER_HEARTBEAT_MS = 2000;
 
@@ -88,7 +93,11 @@ function claimLeadership(key, tabId) {
     const raw = localStorage.getItem(key);
     const current = raw ? JSON.parse(raw) : null;
     const held = current && typeof current.tabId === "string" && Number.isFinite(current.ts);
-    if (held && current.tabId !== tabId && now - current.ts < LEADER_TTL_MS) return false;
+    // A timestamp in the future means the clock moved backwards after the lease was written.
+    // The plain TTL test would then read negative and treat an abandoned lease as perpetually
+    // fresh, muting every other tab until the clock caught up - potentially hours.
+    const age = now - current?.ts;
+    if (held && current.tabId !== tabId && age >= 0 && age < LEADER_TTL_MS) return false;
     localStorage.setItem(key, JSON.stringify({ tabId, ts: now }));
     const after = JSON.parse(localStorage.getItem(key) || "null");
     return !!after && after.tabId === tabId;
@@ -103,7 +112,9 @@ function holdsLeadership(key, tabId) {
   try {
     const raw = localStorage.getItem(key);
     const current = raw ? JSON.parse(raw) : null;
-    return !!current && current.tabId === tabId && Date.now() - current.ts < LEADER_TTL_MS;
+    if (!current || current.tabId !== tabId) return false;
+    const age = Date.now() - current.ts;
+    return age >= 0 && age < LEADER_TTL_MS;
   } catch {
     return true;
   }
@@ -776,6 +787,11 @@ class SdrHubPanel extends HTMLElement {
     // Start empty and hydrate from IndexedDB asynchronously (see _hydratePersistedState).
     this._decodedLogGen = 0;
     this._decodedLog = [];
+    // Bumped synchronously whenever the log is cleared or reset. An in-flight persist/hydrate
+    // captures it and discards its own result if it changed meanwhile - the generation alone
+    // can't cover this, since it only advances once the clear's transaction commits, leaving a
+    // window in which an older equal-generation result would repopulate what was just cleared.
+    this._clearEpoch = 0;
     // batteryStateKey(device) -> {model, id, channel, low, at, alertedAt?} - the canonical,
     // cross-tab-shared low-battery state (see BATTERY_LOW_KEY and mergeBatteryLowState).
     //
@@ -952,6 +968,12 @@ class SdrHubPanel extends HTMLElement {
         location.reload();
         return;
       }
+      // Fallback notification from a peer without BroadcastChannel - re-read both stores.
+      if (ev.key === SYNC_NONCE_KEY) {
+        this._hydrateDecodedLog();
+        this._hydrateBatteryState();
+        return;
+      }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
       // Same reasoning for the battery map, using its own LWW merge so a lagging peer's write
       // can't resurrect a device this tab already saw recover.
@@ -968,8 +990,14 @@ class SdrHubPanel extends HTMLElement {
           // AudioContext - so without re-arming, a tab enabled from elsewhere could never
           // satisfy _canPlayAlertSound() and would stay silent (and stop contending for the
           // alert) until a reload or a local toggle, even after the enabling tab closed.
-          this._audioUnlockWired = false;
-          this._wireAudioUnlock();
+          // Only re-arm if the previous one-time listener has actually been consumed. Forcing
+          // the flag false while it is still armed would attach a second listener and overwrite
+          // _audioUnlockAbort, leaving the first one's signal unreachable - it would then never
+          // detach and would keep firing on every gesture, across detach/reattach cycles.
+          if (!this._audioUnlockAbort || this._audioUnlockAbort.signal.aborted) {
+            this._audioUnlockWired = false;
+            this._wireAudioUnlock();
+          }
         } else {
           // Stop contending if it was just turned off here; the claim then expires on its own.
           this._releaseSoundLeadership();
@@ -995,19 +1023,42 @@ class SdrHubPanel extends HTMLElement {
           this._hydrateBatteryState();
           return;
         }
+        if (msg.kind === "state_reset") {
+          // A peer cleared the IndexedDB-backed state. Its own localStorage removals may have
+          // been no-ops (everything already at defaults), so this is the only signal.
+          this._clearEpoch++;
+          this._decodedLog = [];
+          this._decodedLogGen = 0;
+          this._deviceBatteryOk = new Map();
+          this._batteryGen = 0;
+          this._renderDecodedLog();
+          this._renderBatteryAlerts();
+          return;
+        }
       };
     } catch {
-      // No BroadcastChannel (very old browser) - the storage event above still propagates the
-      // same clear, just without the immediacy.
+      // No BroadcastChannel (very old browser). _postSync falls back to bumping a localStorage
+      // nonce, which does emit a storage event peers can act on - the earlier claim that the
+      // storage handler already covered this was wrong once the state moved to IndexedDB, since
+      // nothing in localStorage changes on a clear any more.
       this._broadcastChannel = null;
     }
   }
 
   _postSync(message) {
     try {
-      if (this._broadcastChannel) this._broadcastChannel.postMessage(message);
+      if (this._broadcastChannel) {
+        this._broadcastChannel.postMessage(message);
+        return;
+      }
     } catch {
-      // Channel closed mid-teardown - the storage event covers the same ground.
+      // Channel closed mid-teardown - fall through to the nonce below.
+    }
+    try {
+      // No channel: bump a nonce so peers get a storage event and re-read from IndexedDB.
+      localStorage.setItem(SYNC_NONCE_KEY, `${Date.now()}-${Math.random()}`);
+    } catch {
+      // Nothing left to notify with; peers reconcile on their next reattach or event.
     }
   }
 
@@ -1232,15 +1283,31 @@ class SdrHubPanel extends HTMLElement {
   // here without any lock. The generation is re-read from storage at write time (not stamped
   // when the event arrived) so a "Clear log" that lands in between is always observed, never
   // raced past.
+  // Merges an authoritative snapshot into the in-memory view rather than replacing it.
+  // Transactions overlap, so a snapshot can predate an optimistic entry added after the read
+  // began - assigning it directly would make that entry vanish until its own write settled, or
+  // permanently if the write failed. A generation change is the exception: that means a clear or
+  // invalidation, where discarding entries is the entire point.
+  _applySettledDecoded(settled) {
+    const legacy = this._decodedLog.filter((e) => !isConvergentEvent(e));
+    const convergent =
+      settled.gen === this._decodedLogGen
+        ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
+        : settled.log;
+    this._decodedLog = [...legacy, ...convergent].slice(0, MAX_DECODED_LOG);
+    this._decodedLogGen = settled.gen;
+    this._renderDecodedLog();
+  }
+
   // Re-reads the authoritative decoded log from IndexedDB. Used on first load, on reattach, and
   // whenever a peer signals a change - IndexedDB has no cross-document change event of its own,
   // so BroadcastChannel carries the notification while the database remains the source of truth.
   async _hydrateDecodedLog() {
+    const epoch = this._clearEpoch;
     try {
       const settled = normalizeDecodedRecord(await idbGet(IDB_KEY_DECODED));
-      this._decodedLogGen = settled.gen;
-      this._decodedLog = settled.log;
-      this._renderDecodedLog();
+      if (epoch !== this._clearEpoch) return;
+      this._applySettledDecoded(settled);
     } catch {
       // No usable store - whatever is in memory stands.
     }
@@ -1249,8 +1316,11 @@ class SdrHubPanel extends HTMLElement {
   async _hydrateBatteryState() {
     try {
       const settled = normalizeBatteryRecord(await idbGet(IDB_KEY_BATTERY));
+      // Same merge-not-replace reasoning as _applySettledDecoded - a hydration read can return a
+      // snapshot older than a transition applied optimistically while it was in flight.
+      this._deviceBatteryOk =
+        settled.gen === this._batteryGen ? mergeBatteryLowState(this._deviceBatteryOk, settled.map) : settled.map;
       this._batteryGen = settled.gen;
-      this._deviceBatteryOk = settled.map;
       this._renderBatteryAlerts();
     } catch {
       // No usable store - whatever is in memory stands.
@@ -1266,9 +1336,16 @@ class SdrHubPanel extends HTMLElement {
       this._renderDecodedLog();
       return;
     }
-    // Show it immediately, then reconcile against the authoritative store.
-    this._decodedLog = mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event]);
+    // Legacy (non-convergent) entries from an older add-on are kept in the local view - they
+    // only need excluding from *persistence*, and dropping them here would blank the visible
+    // history the moment the add-on is upgraded mid-session.
+    const legacy = this._decodedLog.filter((e) => !isConvergentEvent(e));
+    this._decodedLog = [...legacy, ...mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), [event])].slice(
+      0,
+      MAX_DECODED_LOG,
+    );
     this._renderDecodedLog();
+    const epoch = this._clearEpoch;
     try {
       // The whole get-merge-put happens inside one readwrite transaction, so a concurrent tab
       // cannot interleave and clobber this with a shorter prefix of the same log. The generation
@@ -1278,18 +1355,11 @@ class SdrHubPanel extends HTMLElement {
         const merged = mergeDecodedLog(current.log, [{ ...event, _gen: current.gen }]);
         return { gen: current.gen, entries: merged };
       });
+      // A clear landed while this was in flight - its result is pre-clear, so applying it would
+      // repopulate exactly what the clear removed.
+      if (epoch !== this._clearEpoch) return;
       const settled = normalizeDecodedRecord(record);
-      // Merged with the current in-memory view rather than replacing it. Transactions for two
-      // events overlap, and the earlier one's authoritative result predates the later one's
-      // optimistic entry - assigning it directly would make that newer entry vanish until its
-      // own transaction settled a moment later, a visible flicker. A generation change is the
-      // exception: that means a clear, where dropping entries is the point.
-      this._decodedLog =
-        settled.gen === this._decodedLogGen
-          ? mergeDecodedLog(this._decodedLog.filter(isConvergentEvent), settled.log)
-          : settled.log;
-      this._decodedLogGen = settled.gen;
-      this._renderDecodedLog();
+      this._applySettledDecoded(settled);
       this._postSync({ kind: "decoded_changed" });
     } catch {
       // No usable store - the optimistic in-memory update above stands for this session.
@@ -1422,20 +1492,11 @@ class SdrHubPanel extends HTMLElement {
   // worst case is one duplicated beep - acceptable for a notification, and categorically
   // different from the data-integrity guarantees the (convergent) log and battery state get.
   _claimSoundLeadership() {
-    try {
-      const now = Date.now();
-      const raw = localStorage.getItem(SOUND_LEADER_KEY);
-      const current = raw ? JSON.parse(raw) : null;
-      const held = current && typeof current.tabId === "string" && Number.isFinite(current.ts);
-      if (held && current.tabId !== this._tabId && now - current.ts < LEADER_TTL_MS) return false;
-      localStorage.setItem(SOUND_LEADER_KEY, JSON.stringify({ tabId: this._tabId, ts: now }));
-      this._startSoundLeaderHeartbeat();
-      return true;
-    } catch {
-      // Unavailable storage - fall back to just playing it. A possible duplicate beep across
-      // tabs beats silently dropping the notification entirely.
-      return true;
-    }
+    // Delegates to the shared helper rather than repeating the lease logic - the duplicate copy
+    // that used to live here silently missed the backward-clock fix applied to claimLeadership.
+    if (!claimLeadership(SOUND_LEADER_KEY, this._tabId)) return false;
+    this._startSoundLeaderHeartbeat();
+    return true;
   }
 
   // Keeps this tab's claim fresh while it remains able to play sound, so other tabs don't treat
@@ -1448,20 +1509,13 @@ class SdrHubPanel extends HTMLElement {
         this._stopSoundLeaderHeartbeat();
         return;
       }
-      try {
-        const raw = localStorage.getItem(SOUND_LEADER_KEY);
-        const current = raw ? JSON.parse(raw) : null;
-        // Only renew a claim that's still ours - another tab may have legitimately taken over
-        // while this one was suspended, and stomping that would re-create the split we're
-        // avoiding.
-        if (current && current.tabId !== this._tabId) {
-          this._stopSoundLeaderHeartbeat();
-          return;
-        }
-        localStorage.setItem(SOUND_LEADER_KEY, JSON.stringify({ tabId: this._tabId, ts: Date.now() }));
-      } catch {
+      // Only renew a claim that's still ours - another tab may have legitimately taken over
+      // while this one was suspended, and stomping that would recreate the split we're avoiding.
+      if (!holdsLeadership(SOUND_LEADER_KEY, this._tabId)) {
         this._stopSoundLeaderHeartbeat();
+        return;
       }
+      claimLeadership(SOUND_LEADER_KEY, this._tabId);
     }, LEADER_HEARTBEAT_MS);
   }
 
@@ -1476,13 +1530,7 @@ class SdrHubPanel extends HTMLElement {
   // which a low-battery alert would go unplayed by anyone.
   _releaseSoundLeadership() {
     this._stopSoundLeaderHeartbeat();
-    try {
-      const raw = localStorage.getItem(SOUND_LEADER_KEY);
-      const current = raw ? JSON.parse(raw) : null;
-      if (current && current.tabId === this._tabId) localStorage.removeItem(SOUND_LEADER_KEY);
-    } catch {
-      // Unavailable storage - the claim (if any) simply expires on its own.
-    }
+    releaseLeadership(SOUND_LEADER_KEY, this._tabId);
   }
 
   _showError(message, { isLoadError = false } = {}) {
@@ -1681,6 +1729,9 @@ class SdrHubPanel extends HTMLElement {
       // genuine user action rather than convergent derived state, so it's also announced over
       // BroadcastChannel for tabs to pick up immediately. See DECODED_LOG_GEN_KEY.
       this._decodedLog = [];
+      // Bumped before any await so an already-in-flight persist/hydrate can tell a clear
+      // happened and discard its now-pre-clear result instead of repopulating the list.
+      this._clearEpoch++;
       this._renderDecodedLog();
       try {
         // Bumping the generation and emptying the log happen in one transaction, so a decode
@@ -1769,15 +1820,12 @@ class SdrHubPanel extends HTMLElement {
   // favorites, decoded log/filter, time mode, sound toggle, help-dismissed, form prefs) back to
   // its own default one at a time - and guarantees nothing was missed, unlike a growing list of
   // manual resets that could silently drift out of sync with ALL_PREF_KEYS over time.
-  _onResetPreferences() {
+  async _onResetPreferences() {
     // SOUND_LEADER_KEY is cleared here but deliberately kept *out* of ALL_PREF_KEYS - see
     // that list's own comment. Releasing leadership removes it on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
     // listing it there would make every open tab reload each time any one tab navigated away.
-    // The shared state lives in IndexedDB; clearing it is a separate (async) delete. Fired
-    // without awaiting because the reload below is what actually re-reads everything, and a
-    // failed delete simply leaves the old value to be superseded normally.
-    idbDelete([IDB_KEY_BATTERY, IDB_KEY_DECODED]).catch(() => {});
+    this._clearEpoch++;
     for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
       if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
       try {
@@ -1786,6 +1834,18 @@ class SdrHubPanel extends HTMLElement {
         // Unavailable storage - nothing to clear.
       }
     }
+    // Awaited, not fired-and-forgotten: the reload can tear the page down before the delete
+    // transaction commits - especially as idbDelete first yields at `await openIdb()` - which
+    // would leave the log and battery map that Reset was supposed to clear intact on next load.
+    try {
+      await idbDelete([IDB_KEY_BATTERY, IDB_KEY_DECODED]);
+    } catch {
+      // No usable store - nothing persisted to clear.
+    }
+    // Peers get no signal otherwise: IndexedDB has no cross-document change event, and if every
+    // localStorage preference was already at its default then removeItem is a no-op that emits
+    // no storage event either, so other panels would keep rendering the reset-away state.
+    this._postSync({ kind: "state_reset" });
     location.reload();
   }
 

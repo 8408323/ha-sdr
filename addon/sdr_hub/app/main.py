@@ -59,8 +59,21 @@ def record_seq_high_water(seq: int) -> None:
         # backward clock correction would need it. os.replace is atomic on POSIX, so an
         # interrupted write leaves the *previous* valid high-water mark intact.
         tmp = SEQ_HIGH_WATER_PATH.with_suffix(".tmp")
-        tmp.write_text(str(seq))
+        # fsync the file before the rename and the directory after it. os.replace is atomic with
+        # respect to *observers* - nobody sees a half-written file - but atomicity is not
+        # durability: after a power loss the data blocks or the new directory entry may simply
+        # never have reached disk, leaving the checkpoint missing or full of zeros. That degrades
+        # to clock-seeding, which is exactly the case this checkpoint exists to survive.
+        with open(tmp, "w") as fh:
+            fh.write(str(seq))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, SEQ_HIGH_WATER_PATH)
+        dir_fd = os.open(str(SEQ_HIGH_WATER_PATH.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
         # Advanced only after the rename actually lands. Setting it up front meant a transient
         # failure silently suppressed the next SEQ_CHECKPOINT_INTERVAL retries even once /data
         # became writable again - so the last durable checkpoint could fall further behind than
