@@ -3510,11 +3510,22 @@ class SdrHubPanel extends HTMLElement {
     // log lives inside this element either way, so both lookups resolve the same node.
     const input = this.querySelector(`[data-alias-input="${CSS.escape(this._editingAlias)}"]`);
     if (!input) {
-      // The editor is gone - the device was evicted from the capped log, or another tab cleared
-      // it. Focus ownership must be dropped with it: leaving the flag set meant that if the
-      // device reported again later, its editor would silently reappear and steal focus from
-      // whatever the user had moved on to.
-      this._aliasHadFocus = false;
+      // Absent for two very different reasons, and only one of them means the editor is over.
+      //
+      // Genuinely gone: the device was evicted from the capped log, or another tab cleared it.
+      // Focus ownership must be dropped, or the editor silently reappears when that device next
+      // reports and steals focus from whatever the user moved on to.
+      //
+      // Transiently absent: the markup is mid-rebuild. _renderShell() replaces the whole root and
+      // then re-renders the decoded log itself, so a snapshot taken by _reconcilePreferences
+      // before the rebuild was immediately undone by the nested render clearing this flag - the
+      // draft survived but focus and caret did not, which is the very thing the snapshot exists
+      // to preserve.
+      //
+      // The device still being in _decodedLog is what separates them: the log is state, not
+      // markup, and a rebuild does not touch it.
+      const stillLogged = this._decodedLog.some((e) => deviceInstanceKey(e.device || {}) === this._editingAlias);
+      if (!stillLogged) this._aliasHadFocus = false;
       return;
     }
     this._aliasDraft = input.value;
