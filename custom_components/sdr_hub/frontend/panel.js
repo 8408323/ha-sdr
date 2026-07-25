@@ -478,6 +478,15 @@ class SdrHubPanel extends HTMLElement {
     // (see _handleEvent), and MAX_TRACKED_LOW_BATTERY_DEVICES bounds the rest, so this can't grow
     // without limit the way naively caching every seen device's state would.
     this._deviceBatteryOk = new Map();
+    // batteryStateKey(device) -> true for devices already alerted-on for their *current* low
+    // streak. Deliberately separate from, and NOT cleared alongside, _deviceBatteryOk in
+    // disconnectedCallback: that map is wiped on detach because there's no authoritative
+    // snapshot to reconcile the *banner* against on reconnect, but wiping this one too would
+    // mean the very next low report for a device that was already known-low (e.g. from ordinary
+    // dashboard navigation away and back, or an HA reload) re-plays the sound even though the
+    // device never actually recovered - see the wasAlreadyLow check in _handleEvent. Only an
+    // actual battery_ok:true recovery event clears an entry here.
+    this._deviceBatterySoundAlerted = new Set();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -613,6 +622,11 @@ class SdrHubPanel extends HTMLElement {
     // recovery would otherwise leave a stale low-battery entry (and banner) showing
     // indefinitely until, by chance, that exact device reports again. Clearing here means a
     // reconnect starts from a clean slate instead of asserting possibly-stale state.
+    // _deviceBatterySoundAlerted is deliberately NOT cleared here - see its field comment. The
+    // banner (above) is fine starting blank again since it'll repopulate from the very next low
+    // report either way, but doing the same for the sound-dedup set would re-play the alert for
+    // an already-known-low device on every ordinary detach/reattach even though it never
+    // actually recovered.
     this._deviceBatteryOk.clear();
     this._renderBatteryAlerts();
   }
@@ -676,6 +690,11 @@ class SdrHubPanel extends HTMLElement {
     this._renderCoverage();
     this._renderSweeps(forceRebuildSweeps);
     this._renderReceivers();
+    // Only needed on the very first _loadState() (the constructor already restored
+    // this._decodedLog from localStorage before _renderShell() ran, so the container exists but
+    // is still empty until this fires) - subsequent calls are a harmless redundant re-render,
+    // since every real update to _decodedLog already re-renders itself via _handleEvent().
+    this._renderDecodedLog();
   }
 
   _handleEvent(event) {
@@ -709,13 +728,19 @@ class SdrHubPanel extends HTMLElement {
         const key = batteryStateKey(decodedDevice);
         if (decodedDevice.battery_ok) {
           // Recovered (or was never low) - nothing to alert on, so drop any stored entry
-          // rather than keeping a growing pile of healthy devices around forever.
+          // rather than keeping a growing pile of healthy devices around forever. Also clears
+          // the sound-dedup entry - a real recovery is the only thing that should re-arm the
+          // alert for this device's next low report.
           this._deviceBatteryOk.delete(key);
+          this._deviceBatterySoundAlerted.delete(key);
         } else {
-          // Checked before the delete-then-set below (which would otherwise always make a
-          // membership check true) - only a device *newly* going low should play a sound, not
-          // every repeated low report from a device that's already shown in the banner.
-          const wasAlreadyLow = this._deviceBatteryOk.has(key);
+          // Checked against _deviceBatterySoundAlerted, not _deviceBatteryOk - the latter is
+          // cleared on every panel detach/reconnect (see its field comment), which would
+          // otherwise make a same-still-low device's next report always look "newly low" again
+          // after ordinary dashboard navigation. Only an actual battery_ok:true recovery (above)
+          // clears the sound-dedup entry.
+          const wasAlreadyLow = this._deviceBatterySoundAlerted.has(key);
+          this._deviceBatterySoundAlerted.add(key);
           // Delete-then-set (rather than a plain set on an existing key) moves this entry to
           // the end of the Map's iteration order, so the eviction below reliably drops the
           // *oldest* still-low device first when the bound is exceeded.
@@ -727,7 +752,9 @@ class SdrHubPanel extends HTMLElement {
             channel: decodedDevice.channel,
           });
           while (this._deviceBatteryOk.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
-            this._deviceBatteryOk.delete(this._deviceBatteryOk.keys().next().value);
+            const evicted = this._deviceBatteryOk.keys().next().value;
+            this._deviceBatteryOk.delete(evicted);
+            this._deviceBatterySoundAlerted.delete(evicted);
           }
           if (!wasAlreadyLow && this._batterySoundEnabled) this._playBatteryAlertSound();
         }
@@ -987,6 +1014,12 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
       this._batterySoundEnabled = ev.target.checked;
       saveBatterySoundEnabled(this._batterySoundEnabled);
+      // Create (or resume) the AudioContext right here, inside the checkbox's own "change"
+      // handler - some browsers/HA WebViews only allow Web Audio to start or resume from a
+      // direct user gesture. Waiting until the *later*, gesture-less decoded_device WS event
+      // that actually plays the alert would construct/resume the context outside that window,
+      // leaving it "running" in name but producing no audible sound - see _playBatteryAlertSound.
+      if (this._batterySoundEnabled) this._ensureAudioContextRunning();
     });
     this._wireConfirmButton(this.querySelector("#sdr-hub-reset-prefs"), () => this._onResetPreferences(), "Confirm reset?");
   }
@@ -1563,6 +1596,22 @@ class SdrHubPanel extends HTMLElement {
     el.innerHTML = message;
   }
 
+  // Creates the AudioContext (if needed) and resumes it if suspended. Split out from
+  // _playBatteryAlertSound so the battery-sound-toggle change handler can call this directly
+  // from within the user's own click/change gesture - see that handler for why. Best-effort:
+  // resume() is async and this doesn't await it, since by the time an actual alert fires later
+  // the context is normally already "running" from this gesture-time call.
+  _ensureAudioContextRunning() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = this._audioCtx ?? (this._audioCtx = new AudioCtx());
+      if (ctx.state === "suspended") ctx.resume();
+    } catch {
+      // Unsupported/unavailable AudioContext - _playBatteryAlertSound's own try/catch handles
+      // this the same way when the alert actually tries to play.
+    }
+  }
+
   // A short synthesized beep (Web Audio API oscillator, no external asset) rather than an
   // <audio> element with a bundled sound file - avoids shipping/loading a binary asset for one
   // brief tone. The AudioContext is created lazily and reused across calls (not one per alert) -
@@ -1571,6 +1620,7 @@ class SdrHubPanel extends HTMLElement {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = this._audioCtx ?? (this._audioCtx = new AudioCtx());
+      if (ctx.state === "suspended") ctx.resume();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
