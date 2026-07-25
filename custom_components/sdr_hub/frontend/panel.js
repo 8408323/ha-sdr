@@ -685,8 +685,18 @@ class SdrHubPanel extends HTMLElement {
       // tabs, so it's the one write this needs to actively propagate rather than leave to each
       // tab's own event stream.
       if (ev.key === DECODED_LOG_KEY && ev.newValue === "[]") {
-        this._decodedLog = [];
-        this._renderDecodedLog();
+        // Guards a race this handler can otherwise lose: "storage" events queue on the event
+        // loop, so this can fire *after* this tab has since received and saved its own newer
+        // decoded_device event (overwriting localStorage with a nonempty log) - blindly trusting
+        // ev.newValue (always "[]" here, by definition of this branch) would wipe out that newer
+        // entry based on stale information. Re-reading the *current* value at the moment this
+        // actually runs (rather than what triggered the event) tells us whether the clear this
+        // event represents is still the latest word on the subject - if something newer has
+        // since been written, defer to that instead.
+        if (localStorage.getItem(DECODED_LOG_KEY) === "[]") {
+          this._decodedLog = [];
+          this._renderDecodedLog();
+        }
       }
     };
     window.addEventListener("storage", this._onStorageEvent);
@@ -706,6 +716,15 @@ class SdrHubPanel extends HTMLElement {
     // add-on's actual broadcast rate, evicting "keep full history" mode's capped buffer
     // twice as fast as it should).
     if (!this._unsub && !this._subscribing) {
+      // Reload the persisted sound-dedup set here too, not just once in the constructor -
+      // disconnectedCallback tears down both the WS subscription and the storage listener, so
+      // while detached this instance misses both a live battery_ok:true recovery from the add-on
+      // AND another tab's own recovery-driven update to BATTERY_SOUND_ALERTED_KEY. Retaining the
+      // stale in-memory Set across the reattach would keep treating an already-recovered device
+      // as "already alerted", silently skipping the alert for its next real low report even
+      // though the recovery was in fact observed (by another tab, or would have been by this one
+      // had it stayed connected) and already persisted.
+      this._deviceBatterySoundAlerted = loadBatterySoundAlerted();
       this._loadState();
       this._subscribe();
     }
@@ -1791,22 +1810,47 @@ class SdrHubPanel extends HTMLElement {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = this._audioCtx ?? (this._audioCtx = new AudioCtx());
-      if (ctx.state === "suspended") ctx.resume();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = 880;
-      gain.gain.setValueAtTime(0.2, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.4);
+      // ctx.currentTime is frozen while suspended, so scheduling the oscillator immediately
+      // (the old behavior) queued it against that frozen time rather than actually playing now -
+      // it could then suddenly play much later, whenever some *unrelated* interaction happened
+      // to unlock the context, well after the low-battery event that triggered it. Wait for a
+      // successful resume() and confirm the context actually reports "running" before scheduling
+      // - resume() rejecting (still no qualifying gesture, or genuinely unsupported) is handled
+      // explicitly below rather than by letting it silently reject unobserved.
+      if (ctx.state === "suspended") {
+        ctx
+          .resume()
+          .then(() => {
+            if (ctx.state === "running") this._scheduleBatteryAlertTone(ctx);
+          })
+          .catch(() => {
+            // Same "convenience notification, not worth surfacing an error over" reasoning as
+            // the outer catch below.
+          });
+        return;
+      }
+      this._scheduleBatteryAlertTone(ctx);
     } catch {
       // Autoplay policy (no prior user gesture on this page) or an unsupported/unavailable
       // AudioContext - this is a convenience notification on top of the always-visible banner,
       // not worth surfacing an error over.
     }
+  }
+
+  // The actual oscillator scheduling, split out of _playBatteryAlertSound so it can be deferred
+  // until after an in-flight ctx.resume() actually resolves (see there) instead of always running
+  // synchronously against a context that might still be suspended.
+  _scheduleBatteryAlertTone(ctx) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.2, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.4);
   }
 
   _renderDecodedLog() {
