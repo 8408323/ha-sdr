@@ -271,6 +271,18 @@ function serializeBatteryRecord(gen, map, evicted = new Map(), appliedGaps = [],
   };
 }
 
+// Highest transition order a battery record knows about, from any source. Used to seed an
+// invalidation boundary: a freshly opened tab has _maxSeenOrd 0 until its first decode, so
+// deriving the boundary from that alone could record 0 while the stored map held far higher
+// orders - and any delayed pre-gap writer would then compare above it and resurrect exactly the
+// state the invalidation cleared.
+function batteryRecordHighWater(record) {
+  let max = Number.isFinite(record.boundaryOrd) ? record.boundaryOrd : 0;
+  for (const entry of record.map.values()) if (Number.isFinite(entry.ord) && entry.ord > max) max = entry.ord;
+  for (const ord of record.evicted.values()) if (Number.isFinite(ord) && ord > max) max = ord;
+  return max;
+}
+
 // Union of two eviction maps, keeping the highest known recovery order per key. Used wherever two
 // views of the battery state are combined, so neither side's eviction knowledge is rolled back by
 // merging with an older snapshot.
@@ -451,6 +463,19 @@ const ALL_PREF_KEYS = [
   BATTERY_SOUND_ALERT_KEY,
   BATTERY_LOW_KEY,
 ];
+
+// Fingerprint of the persisted values that are baked into the shell's markup when it is rendered
+// (rather than applied to live controls afterwards). _reconcilePreferences can update an input's
+// value, but it cannot retro-fit markup, so these are handled by rebuilding instead.
+function shellPrefsSignature() {
+  try {
+    return [SWEEP_FORM_PREFS_KEY, RECEIVER_FORM_PREFS_KEY, HELP_DISMISSED_KEY]
+      .map((k) => `${k}=${localStorage.getItem(k) ?? ""}`)
+      .join("|");
+  } catch {
+    return "";
+  }
+}
 
 function loadFormPrefs(key) {
   try {
@@ -1208,6 +1233,19 @@ class SdrHubPanel extends HTMLElement {
   // the storage listener was torn down and change notifications were therefore missed.
   _reconcilePreferences() {
     const hadShell = !!this.querySelector("#sdr-hub-root");
+    // The sweep/receiver form defaults and the help card's visibility are rendered *into* the
+    // shell rather than driven from live state, so no amount of updating existing controls can
+    // reconcile them - a stale form would also re-persist the reset-away values on its next
+    // submit. Rebuild the shell instead when what it was rendered from has changed, which is
+    // cheap and rare (only on reattach, and only when another tab actually changed them).
+    if (hadShell && this._shellPrefsSignature !== undefined && this._shellPrefsSignature !== shellPrefsSignature()) {
+      this._renderShell();
+      this._renderDecodedLog();
+      this._renderBatteryAlerts();
+      this._renderConnectionStatus();
+      this._loadState(true);
+      return;
+    }
     const previousColormap = this._colormap;
     const previousMin = this._dbMin;
     const previousMax = this._dbMax;
@@ -1581,6 +1619,12 @@ class SdrHubPanel extends HTMLElement {
   async _hydrateBatteryState({ adopt = false } = {}) {
     try {
       const settled = normalizeBatteryRecord(await idbGet(IDB_KEY_BATTERY));
+      // Mirrors _applySettledDecoded: an observed generation change means some tab invalidated or
+      // reset, and adopting that generation without recording it left a pre-gap transition already
+      // waiting in _applyBatteryTransition free to resume with the *new* generation as expectedGen,
+      // skip the mismatch boundary entirely, and write stale state into the cleared generation -
+      // after which the delayed gap is a no-op against appliedGaps, so nothing could correct it.
+      if (settled.gen !== this._batteryGen) this._batteryEpoch++;
       this._deviceBatteryOk =
         !adopt && settled.gen === this._batteryGen
           ? mergeBatteryLowState(this._deviceBatteryOk, settled.map, mergeEvicted(this._batteryEvicted, settled.evicted))
@@ -1782,7 +1826,7 @@ class SdrHubPanel extends HTMLElement {
           gapId ? [...current.appliedGaps, gapId] : current.appliedGaps,
           // Monotonic, like the decoded clearedOrd: a later bump must never lower it, or writes
           // from before an earlier bump could compare above the reduced boundary and return.
-          Math.max(this._maxSeenOrd ?? 0, current.boundaryOrd ?? 0),
+          Math.max(this._maxSeenOrd ?? 0, batteryRecordHighWater(current)),
         );
       });
       const settled = normalizeBatteryRecord(record);
@@ -2021,6 +2065,9 @@ class SdrHubPanel extends HTMLElement {
   // ── shell ────────────────────────────────────────────────────────────────
 
   _renderShell() {
+    // Recorded at render time so a later reattach can tell whether the markup this produced is
+    // still consistent with storage - see _reconcilePreferences.
+    this._shellPrefsSignature = shellPrefsSignature();
     // Recreates #sdr-hub-sweeps as empty - invalidate the cached "already rendered" keys used
     // by _renderSweeps()'s no-op-refresh skip, or the next _renderSweeps() call would see an
     // unchanged sweep id set and wrongly conclude the (now-empty) container is already
@@ -2313,7 +2360,7 @@ class SdrHubPanel extends HTMLElement {
           new Map(),
           cur.evicted,
           cur.appliedGaps,
-          Math.max(this._maxSeenOrd ?? 0, cur.boundaryOrd ?? 0),
+          Math.max(this._maxSeenOrd ?? 0, batteryRecordHighWater(cur)),
         );
       });
     } catch {
