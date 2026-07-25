@@ -484,12 +484,17 @@ function mergeBatteryLowState(current, incoming) {
       // still-low sensor has a newer ord, so replacing outright would drop alertedAt and make
       // the next comparison see the transition as never-alerted - re-playing the tone on every
       // single transmission, rather than once when it first went low.
-      const keepAlerted = existing && existing.low && entry.low ? existing.alertedAt : undefined;
+      // Carry the marker only within the same episode (same lowSince) - across a recovery the
+      // episode ends, and the next low must be able to alert again.
+      const sameEpisode =
+        existing && existing.low && entry.low && (existing.lowSince ?? existing.ord) === (entry.lowSince ?? entry.ord);
+      const keepAlerted = sameEpisode ? existing.alertedAt : undefined;
       out.set(key, keepAlerted !== undefined ? { ...entry, alertedAt: keepAlerted } : entry);
     } else if (
       Number.isFinite(entry.alertedAt) &&
       existing.low &&
       entry.low &&
+      (existing.lowSince ?? existing.ord) === (entry.lowSince ?? entry.ord) &&
       !(Number.isFinite(existing.alertedAt) && existing.alertedAt >= entry.alertedAt)
     ) {
       // The incoming copy carries an alert marker this one lacks (or a newer one) - the sound
@@ -894,7 +899,7 @@ class SdrHubPanel extends HTMLElement {
       // shared storage instead, which is exactly what a still-connected peer has been keeping
       // up to date, and don't touch the generation.
       if (wasDisconnected) {
-        this._hydrateBatteryState();
+        this._hydrateBatteryState({ adopt: true });
       }
     };
     this._onConnDisconnected = () => {
@@ -1085,7 +1090,8 @@ class SdrHubPanel extends HTMLElement {
     // that state can legitimately be ahead of storage (a peer wrote a staler value, or this
     // tab's own writes were blocked by quota), so replacing would lose it.
     // Both are re-read from IndexedDB, which is authoritative - see the storage-layer comment.
-    this._hydrateBatteryState();
+    // adopt:true because a detached element's battery cache is strictly stale (see the method).
+    this._hydrateBatteryState({ adopt: true });
     this._renderBatteryAlerts();
     this._hydrateDecodedLog();
     if (!this._unsub && !this._subscribing) {
@@ -1315,13 +1321,19 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
-  async _hydrateBatteryState() {
+  // `adopt` replaces rather than merges. Used on reattach: while detached this element received
+  // no events, so its cache is strictly behind - and worse, a recovery tombstone it never saw can
+  // since have been evicted, leaving nothing in the store able to contradict its retained stale
+  // low. Merging an unbounded-age cache would then pin a false banner indefinitely. During normal
+  // operation merging is right, since a snapshot can predate a transition applied optimistically
+  // while the read was in flight.
+  async _hydrateBatteryState({ adopt = false } = {}) {
     try {
       const settled = normalizeBatteryRecord(await idbGet(IDB_KEY_BATTERY));
-      // Same merge-not-replace reasoning as _applySettledDecoded - a hydration read can return a
-      // snapshot older than a transition applied optimistically while it was in flight.
       this._deviceBatteryOk =
-        settled.gen === this._batteryGen ? mergeBatteryLowState(this._deviceBatteryOk, settled.map) : settled.map;
+        !adopt && settled.gen === this._batteryGen
+          ? mergeBatteryLowState(this._deviceBatteryOk, settled.map)
+          : settled.map;
       this._batteryGen = settled.gen;
       this._renderBatteryAlerts();
     } catch {
@@ -1348,12 +1360,18 @@ class SdrHubPanel extends HTMLElement {
     );
     this._renderDecodedLog();
     const epoch = this._clearEpoch;
+    const expectedGen = this._decodedLogGen;
     try {
       // The whole get-merge-put happens inside one readwrite transaction, so a concurrent tab
       // cannot interleave and clobber this with a shorter prefix of the same log. The generation
       // is read *within* the transaction too, so a clear that lands first is always observed.
       const record = await idbMutate(IDB_KEY_DECODED, (raw) => {
         const current = normalizeDecodedRecord(raw);
+        // No-op if the log was cleared between this event arriving and the transaction running.
+        // Stamping it with current.gen instead would commit a pre-clear event *into the new
+        // generation*, where it survives on every later hydration - and the local epoch check
+        // can't help, since it only suppresses applying the result, not the write itself.
+        if (current.gen !== expectedGen) return undefined;
         const merged = mergeDecodedLog(current.log, [{ ...event, _gen: current.gen }]);
         return { gen: current.gen, entries: merged };
       });
@@ -1416,7 +1434,20 @@ class SdrHubPanel extends HTMLElement {
     // locally sane.
     const ord = Number.isFinite(eventOrder(event)) ? eventOrder(event) : Date.now();
     const previous = this._deviceBatteryOk.get(key);
-    const entry = { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, ord };
+    // lowSince identifies the *episode*: it is the ord at which this device last went from
+    // not-low to low, and is carried across repeat low reports. A recovery ends the episode, so
+    // a later low starts a new one with a new lowSince. Alert markers are matched on it - see
+    // mergeBatteryLowState - so a marker delayed past a recovery can't silence the next episode.
+    const previousEntry = this._deviceBatteryOk.get(key);
+    const lowSince = isLow ? (previousEntry?.low ? (previousEntry.lowSince ?? previousEntry.ord) : ord) : undefined;
+    const entry = {
+      model: decodedDevice.model,
+      id: decodedDevice.id,
+      channel: decodedDevice.channel,
+      low: isLow,
+      ord,
+      ...(lowSince !== undefined ? { lowSince } : {}),
+    };
     // Every tab receives this same broadcast and applies it, but each does so inside its own
     // IndexedDB transaction, so the concurrent updates serialize at the database rather than
     // racing. Awaited so the alert decision below reads the settled state, not a guess.
@@ -1441,9 +1472,14 @@ class SdrHubPanel extends HTMLElement {
     // Optimistic local update so the banner and alert decision don't lag a round-trip.
     this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, new Map([[key, entry]]));
     this._renderBatteryAlerts();
+    const expectedGen = this._batteryGen;
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
         const current = normalizeBatteryRecord(raw);
+        // Same reasoning as _persistDecodedEvent: a transition that began before an
+        // invalidation must not be merged into the generation that invalidation created, or a
+        // delayed transaction in any tab could recreate the banner the bump was meant to discard.
+        if (current.gen !== expectedGen) return undefined;
         const merged = mergeBatteryLowState(current.map, new Map([[key, entry]]));
         return serializeBatteryRecord(current.gen, merged);
       });
@@ -1508,7 +1544,11 @@ class SdrHubPanel extends HTMLElement {
     if (this._soundLeaderTimer) return;
     this._soundLeaderTimer = setInterval(() => {
       if (!this._canPlayAlertSound()) {
-        this._stopSoundLeaderHeartbeat();
+        // Release rather than just stopping the timer. Leaving the lease to age out means every
+        // other playable tab rejects it as fresh for up to the TTL, so a device that sends a
+        // single low report in that window is never heard at all - the same missed-alert gap the
+        // toggle and detach paths already avoid by releasing immediately.
+        this._releaseSoundLeadership();
         return;
       }
       // Only renew a claim that's still ours - another tab may have legitimately taken over

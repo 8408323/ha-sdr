@@ -28,6 +28,7 @@ SEQ_HIGH_WATER_PATH = Path("/data/event_seq")
 # keeps that guarantee while writing ~1/N as often. Gaps in the sequence are harmless.
 SEQ_CHECKPOINT_INTERVAL = 100
 _seq_high_water_written = 0
+_seq_scheduled_high_water = 0
 
 
 def resolve_seq_seed() -> int:
@@ -46,10 +47,9 @@ def resolve_seq_seed() -> int:
     return max(now_ms, stored + SEQ_CHECKPOINT_INTERVAL)
 
 
-def record_seq_high_water(seq: int) -> None:
+def _write_seq_checkpoint(seq: int) -> None:
+    """Durably records `seq`. Blocking - must not run on the event loop."""
     global _seq_high_water_written
-    if seq - _seq_high_water_written < SEQ_CHECKPOINT_INTERVAL:
-        return
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Written to a temp file and atomically renamed rather than written in place. write_text
@@ -82,8 +82,25 @@ def record_seq_high_water(seq: int) -> None:
         _seq_high_water_written = seq
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
-        # rather than taking the decoder thread down over a checkpoint write.
+        # rather than failing the decode over a checkpoint write.
         pass
+
+
+def record_seq_high_water(loop: asyncio.AbstractEventLoop, seq: int) -> None:
+    """Schedules a durable checkpoint if enough sequence numbers have been issued.
+
+    The write plus two fsyncs are deliberately pushed to a worker thread. on_device is called
+    straight from Rtl433Decoder._read_loop, which is an asyncio task on the main loop - doing
+    blocking file I/O there would stall everything else the loop is running, including the
+    WebSocket writers and the HTTP API, for as long as /data takes to sync.
+    """
+    global _seq_scheduled_high_water
+    if seq - _seq_scheduled_high_water < SEQ_CHECKPOINT_INTERVAL:
+        return
+    # Tracked separately from _seq_high_water_written (which only advances on a *successful*
+    # write) so a slow or failing disk can't queue an executor job per decode.
+    _seq_scheduled_high_water = seq
+    loop.run_in_executor(None, _write_seq_checkpoint, seq)
 
 
 @asynccontextmanager
@@ -108,8 +125,9 @@ async def lifespan(app: FastAPI):
     # behind their existing log (and gets truncated as "old") while newer battery transitions
     # are rejected as lower-ordered - a recovery could stay hidden indefinitely. Seeding from
     # max(last issued, now) makes the sequence non-decreasing regardless of what the clock does.
-    # next() on an itertools.count is atomic under the GIL, which matters because on_device is
-    # invoked from the decoder threads rather than the event loop.
+    # on_device runs on the event loop (Rtl433Decoder._read_loop is an asyncio task), so the
+    # counter is only ever advanced from a single thread - the durable checkpoint is what gets
+    # pushed to an executor, since that is the part that would block the loop.
     event_seq = itertools.count(resolve_seq_seed())
 
     def on_row(sweep_id: str, row: SweepRow) -> None:
@@ -138,7 +156,7 @@ async def lifespan(app: FastAPI):
         # increasing for the life of this process, so ordering can't invert. received_at is kept
         # alongside it for display/diagnostics only.
         seq = next(event_seq)
-        record_seq_high_water(seq)
+        record_seq_high_water(loop, seq)
         broadcaster.broadcast(
             {
                 "type": "decoded_device",
