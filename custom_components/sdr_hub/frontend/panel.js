@@ -576,6 +576,16 @@ class SdrHubPanel extends HTMLElement {
       // this panel (an automation service call, another open panel) - reload the
       // authoritative snapshot rather than hand-patch local state.
       this._loadState();
+    } else if (event.type === "stream_reconnected") {
+      // The coordinator's own WS connection to the add-on dropped and just reconnected - see
+      // coordinator.py's ws_loop for why it sends this. This panel element can stay attached
+      // to HA the whole time that happens (unlike disconnectedCallback's reconnect case above,
+      // which only covers *this panel* detaching), so it needs its own trigger to discard
+      // event-derived state that may have missed updates during the outage (e.g. a low-battery
+      // device's recovery) rather than keep asserting what's now possibly stale.
+      this._deviceBatteryOk.clear();
+      this._renderBatteryAlerts();
+      this._loadState();
     }
   }
 

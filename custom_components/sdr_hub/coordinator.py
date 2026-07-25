@@ -109,9 +109,22 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def ws_loop(self) -> None:
         """Long-running task (owned by the config entry) that keeps the add-on's WS stream forwarded."""
         self._stopping = False
+        first_connection = True
         while not self._stopping:
             try:
                 async with self.api.connect_ws() as ws:
+                    if not first_connection:
+                        # Reconnecting after an outage, not connecting for the first time. Any
+                        # events the add-on emitted during the gap (e.g. a low-battery device's
+                        # recovery) were missed, so panel-side state derived purely from the
+                        # event stream (see panel.js's _deviceBatteryOk) can no longer be trusted
+                        # - tell subscribers to discard and rebuild it, rather than keep asserting
+                        # what may now be stale. This fires on every reconnect, independently of
+                        # (and in addition to) the panel's own disconnectedCallback-driven clear,
+                        # since the panel element can stay attached to HA the whole time this
+                        # add-on-facing WS drops and reconnects underneath it.
+                        self._dispatch({"type": "stream_reconnected"})
+                    first_connection = False
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
