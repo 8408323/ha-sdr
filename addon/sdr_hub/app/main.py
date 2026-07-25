@@ -266,7 +266,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SDR Hub",
     description="RTL-SDR hardware access for Home Assistant: wideband spectrum sweeps and configurable receivers.",
-    version="0.1.0",
+    # Kept in step with the `version:` field in addon/sdr_hub/config.yaml - they describe the same
+    # release, and a mismatch means /openapi.json and /docs advertise a different API version than
+    # the Supervisor shows for the installed add-on. Bump both together.
+    version="0.2.0",
     lifespan=lifespan,
 )
 app.include_router(router)

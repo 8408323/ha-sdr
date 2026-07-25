@@ -240,11 +240,18 @@ function normalizeBatteryRecord(raw) {
   // device's low report below it, so once 50 unrelated devices had recovered, a tab receiving a
   // genuinely late first-low for some other device silently dropped a real warning - with no
   // evidence that particular key had ever recovered. Only the key's own recovery may suppress it.
+  // Highest event order covered by the generation bump that produced this record - the battery
+  // analogue of the decoded log's clearedOrd. Without it, every generation mismatch was rejected
+  // outright, including a transition that arrived *after* a peer's reset but before its
+  // notification could travel: a sensor whose only low report lands in that window stayed
+  // unalerted with nothing able to recover it.
+  const boundaryOrd = raw && Number.isFinite(raw.boundaryOrd) ? raw.boundaryOrd : null;
   const rawEvicted = raw && raw.evicted && typeof raw.evicted === "object" ? raw.evicted : {};
   const evicted = new Map(Object.entries(rawEvicted).filter(([, v]) => Number.isFinite(v)));
   return {
     gen,
     appliedGaps,
+    boundaryOrd,
     evicted,
     map: new Map(
       Object.entries(entries).filter(
@@ -254,10 +261,11 @@ function normalizeBatteryRecord(raw) {
   };
 }
 
-function serializeBatteryRecord(gen, map, evicted = new Map(), appliedGaps = []) {
+function serializeBatteryRecord(gen, map, evicted = new Map(), appliedGaps = [], boundaryOrd = null) {
   return {
     gen,
     appliedGaps: appliedGaps.slice(-MAX_TRACKED_APPLIED_GAPS),
+    boundaryOrd,
     evicted: Object.fromEntries(evicted),
     entries: Object.fromEntries(map),
   };
@@ -1217,6 +1225,15 @@ class SdrHubPanel extends HTMLElement {
     if (soundToggle) soundToggle.checked = this._batterySoundEnabled;
     const timeToggle = this.querySelector("#sdr-hub-decoded-time-toggle");
     if (timeToggle) timeToggle.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
+    // The colormap and contrast inputs matter beyond cosmetics: applyDbRange() reads whichever
+    // companion input it is not changing, so leaving them stale meant editing one bound wrote back
+    // the *old* value of the other, partially reverting a range another tab had persisted.
+    const colormapEl = this.querySelector("#sdr-hub-colormap");
+    if (colormapEl) colormapEl.value = this._colormap;
+    const dbMinEl = this.querySelector("#sdr-hub-db-min");
+    if (dbMinEl) dbMinEl.value = this._dbMin;
+    const dbMaxEl = this.querySelector("#sdr-hub-db-max");
+    if (dbMaxEl) dbMaxEl.value = this._dbMax;
     this._renderDecodedLog();
     if (previousColormap !== this._colormap || previousMin !== this._dbMin || previousMax !== this._dbMax) {
       this._renderSweeps(true);
@@ -1763,6 +1780,9 @@ class SdrHubPanel extends HTMLElement {
           new Map(),
           current.evicted,
           gapId ? [...current.appliedGaps, gapId] : current.appliedGaps,
+          // Monotonic, like the decoded clearedOrd: a later bump must never lower it, or writes
+          // from before an earlier bump could compare above the reduced boundary and return.
+          Math.max(this._maxSeenOrd ?? 0, current.boundaryOrd ?? 0),
         );
       });
       const settled = normalizeBatteryRecord(record);
@@ -1859,10 +1879,15 @@ class SdrHubPanel extends HTMLElement {
     try {
       const record = await idbMutate(IDB_KEY_BATTERY, (raw) => {
         const current = normalizeBatteryRecord(raw);
-        // Same reasoning as _persistDecodedEvent: a transition that began before an
-        // invalidation must not be merged into the generation that invalidation created, or a
-        // delayed transaction in any tab could recreate the banner the bump was meant to discard.
-        if (current.gen !== expectedGen) return undefined;
+        // Same reasoning as _persistDecodedEvent, including its boundary refinement: a transition
+        // that began before a bump must not be merged into the generation that bump created. But a
+        // transition ordered *above* the boundary post-dates it - typically one that arrived after
+        // a peer's reset and before its notification travelled - and rejecting those outright left
+        // a device whose only low report landed in that window permanently unalerted.
+        if (current.gen !== expectedGen) {
+          const boundary = current.boundaryOrd;
+          if (!Number.isFinite(base.ord) || !Number.isFinite(boundary) || base.ord <= boundary) return undefined;
+        }
         // The episode is derived HERE, from the transaction's own authoritative map, not from
         // whatever this tab happened to have cached when the event arrived. Deriving it outside
         // meant a repeat low arriving mid-hydration saw an incomplete cache, was stamped as a new
@@ -1873,7 +1898,13 @@ class SdrHubPanel extends HTMLElement {
           new Map([[key, withEpisode(base, current.map.get(key))]]),
           mergeEvicted(this._batteryEvicted, current.evicted),
         );
-        return serializeBatteryRecord(current.gen, merged.map, merged.evicted, current.appliedGaps);
+        return serializeBatteryRecord(
+          current.gen,
+          merged.map,
+          merged.evicted,
+          current.appliedGaps,
+          current.boundaryOrd,
+        );
       });
       const settled = normalizeBatteryRecord(record);
       // Same overlapping-transaction reasoning as _persistDecodedEvent - merge unless the
@@ -2277,7 +2308,13 @@ class SdrHubPanel extends HTMLElement {
       });
       await idbMutate(IDB_KEY_BATTERY, (raw) => {
         const cur = normalizeBatteryRecord(raw);
-        return serializeBatteryRecord(cur.gen + 1, new Map(), cur.evicted, cur.appliedGaps);
+        return serializeBatteryRecord(
+          cur.gen + 1,
+          new Map(),
+          cur.evicted,
+          cur.appliedGaps,
+          Math.max(this._maxSeenOrd ?? 0, cur.boundaryOrd ?? 0),
+        );
       });
     } catch {
       // No usable store - nothing persisted to clear.
