@@ -618,7 +618,14 @@ class SdrHubPanel extends HTMLElement {
             <button id="sdr-hub-export-config" type="button" style="${BTN_SECONDARY}">Export config</button>
             <label style="${BTN_SECONDARY};display:inline-flex;align-items:center;cursor:pointer;">
               Import config
-              <input id="sdr-hub-import-config" type="file" accept="application/json" style="display:none;">
+              <!-- Visually hidden via clipping, not display:none - display:none removes the
+                   input from both the focus and accessibility trees, and the wrapping <label>
+                   itself is never in the tab order, so a keyboard-only user would have no way
+                   to reach the file picker at all. This clip-based hiding keeps the input
+                   focusable/operable (Tab + Enter/Space opens the picker) while staying
+                   invisible, matching the visible "Import config" label text. -->
+              <input id="sdr-hub-import-config" type="file" accept="application/json"
+                style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">
             </label>
           </div>
         </div>
@@ -666,6 +673,14 @@ class SdrHubPanel extends HTMLElement {
       this._renderSweeps(true);
     });
     const applyDbRange = () => {
+      // Number("") is 0, not NaN - checking the raw string for emptiness first (rather than
+      // relying on Number.isFinite alone) stops a cleared-then-blurred field from silently
+      // being accepted as a real 0 dB boundary while the input itself still looks blank.
+      if (dbMinInput.value.trim() === "" || dbMaxInput.value.trim() === "") {
+        dbMinInput.value = this._dbMin;
+        dbMaxInput.value = this._dbMax;
+        return;
+      }
       const min = Number(dbMinInput.value);
       const max = Number(dbMaxInput.value);
       // A non-positive span would divide by <= 0 in _paintRow's t calculation, turning the
@@ -1423,9 +1438,14 @@ class SdrHubPanel extends HTMLElement {
       // Overwrite the peak bin's pixel with a stark, unmistakable color - baked directly into
       // the bitmap (not a separate overlay), so it stays exactly where it happened even once
       // this row scrolls into history, without needing to track marker positions separately.
+      // Pure red rather than white: white is a real, reachable value in every colormap (it's
+      // exactly what Grayscale clamps to at/above the contrast max), so a strong or
+      // contrast-saturated signal would otherwise paint right over the marker and hide it.
+      // None of COLORMAPS' ramps (blue, viridis, grayscale) ever produce pure red, so it stays
+      // visually distinct regardless of which colormap is active.
       rowImage.data[peak.bin * 4] = 255;
-      rowImage.data[peak.bin * 4 + 1] = 255;
-      rowImage.data[peak.bin * 4 + 2] = 255;
+      rowImage.data[peak.bin * 4 + 1] = 0;
+      rowImage.data[peak.bin * 4 + 2] = 0;
       rowImage.data[peak.bin * 4 + 3] = 255;
     }
     ctx.putImageData(rowImage, 0, y);
