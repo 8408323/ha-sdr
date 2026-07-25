@@ -367,6 +367,8 @@ class SdrHubPanel extends HTMLElement {
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
+    this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
+    this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
     this._favoriteDevices = loadFavoriteDevices(); // Set of "model|id" - pinned to top of the decoded log
     this._colormap = loadColormap();
     const dbRange = loadDbRange();
@@ -567,6 +569,7 @@ class SdrHubPanel extends HTMLElement {
           <button data-dismiss-help style="${BTN}">Got it, don't show again</button>
         </div>
         <div id="sdr-hub-error" style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
+        <div id="sdr-hub-battery-alert" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Dongles</h2>
@@ -604,6 +607,7 @@ class SdrHubPanel extends HTMLElement {
             </label>
             <button type="submit" style="${BTN}">Start sweep</button>
           </form>
+          <input id="sdr-hub-sweep-filter" type="text" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-sweeps"></div>
         </div>
 
@@ -620,6 +624,7 @@ class SdrHubPanel extends HTMLElement {
             <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. Weather station" style="${INPUT};width:140px"></label>
             <button type="submit" style="${BTN}">Start receiver</button>
           </form>
+          <input id="sdr-hub-receiver-filter" type="text" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-receivers"></div>
         </div>
 
@@ -671,6 +676,14 @@ class SdrHubPanel extends HTMLElement {
     });
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
+    this.querySelector("#sdr-hub-sweep-filter").addEventListener("input", (ev) => {
+      this._sweepFilter = ev.target.value.trim().toLowerCase();
+      this._applySweepFilter();
+    });
+    this.querySelector("#sdr-hub-receiver-filter").addEventListener("input", (ev) => {
+      this._receiverFilter = ev.target.value.trim().toLowerCase();
+      this._applyReceiverFilter();
+    });
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
     this._wireColormapControls();
@@ -988,8 +1001,9 @@ class SdrHubPanel extends HTMLElement {
         const titleHtml = s.label
           ? `<strong>${esc(s.label)}</strong> <span style="color:var(--secondary-text-color,#727272);">(${rangeText})</span>`
           : rangeText;
+        const searchText = `${s.label || ""} ${s.dongle_serial} ${fmtMHz(s.start_hz)} ${fmtMHz(s.stop_hz)}`.toLowerCase();
         return `
-      <div style="margin-bottom:16px;">
+      <div data-sweep-row="${esc(s.id)}" data-search="${esc(searchText)}" style="margin-bottom:16px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <span>${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
@@ -1023,7 +1037,7 @@ class SdrHubPanel extends HTMLElement {
       })
       .join("");
     for (const s of this._state.sweeps) {
-      el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`).addEventListener("click", () =>
+      this._wireConfirmButton(el.querySelector(`[data-remove-sweep="${CSS.escape(s.id)}"]`), () =>
         this._onRemoveSweep(s.id),
       );
       this._wireCopyButton(el.querySelector(`[data-copy-sweep-yaml="${CSS.escape(s.id)}"]`), () => this._sweepYaml(s));
@@ -1072,6 +1086,35 @@ class SdrHubPanel extends HTMLElement {
         }
       }
     }
+    this._applySweepFilter();
+  }
+
+  // Hides (rather than excludes from the render above) non-matching sweep cards - keeps the
+  // filter orthogonal to _renderSweeps's own no-op-refresh/canvas-history invariants instead of
+  // needing to thread it through that already-intricate rebuild logic.
+  _applySweepFilter() {
+    const el = this.querySelector("#sdr-hub-sweeps");
+    if (!el) return;
+    const rows = [...el.querySelectorAll("[data-sweep-row]")];
+    if (rows.length === 0) return; // "No active sweeps" placeholder - nothing to filter
+    let visibleCount = 0;
+    for (const row of rows) {
+      const match = !this._sweepFilter || (row.dataset.search || "").includes(this._sweepFilter);
+      row.style.display = match ? "" : "none";
+      if (match) visibleCount++;
+    }
+    let emptyMsg = el.querySelector("[data-sweep-filter-empty]");
+    if (visibleCount === 0) {
+      if (!emptyMsg) {
+        emptyMsg = document.createElement("p");
+        emptyMsg.dataset.sweepFilterEmpty = "";
+        emptyMsg.style.color = "var(--secondary-text-color,#727272)";
+        el.appendChild(emptyMsg);
+      }
+      emptyMsg.textContent = `No sweeps match "${this._sweepFilter}".`;
+    } else if (emptyMsg) {
+      emptyMsg.remove();
+    }
   }
 
   _renderReceivers() {
@@ -1088,9 +1131,10 @@ class SdrHubPanel extends HTMLElement {
           <th>Label</th><th>Frequencies</th><th>Dongle</th><th>Status</th><th></th>
         </tr>
         ${this._state.receivers
-          .map(
-            (r) => `
-          <tr>
+          .map((r) => {
+            const searchText = `${r.label || ""} ${r.dongle_serial} ${r.frequencies_hz.map(fmtMHz).join(" ")}`.toLowerCase();
+            return `
+          <tr data-receiver-row="${esc(r.id)}" data-search="${esc(searchText)}">
             <td>${r.label ? esc(r.label) : `<em style="color:var(--secondary-text-color,#727272);">—</em>`}</td>
             <td>${r.frequencies_hz.map(fmtMHz).join(", ")} MHz</td>
             <td>${esc(r.dongle_serial)}</td>
@@ -1099,22 +1143,81 @@ class SdrHubPanel extends HTMLElement {
               <button data-copy-receiver-yaml="${esc(r.id)}" title="Copy as an sdr_hub.add_receiver automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
               <button data-remove-receiver="${esc(r.id)}" style="${BTN_DANGER}">Stop</button>
             </td>
-          </tr>`,
-          )
+          </tr>`;
+          })
           .join("")}
       </table>
       </div>`;
     for (const r of this._state.receivers) {
-      el.querySelector(`[data-remove-receiver="${CSS.escape(r.id)}"]`).addEventListener("click", () =>
+      this._wireConfirmButton(el.querySelector(`[data-remove-receiver="${CSS.escape(r.id)}"]`), () =>
         this._onRemoveReceiver(r.id),
       );
       this._wireCopyButton(el.querySelector(`[data-copy-receiver-yaml="${CSS.escape(r.id)}"]`), () =>
         this._receiverYaml(r),
       );
     }
+    this._applyReceiverFilter();
+  }
+
+  // See _applySweepFilter above - same hide-non-matching-rows approach, applied to the
+  // receivers table's <tr> elements instead of the sweeps' card <div>s.
+  _applyReceiverFilter() {
+    const el = this.querySelector("#sdr-hub-receivers");
+    if (!el) return;
+    const rows = [...el.querySelectorAll("[data-receiver-row]")];
+    if (rows.length === 0) return; // "No active receivers" placeholder - nothing to filter
+    let visibleCount = 0;
+    for (const row of rows) {
+      const match = !this._receiverFilter || (row.dataset.search || "").includes(this._receiverFilter);
+      row.style.display = match ? "" : "none";
+      if (match) visibleCount++;
+    }
+    let emptyMsg = el.querySelector("[data-receiver-filter-empty]");
+    if (visibleCount === 0) {
+      if (!emptyMsg) {
+        emptyMsg = document.createElement("p");
+        emptyMsg.dataset.receiverFilterEmpty = "";
+        emptyMsg.style.color = "var(--secondary-text-color,#727272)";
+        el.appendChild(emptyMsg);
+      }
+      emptyMsg.textContent = `No receivers match "${this._receiverFilter}".`;
+    } else if (emptyMsg) {
+      emptyMsg.remove();
+    }
+  }
+
+  // Surfaces low-battery devices independently of the decoded-log filter/scroll position - a
+  // user monitoring many sensors shouldn't have to clear their filter and scroll the whole log
+  // to notice one needs a battery change.
+  _renderBatteryAlerts() {
+    const el = this.querySelector("#sdr-hub-battery-alert");
+    if (!el) return;
+    // Only the most recent event per device (model+id) reflects its *current* battery state -
+    // walking newest-first and keeping just the first sighting of each key means an older
+    // battery_ok:false that has since recovered doesn't stay stuck showing as low.
+    const seen = new Set();
+    const low = [];
+    for (const event of this._decodedLog) {
+      const d = event.device || {};
+      if (!Object.hasOwn(d, "battery_ok")) continue;
+      const key = deviceFavoriteKey(d);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!d.battery_ok) low.push(d.id != null ? `${d.model || "Unknown device"} (id ${d.id})` : d.model || "Unknown device");
+    }
+    if (low.length === 0) {
+      el.style.display = "none";
+      el.innerHTML = "";
+      return;
+    }
+    el.style.display = "block";
+    el.innerHTML = `⚠️ Low battery: ${low.map(esc).join(", ")}`;
   }
 
   _renderDecodedLog() {
+    // Independent of the filter text/results below - battery state should stay visible even
+    // while a user has the log filtered down to something else entirely.
+    this._renderBatteryAlerts();
     const el = this.querySelector("#sdr-hub-decoded");
     if (!el) return;
     if (this._decodedLog.length === 0) {
@@ -1545,6 +1648,32 @@ class SdrHubPanel extends HTMLElement {
       hop_interval_s: r.hop_interval_s,
       protocols: r.protocols,
       label: r.label,
+    });
+  }
+
+  // Requires a second click within CONFIRM_WINDOW_MS before actually invoking onConfirm - guards
+  // a running sweep/receiver (which can represent minutes to hours of unsaved capture history)
+  // against being stopped by a single stray or misdirected click, without the accessibility/
+  // automation-blocking downsides of a native window.confirm() dialog.
+  _wireConfirmButton(button, onConfirm) {
+    const CONFIRM_WINDOW_MS = 4000;
+    const original = button.textContent;
+    let armed = false;
+    let timer = null;
+    const disarm = () => {
+      armed = false;
+      clearTimeout(timer);
+      button.textContent = original;
+    };
+    button.addEventListener("click", () => {
+      if (!armed) {
+        armed = true;
+        button.textContent = "Confirm stop?";
+        timer = setTimeout(disarm, CONFIRM_WINDOW_MS);
+        return;
+      }
+      disarm();
+      onConfirm();
     });
   }
 
