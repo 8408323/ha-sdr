@@ -298,10 +298,42 @@ function loadBatteryLowState() {
     if (!raw) return new Map();
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
-    return new Map(Object.entries(parsed));
+    return new Map(
+      Object.entries(parsed).filter(([, v]) => v && typeof v === "object" && Number.isFinite(v.at) && typeof v.low === "boolean"),
+    );
   } catch {
     return new Map();
   }
+}
+
+// Per-key last-writer-wins by the *server* transition time (received_at), which is what makes
+// this map genuinely convergent rather than merely "usually the same".
+//
+// This map is not a set union like the decoded log - it's a fold over an ordered stream of
+// battery_ok transitions, so two tabs sitting at different positions in that stream legitimately
+// hold different maps. Storing a bare {model,id,channel} (as an earlier revision did) carried no
+// information to reconcile them, so a lagging tab's whole-map write could resurrect a device
+// that had already recovered. Tagging every entry with the transition's own server timestamp and
+// keeping the newer one makes the merge commutative, associative and idempotent - a real
+// LWW-register - so write order genuinely stops mattering.
+//
+// Recoveries are kept as tombstones (low:false) rather than deleted for exactly the same reason:
+// an absent key carries no timestamp, so a stale "still low" write would otherwise win over a
+// newer recovery simply by being present.
+function mergeBatteryLowState(current, incoming) {
+  const out = new Map(current);
+  for (const [key, entry] of incoming) {
+    const existing = out.get(key);
+    if (!existing || entry.at > existing.at) out.set(key, entry);
+  }
+  // Bound total size (low entries *and* tombstones) by dropping the oldest transitions first -
+  // recency here is the transition timestamp, not insertion order, so eviction is deterministic
+  // across tabs too.
+  if (out.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
+    const keep = [...out.entries()].sort(([, a], [, b]) => b.at - a.at).slice(0, MAX_TRACKED_LOW_BATTERY_DEVICES);
+    return new Map(keep);
+  }
+  return out;
 }
 
 function saveBatteryLowStateRaw(map) {
@@ -761,19 +793,34 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       // Another tab's decoded-log write or "Clear log" click - reload the canonical state
-      // straight from storage rather than trying to diff/adopt ev.newValue directly. Since every
-      // tab derives the same value from the same server-assigned event ids (see
-      // mergeDecodedLog), "just re-read what's stored" is always correct here regardless of
-      // which tab's write landed last.
+      // Union what the peer wrote with what this tab already holds - deliberately NOT a plain
+      // adopt/replace. A peer can legitimately write a value that lacks events this tab has
+      // already seen (it may be lagging, or have been over quota), and replacing would discard
+      // them here too. Merging keeps the grow-only-set semantics the whole design rests on.
+      // A generation bump is the one case that *is* a replace: it means the log was cleared, so
+      // older entries are meant to disappear rather than be preserved.
       if (ev.key === DECODED_LOG_KEY || ev.key === DECODED_LOG_GEN_KEY) {
-        this._decodedLogGen = loadDecodedLogGen();
-        this._decodedLog = loadDecodedLog(this._decodedLogGen);
+        const gen = loadDecodedLogGen();
+        const carried = gen === this._decodedLogGen ? this._decodedLog.filter((e) => isConvergentEvent(e)) : [];
+        this._decodedLogGen = gen;
+        this._decodedLog = mergeDecodedLog(carried, loadDecodedLog(gen));
         this._renderDecodedLog();
       }
-      // Another tab's low-battery state update (or recovery) - same convergent-state reasoning.
+      // Same reasoning for the battery map, using its own LWW merge so a lagging peer's write
+      // can't resurrect a device this tab already saw recover.
       if (ev.key === BATTERY_LOW_KEY) {
-        this._deviceBatteryOk = loadBatteryLowState();
+        this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, loadBatteryLowState());
         this._renderBatteryAlerts();
+      }
+      // The sound preference is a single user choice, not per-tab - keep the checkbox and the
+      // in-memory flag in step when it's toggled elsewhere, so a tab left open doesn't keep
+      // contending for (or ignoring) the alert based on a setting the user has since changed.
+      if (ev.key === BATTERY_SOUND_ALERT_KEY) {
+        this._batterySoundEnabled = loadBatterySoundEnabled();
+        const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
+        if (toggle) toggle.checked = this._batterySoundEnabled;
+        // Stop contending if it was just turned off here; the claim then expires on its own.
+        if (!this._batterySoundEnabled) this._releaseSoundLeadership();
       }
     };
     window.addEventListener("storage", this._onStorageEvent);
@@ -993,7 +1040,7 @@ class SdrHubPanel extends HTMLElement {
       const favKey = deviceFavoriteKey(decodedDevice);
       if (this._favoriteDevices.has(favKey)) this._flashDeviceKey = favKey;
       this._persistDecodedEvent(event);
-      if (Object.hasOwn(decodedDevice, "battery_ok")) this._updateBatteryState(decodedDevice);
+      if (Object.hasOwn(decodedDevice, "battery_ok")) this._updateBatteryState(event);
     } else if (event.type === "status" || event.type === "state_changed") {
       // A receiver/sweep died, or something else changed the add-on's state from outside
       // this panel (an automation service call, another open panel) - reload the
@@ -1038,48 +1085,73 @@ class SdrHubPanel extends HTMLElement {
       this._renderDecodedLog();
       return;
     }
-    const next = mergeDecodedLog(loadDecodedLog(gen), [{ ...event, _gen: gen }]);
+    // Merges storage, this tab's own in-memory log, and the new event. Including the in-memory
+    // side matters for two independent reasons: a peer that wrote a staler/truncated value
+    // between this tab's own read and write can't erase what this tab already knew (the read and
+    // write are not atomic across documents - there is no reliable storage mutex), and if
+    // localStorage is unavailable or over quota, loadDecodedLog() returns [] and the log would
+    // otherwise collapse to just the newest entry on every event.
+    const carried = this._decodedLog.filter((e) => isConvergentEvent(e) && e._gen === gen);
+    const next = mergeDecodedLog(mergeDecodedLog(carried, loadDecodedLog(gen)), [{ ...event, _gen: gen }]);
     saveDecodedLogRaw(next);
     this._decodedLog = next;
     this._renderDecodedLog();
   }
 
-  // Also unsynchronized, and for the same reason: every tab sees the same battery_ok transitions
-  // and derives the same map, so the persisted value converges without coordination. What
-  // *can't* converge is the alert sound - it's a side effect, so "exactly once across all tabs"
-  // needs real mutual exclusion, which is the one thing the sound-leader election provides.
-  _updateBatteryState(decodedDevice) {
+  // Merges this transition into the shared map as an LWW-register keyed on the server's own
+  // received_at (see mergeBatteryLowState), so tabs at different positions in the event stream
+  // reconcile correctly instead of overwriting each other.
+  //
+  // The alert decision is deliberately *not* derived from "did this write change the map".
+  // Doing that let whichever tab merely wrote first consume the transition - including a muted
+  // or audio-locked tab, which would then permanently suppress the alert in every tab that could
+  // actually have played it. Instead the transition carries its own timestamp and only the sound
+  // leader records `alertedAt`, so a playable tab still sees an un-alerted transition regardless
+  // of how many silent tabs processed it first.
+  _updateBatteryState(event) {
+    const decodedDevice = event.device || {};
     const key = batteryStateKey(decodedDevice);
     const isLow = !decodedDevice.battery_ok;
-    const map = loadBatteryLowState();
-    const wasAlreadyLow = map.has(key);
-    if (!isLow) {
-      // Recovered (or was never low) - nothing to alert on, so drop any stored entry rather
-      // than keeping a growing pile of healthy devices around forever.
-      map.delete(key);
-    } else {
-      // Delete-then-set (rather than a plain set on an existing key) moves this entry to the
-      // end of the Map's iteration order, so the eviction below reliably drops the *oldest*
-      // still-low device first when the bound is exceeded.
-      map.delete(key);
-      map.set(key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel });
-      while (map.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
-        map.delete(map.keys().next().value);
-      }
-    }
-    saveBatteryLowStateRaw(map);
-    this._deviceBatteryOk = map;
+    // Falls back to wall-clock only for events from an add-on predating received_at; those can't
+    // order against other tabs anyway (see isConvergentEvent), so this just keeps them locally sane.
+    const at = Number.isFinite(event.received_at) ? event.received_at : Date.now() / 1000;
+    const previous = this._deviceBatteryOk.get(key);
+    const incoming = new Map([
+      [key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, at }],
+    ]);
+    // Merge against both storage *and* this tab's own in-memory view, so a peer's concurrent
+    // write can't erase knowledge this tab already had.
+    const merged = mergeBatteryLowState(mergeBatteryLowState(this._deviceBatteryOk, loadBatteryLowState()), incoming);
+    this._deviceBatteryOk = merged;
+    saveBatteryLowStateRaw(merged);
     this._renderBatteryAlerts();
-    if (isLow && !wasAlreadyLow) this._maybePlayLeaderAlert();
+    // Only a transition that is genuinely newer than whatever has already been alerted for this
+    // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
+    const winner = merged.get(key);
+    if (!winner || !winner.low || winner.at !== at) return;
+    const alreadyAlerted = previous && Number.isFinite(previous.alertedAt) && previous.alertedAt >= at;
+    if (alreadyAlerted) return;
+    this._maybePlayLeaderAlert(key, at);
   }
 
   // Plays the alert only in the tab currently holding sound leadership. Only tabs that can
   // *actually* produce sound right now (pref enabled and an already-unlocked AudioContext)
   // contend for it - otherwise a muted or audio-locked tab could win the election and silently
   // swallow the alert for every tab that could have played it.
-  _maybePlayLeaderAlert() {
+  //
+  // Recording alertedAt is done here, by the winning tab only, rather than in the shared state
+  // write - that separation is what keeps a silent tab's state update from marking a transition
+  // as already-alerted.
+  _maybePlayLeaderAlert(key, at) {
     if (!this._canPlayAlertSound()) return;
     if (!this._claimSoundLeadership()) return;
+    const entry = this._deviceBatteryOk.get(key);
+    if (entry) {
+      const marked = new Map(this._deviceBatteryOk);
+      marked.set(key, { ...entry, alertedAt: at });
+      this._deviceBatteryOk = marked;
+      saveBatteryLowStateRaw(marked);
+    }
     this._playBatteryAlertSound();
   }
 
@@ -1425,7 +1497,15 @@ class SdrHubPanel extends HTMLElement {
     // list's own comment. Releasing leadership removes it on every ordinary detach, and
     // _onStorageEvent reloads the page whenever an ALL_PREF_KEYS entry is removed elsewhere, so
     // listing it there would make every open tab reload each time any one tab navigated away.
+    // Bump the clear-generation *before* removing anything. Reset and the reload it triggers
+    // aren't instantaneous, so another tab (or this one) can persist an in-flight decode in
+    // between and resurrect log entries the reset was meant to remove. Entries carrying the
+    // pre-reset generation are filtered out on load, so anything that slips through that window
+    // is ignored rather than reappearing.
+    const supersededGen = loadDecodedLogGen() + 1;
+    saveDecodedLogGen(supersededGen);
     for (const key of [...ALL_PREF_KEYS, SOUND_LEADER_KEY]) {
+      if (key === DECODED_LOG_GEN_KEY) continue; // just set above, deliberately
       try {
         localStorage.removeItem(key);
       } catch {
@@ -1969,11 +2049,13 @@ class SdrHubPanel extends HTMLElement {
     // battery would otherwise have its record evicted by newer events from other devices,
     // silently clearing an alert that never actually recovered.
     // Sorted by key (not Map iteration order) for a presentation order that's stable regardless
-    // of which device most recently reported - the eviction logic above deliberately reorders
-    // the map's *insertion* order on every refresh (delete-then-set, to track LRU recency), and
-    // rendering that order directly would change "A, B" to "B, A" on a no-op refresh, defeating
-    // the _lastBatteryAlertMessage dedup below and re-triggering the live-region announcement.
+    // of which device most recently reported - merge/eviction reorder the map's own iteration
+    // order, and rendering that directly would flip "A, B" to "B, A" on a no-op refresh,
+    // defeating the _lastBatteryAlertMessage dedup below and re-triggering the live-region
+    // announcement. Recovered devices are retained as low:false tombstones (see
+    // mergeBatteryLowState) purely so the merge can order them - filter them out for display.
     const low = [...this._deviceBatteryOk.entries()]
+      .filter(([, entry]) => entry.low)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([, { model, id, channel }]) => {
         const parts = [id != null ? `id ${id}` : null, channel != null ? `ch ${channel}` : null].filter(Boolean);
