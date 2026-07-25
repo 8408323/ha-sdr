@@ -321,9 +321,15 @@ function loadBatteryState() {
 // Reconciles a local (gen, map) against a stored one. A higher generation means a stream_gap
 // invalidated everything older, so it replaces rather than merges; equal generations merge
 // normally; a lower one is a superseded write and is ignored outright.
-function reconcileBatteryState(local, remote) {
+// `invalidationPending` means this document invalidated its state but couldn't persist the
+// generation bump (see _invalidateBatteryState). Until that clear lands, stored entries at the
+// same generation are exactly the ones it discarded, so merging them back would undo the
+// invalidation on the very next event. A higher stored generation still wins - someone else
+// published a clear, which supersedes this one either way.
+function reconcileBatteryState(local, remote, invalidationPending = false) {
   if (remote.gen > local.gen) return remote;
   if (remote.gen < local.gen) return local;
+  if (invalidationPending) return local;
   return { gen: local.gen, map: mergeBatteryLowState(local.map, remote.map) };
 }
 
@@ -734,6 +740,7 @@ class SdrHubPanel extends HTMLElement {
     const seededBattery = loadBatteryState();
     this._deviceBatteryOk = seededBattery.map;
     this._batteryGen = seededBattery.gen;
+    this._batteryInvalidationPending = false;
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -810,13 +817,22 @@ class SdrHubPanel extends HTMLElement {
       this._connectionStatus = "connected";
       this._renderConnectionStatus();
       // An HA-side restart or integration reload drops this WebSocket and the client silently
-      // resubscribes, without ever detaching this element. Decoded events can be missed in that
-      // window, and coordinator.py deliberately emits stream_reconnected only *after* its first
-      // connection - so on the HA-restart path no stream_gap/stream_reconnected ever arrives and
-      // nothing would otherwise invalidate the restored map. If the missed event was a recovery,
-      // the banner would keep asserting a low battery indefinitely. Treat a reconnect as
-      // equivalent to a gap: the loss is upstream of every tab, so no peer's copy is better.
-      if (wasDisconnected) this._invalidateBatteryState();
+      // resubscribes without detaching this element, so events can be missed with no
+      // stream_gap/stream_reconnected to signal it (coordinator.py emits the latter only after
+      // its *first* connection).
+      //
+      // Crucially this is a *local* loss, unlike a stream gap: only this tab's socket dropped,
+      // and other tabs may have stayed connected throughout with an accurate map. Publishing a
+      // dominant global clear here would destroy their correct state - and if the affected
+      // device has stopped transmitting, that warning would never come back. So re-sync from
+      // shared storage instead, which is exactly what a still-connected peer has been keeping
+      // up to date, and don't touch the generation.
+      if (wasDisconnected) {
+        const resynced = loadBatteryState();
+        this._batteryGen = Math.max(this._batteryGen, resynced.gen);
+        this._deviceBatteryOk = resynced.map;
+        this._renderBatteryAlerts();
+      }
     };
     this._onConnDisconnected = () => {
       this._connectionStatus = "disconnected";
@@ -905,7 +921,11 @@ class SdrHubPanel extends HTMLElement {
         // reconcileBatteryState handles all three cases: a peer that processed a stream_gap
         // (higher generation) replaces, a peer at the same generation merges, and a superseded
         // pre-gap write (lower generation) is discarded rather than resurrecting stale entries.
-        const next = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
+        const next = reconcileBatteryState(
+          { gen: this._batteryGen, map: this._deviceBatteryOk },
+          loadBatteryState(),
+          this._batteryInvalidationPending,
+        );
         this._batteryGen = next.gen;
         this._deviceBatteryOk = next.map;
         this._renderBatteryAlerts();
@@ -1238,6 +1258,13 @@ class SdrHubPanel extends HTMLElement {
     // alone, so this tab can't later present un-persisted authority to its peers.
     this._batteryGen = cleared.persisted ? cleared.gen : this._batteryGen;
     this._deviceBatteryOk = cleared.persisted ? cleared.map : new Map();
+    // A failed invalidation leaves this tab at the old generation with an empty map - but
+    // storage still holds the pre-invalidation entries at that *same* generation, so the next
+    // event's equal-generation merge would pull every stale assertion straight back in and a
+    // quiet device's obsolete warning could reappear indefinitely. Remember that this tab has
+    // locally invalidated but couldn't publish it, and stop merging stored entries until a
+    // clear actually lands. Retried on the next write, so it self-heals once storage recovers.
+    this._batteryInvalidationPending = !cleared.persisted;
     this._renderBatteryAlerts();
   }
 
@@ -1266,7 +1293,11 @@ class SdrHubPanel extends HTMLElement {
     // Re-read the generation at write time (not at event arrival) so a stream_gap that landed in
     // between is always observed. If another tab bumped it, everything this tab held is
     // invalidated and only the post-gap storage state plus this event survive.
-    const reconciled = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
+    const reconciled = reconcileBatteryState(
+      { gen: this._batteryGen, map: this._deviceBatteryOk },
+      loadBatteryState(),
+      this._batteryInvalidationPending,
+    );
     this._batteryGen = reconciled.gen;
     const base = reconciled.map;
     // Merge against both storage *and* this tab's own in-memory view, so a peer's concurrent
@@ -1278,6 +1309,9 @@ class SdrHubPanel extends HTMLElement {
     const written = saveBatteryState(this._batteryGen, merged);
     this._batteryGen = written.gen;
     this._deviceBatteryOk = written.map;
+    // A successful write means the local view is published again, so the pending-invalidation
+    // hold (see _invalidateBatteryState) is no longer needed.
+    if (written.persisted) this._batteryInvalidationPending = false;
     this._renderBatteryAlerts();
     // Only a transition that is genuinely newer than whatever has already been alerted for this
     // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.

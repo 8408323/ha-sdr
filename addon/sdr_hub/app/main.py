@@ -53,7 +53,15 @@ def record_seq_high_water(seq: int) -> None:
     _seq_high_water_written = seq
     try:
         SEQ_HIGH_WATER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SEQ_HIGH_WATER_PATH.write_text(str(seq))
+        # Written to a temp file and atomically renamed rather than written in place. write_text
+        # truncates first, so a crash or power loss mid-write can leave the checkpoint empty or
+        # partial - which resolve_seq_seed treats as invalid and falls back to the wall clock,
+        # silently forfeiting the durability guarantee this exists for at exactly the moment a
+        # backward clock correction would need it. os.replace is atomic on POSIX, so an
+        # interrupted write leaves the *previous* valid high-water mark intact.
+        tmp = SEQ_HIGH_WATER_PATH.with_suffix(".tmp")
+        tmp.write_text(str(seq))
+        os.replace(tmp, SEQ_HIGH_WATER_PATH)
     except OSError:
         # Read-only or full /data - ordering degrades to the previous clock-seeded behaviour
         # rather than taking the decoder thread down over a checkpoint write.
