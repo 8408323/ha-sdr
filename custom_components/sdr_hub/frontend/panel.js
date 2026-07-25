@@ -203,6 +203,16 @@ function deviceFavoriteKey(d) {
   return `${d.model || ""}|${d.id != null ? d.id : ""}`;
 }
 
+// Like deviceFavoriteKey, but also folds in `channel` - some device families (e.g. ones
+// distinguished only by a channel dial/jumper) share the same model and omit `id` entirely, so
+// deviceFavoriteKey's model|id alone would collide and let one sensor's healthy report overwrite
+// another's still-low battery-state entry. Battery tracking needs the extra discriminator;
+// deviceFavoriteKey itself is left as-is since it's pre-existing, shared with the favorites
+// feature, and out of scope here.
+function batteryStateKey(d) {
+  return `${d.model || ""}|${d.id != null ? d.id : ""}|${d.channel != null ? d.channel : ""}`;
+}
+
 function loadFavoriteDevices() {
   try {
     const raw = localStorage.getItem(FAVORITE_DEVICES_KEY);
@@ -353,6 +363,10 @@ const scrollRowCapForWidth = (width) => {
   return Math.max(MIN_SCROLL_ROWS, Math.min(MAX_CANVAS_HEIGHT_PX, memoryCap, areaCap));
 };
 const MAX_DECODED_LOG = 50;
+// Bounds _deviceBatteryOk (see its field comment) - only entries for currently-low devices are
+// kept (a recovery deletes its entry outright), but a cap still guards against a misbehaving
+// add-on or a receiver observing many changing/unique ids from filling the map without limit.
+const MAX_TRACKED_LOW_BATTERY_DEVICES = 100;
 
 class SdrHubPanel extends HTMLElement {
   constructor() {
@@ -366,10 +380,13 @@ class SdrHubPanel extends HTMLElement {
     this._scrollDrawIndex = {}; // sweep_id -> next unused row slot in scroll-mode canvas
     this._viewportHeight = {}; // sweep_id -> user-dragged visible px height, else WATERFALL_HEIGHT
     this._decodedLog = []; // most-recent-first
-    // model|id -> latest known battery_ok, tracked independently of _decodedLog so a device
-    // that reported low battery and then went silent (falling off the capped log once enough
-    // *other* devices decode) doesn't have its alert silently cleared - it's only cleared by an
-    // actual battery_ok:true recovery event, never by the log simply rolling past it.
+    // batteryStateKey(device) -> {ok:false, model, id} for currently-low devices only, tracked
+    // independently of _decodedLog so a device that reported low battery and then went silent
+    // (falling off the capped log once enough *other* devices decode) doesn't have its alert
+    // silently cleared - it's only cleared by an actual battery_ok:true recovery event, never by
+    // the log simply rolling past it. Recovered/healthy devices are deleted rather than stored
+    // (see _handleEvent), and MAX_TRACKED_LOW_BATTERY_DEVICES bounds the rest, so this can't grow
+    // without limit the way naively caching every seen device's state would.
     this._deviceBatteryOk = new Map();
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
@@ -524,11 +541,21 @@ class SdrHubPanel extends HTMLElement {
       // _decodedLog at render time.
       const decodedDevice = event.device || {};
       if (Object.hasOwn(decodedDevice, "battery_ok")) {
-        this._deviceBatteryOk.set(deviceFavoriteKey(decodedDevice), {
-          ok: !!decodedDevice.battery_ok,
-          model: decodedDevice.model,
-          id: decodedDevice.id,
-        });
+        const key = batteryStateKey(decodedDevice);
+        if (decodedDevice.battery_ok) {
+          // Recovered (or was never low) - nothing to alert on, so drop any stored entry
+          // rather than keeping a growing pile of healthy devices around forever.
+          this._deviceBatteryOk.delete(key);
+        } else {
+          // Delete-then-set (rather than a plain set on an existing key) moves this entry to
+          // the end of the Map's iteration order, so the eviction below reliably drops the
+          // *oldest* still-low device first when the bound is exceeded.
+          this._deviceBatteryOk.delete(key);
+          this._deviceBatteryOk.set(key, { ok: false, model: decodedDevice.model, id: decodedDevice.id });
+          while (this._deviceBatteryOk.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
+            this._deviceBatteryOk.delete(this._deviceBatteryOk.keys().next().value);
+          }
+        }
       }
       this._renderDecodedLog();
     } else if (event.type === "status" || event.type === "state_changed") {
@@ -565,6 +592,9 @@ class SdrHubPanel extends HTMLElement {
     // #sdr-hub-receivers is about to be recreated empty by this shell rebuild below.
     this._renderedReceiverIdsKey = null;
     this._renderedReceiverStatusKey = null;
+    // Same invalidation, same reason, for _renderBatteryAlerts()'s unchanged-message skip -
+    // #sdr-hub-battery-alert is about to be recreated empty by this shell rebuild below.
+    this._lastBatteryAlertMessage = null;
     const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
     const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
     // "Dismissed" only skips showing it by default on load - the Help button in the header
@@ -627,7 +657,7 @@ class SdrHubPanel extends HTMLElement {
             </label>
             <button type="submit" style="${BTN}">Start sweep</button>
           </form>
-          <input id="sdr-hub-sweep-filter" type="text" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
+          <input id="sdr-hub-sweep-filter" type="text" aria-label="Filter sweeps by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-sweeps"></div>
         </div>
 
@@ -644,7 +674,7 @@ class SdrHubPanel extends HTMLElement {
             <label style="${LABEL}">Label (optional)<input name="label" placeholder="e.g. Weather station" style="${INPUT};width:140px"></label>
             <button type="submit" style="${BTN}">Start receiver</button>
           </form>
-          <input id="sdr-hub-receiver-filter" type="text" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
+          <input id="sdr-hub-receiver-filter" type="text" aria-label="Filter receivers by label, dongle, or frequency" placeholder="Filter by label, dongle, or frequency…" style="${INPUT};width:100%;margin-bottom:8px;box-sizing:border-box;">
           <div id="sdr-hub-receivers"></div>
         </div>
 
@@ -1239,21 +1269,24 @@ class SdrHubPanel extends HTMLElement {
   _renderBatteryAlerts() {
     const el = this.querySelector("#sdr-hub-battery-alert");
     if (!el) return;
-    // Reads from _deviceBatteryOk (updated per-event in _handleEvent), not _decodedLog - the
-    // log is capped at MAX_DECODED_LOG and a weakening sensor that stops transmitting after
-    // reporting low battery would otherwise have its record evicted by newer events from other
-    // devices, silently clearing an alert that never actually recovered.
-    const low = [];
-    for (const { ok, model, id } of this._deviceBatteryOk.values()) {
-      if (!ok) low.push(id != null ? `${model || "Unknown device"} (id ${id})` : model || "Unknown device");
-    }
-    if (low.length === 0) {
-      el.style.display = "none";
-      el.innerHTML = "";
-      return;
-    }
-    el.style.display = "block";
-    el.innerHTML = `⚠️ Low battery: ${low.map(esc).join(", ")}`;
+    // Reads from _deviceBatteryOk (updated per-event in _handleEvent, and only ever holding
+    // currently-low devices - see its field comment), not _decodedLog - the log is capped at
+    // MAX_DECODED_LOG and a weakening sensor that stops transmitting after reporting low
+    // battery would otherwise have its record evicted by newer events from other devices,
+    // silently clearing an alert that never actually recovered.
+    const low = [...this._deviceBatteryOk.values()].map(({ model, id }) =>
+      id != null ? `${model || "Unknown device"} (id ${id})` : model || "Unknown device",
+    );
+    const message = low.length === 0 ? "" : `⚠️ Low battery: ${low.map(esc).join(", ")}`;
+    // Every unrelated decoded_device event (and the 30s poll, via _loadState -> _renderDecodedLog
+    // -> here) calls this while any device remains low. This is an aria-live="assertive" region,
+    // so replacing its text content is itself an announcement to screen readers even when the
+    // text is unchanged - re-set the DOM only when the computed message actually differs, so
+    // users aren't interrupted at up to the full rtl_433 event rate for no new information.
+    if (this._lastBatteryAlertMessage === message) return;
+    this._lastBatteryAlertMessage = message;
+    el.style.display = message ? "block" : "none";
+    el.innerHTML = message;
   }
 
   _renderDecodedLog() {
