@@ -154,7 +154,10 @@ function saveFormPrefs(key, values) {
 function loadColormap() {
   try {
     const v = localStorage.getItem(COLORMAP_KEY);
-    return v && COLORMAPS[v] ? v : "sequential";
+    // Object.hasOwn (not just truthy COLORMAPS[v]) so a persisted value that happens to match an
+    // inherited Object property name (e.g. "constructor", "toString") from manually-edited or
+    // corrupted storage can't slip through and resolve to something without a usable `.fn`.
+    return v && Object.hasOwn(COLORMAPS, v) ? v : "sequential";
   } catch {
     return "sequential";
   }
@@ -904,6 +907,24 @@ class SdrHubPanel extends HTMLElement {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
     }
+    // A forced rebuild (colormap/contrast change, or the scroll-mode toggle) replaces every
+    // scroll container element outright, which would otherwise silently reset scrollTop to 0 -
+    // jumping a user who was mid-history (or intentionally following the bottom) back to the
+    // oldest row and, for the bottom-follow case, leaving them stuck there since
+    // _drawScrollRow's wasAtBottom check reads the *new* container, which starts at scrollTop 0
+    // and hasn't earned "at bottom" yet. Snapshot each sweep's current position (and whether it
+    // was pinned to the bottom) before tearing the containers down, then restore it below once
+    // the replacement containers exist and have their history replayed back in.
+    const preservedScroll = {};
+    for (const s of this._state.sweeps) {
+      const container = el.querySelector(`[data-sweep-scroll-container="${CSS.escape(s.id)}"]`);
+      if (container) {
+        preservedScroll[s.id] = {
+          atBottom: container.scrollTop + container.clientHeight >= container.scrollHeight - 4,
+          scrollTop: container.scrollTop,
+        };
+      }
+    }
     el.innerHTML = this._state.sweeps
       .map((s) => {
         const scroll = !!this._scrollMode[s.id];
@@ -918,6 +939,15 @@ class SdrHubPanel extends HTMLElement {
         const canvasHeight = scroll
           ? Math.max(1, Math.min(historyLen, scrollRowCapForWidth(rowWidth)))
           : WATERFALL_HEIGHT;
+        // The canvas element gets an explicit `width` attribute (matching the actual row
+        // width), not just `height` - without it the bitmap defaults to width=300, and
+        // _drawScrollRow's very first replayed row (below) would then see canvas.width !==
+        // width and take its "range changed" branch, wiping out this pre-set canvasHeight
+        // back down to a 1px canvas. Every subsequent replayed row would then hit the
+        // still-growing incremental-resize path (grow-by-one-row + full-bitmap copy through a
+        // temp canvas) instead of just being drawn straight into the already-correctly-sized
+        // bitmap - turning a full-history repaint (colormap/contrast change) into up to
+        // O(historyLen^2) pixel copies.
         const viewportHeight = this._viewportHeight[s.id] ?? WATERFALL_HEIGHT;
         const rangeText = `${fmtMHz(s.start_hz)}–${fmtMHz(s.stop_hz)} MHz`;
         const titleHtml = s.label
@@ -941,7 +971,7 @@ class SdrHubPanel extends HTMLElement {
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
-            <canvas data-sweep-canvas="${esc(s.id)}" height="${canvasHeight}"
+            <canvas data-sweep-canvas="${esc(s.id)}" width="${rowWidth}" height="${canvasHeight}"
               style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
             <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
           </div>
@@ -983,6 +1013,20 @@ class SdrHubPanel extends HTMLElement {
         for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
       }
       this._renderTimeAxis(s.id);
+      // Restore the position captured above, now that the replacement container has its
+      // history replayed back in (so scrollHeight reflects the final content size). A
+      // bottom-pinned view is restored by re-pinning to the new bottom rather than replaying
+      // the raw scrollTop - the canvas's pre-computed height (see the `width` attribute comment
+      // above) already matches the old one for a same-size repaint, but re-deriving "bottom"
+      // from the live scrollHeight is what actually keeps a user who was following live data
+      // still following it, rather than depending on that size staying identical.
+      const preserved = preservedScroll[s.id];
+      if (preserved) {
+        const container = el.querySelector(`[data-sweep-scroll-container="${CSS.escape(s.id)}"]`);
+        if (container) {
+          container.scrollTop = preserved.atBottom ? container.scrollHeight : preserved.scrollTop;
+        }
+      }
     }
   }
 
@@ -1585,7 +1629,12 @@ class SdrHubPanel extends HTMLElement {
     // race the add-on's per-dongle ownership check against another entry targeting the same
     // hardware in the same import.
     for (const s of sweeps) {
-      if (!s || !s.dongle_serial || !Number.isFinite(s.start_hz) || !Number.isFinite(s.stop_hz)) {
+      // typeof check, not truthiness - some SDR devices legitimately omit a serial, so
+      // dongle_serial: "" is a real device's export (the panel itself supports selecting
+      // these; see _renderDongleOptions' hasPreference handling of the same case), not a
+      // malformed entry. A truthy check would reject re-importing the panel's own backup for
+      // exactly those devices.
+      if (!s || typeof s.dongle_serial !== "string" || !Number.isFinite(s.start_hz) || !Number.isFinite(s.stop_hz)) {
         errors.push(`Skipped an invalid sweep entry (missing dongle_serial/start_hz/stop_hz)`);
         continue;
       }
@@ -1596,7 +1645,9 @@ class SdrHubPanel extends HTMLElement {
       }
     }
     for (const r of receivers) {
-      if (!r || !r.dongle_serial || !Array.isArray(r.frequencies_hz) || r.frequencies_hz.length === 0) {
+      // See the matching typeof check in the sweep loop above - same "" is a valid serial-less
+      // device reasoning applies here.
+      if (!r || typeof r.dongle_serial !== "string" || !Array.isArray(r.frequencies_hz) || r.frequencies_hz.length === 0) {
         errors.push(`Skipped an invalid receiver entry (missing dongle_serial/frequencies_hz)`);
         continue;
       }
