@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
@@ -34,6 +35,14 @@ async def lifespan(app: FastAPI):
     broadcaster = Broadcaster()
     app.state.broadcaster = broadcaster
 
+    # Seeded from the current wall clock (in ms) rather than 0 so that values keep increasing
+    # across add-on restarts too - a client's persisted events survive a restart, and a counter
+    # restarting at 0 would make every new event sort behind them. Within a run it only ever
+    # increments, so it is immune to the clock corrections that motivated it in the first place.
+    # next() on an itertools.count is atomic under the GIL, which matters because on_device is
+    # invoked from the decoder threads rather than the event loop.
+    event_seq = itertools.count(int(time.time() * 1000))
+
     def on_row(sweep_id: str, row: SweepRow) -> None:
         broadcaster.broadcast(
             {
@@ -46,17 +55,24 @@ async def lifespan(app: FastAPI):
         )
 
     def on_device(receiver_id: str, device: dict) -> None:
-        # event_id/received_at are assigned here, once, on the server - deliberately NOT left to
-        # each client. Every open panel tab holds its own independent WebSocket subscription and
-        # receives this same broadcast separately, so a client-generated id would differ per tab
-        # for one physical decode, and any cross-tab dedup/merge built on it would treat N tabs'
-        # views of one event as N distinct events. A single server-assigned id (and a single
-        # server timestamp, so ordering doesn't depend on per-tab arrival jitter either) is what
-        # lets every tab independently converge on an identical decoded-device log.
+        # event_id/seq/received_at are assigned here, once, on the server - deliberately NOT left
+        # to each client. Every open panel tab holds its own independent WebSocket subscription
+        # and receives this same broadcast separately, so a client-generated id would differ per
+        # tab for one physical decode, and any cross-tab dedup/merge built on it would treat N
+        # tabs' views of one event as N distinct events. Server-assigned values are what let
+        # every tab independently converge on an identical decoded-device log.
+        #
+        # `seq` (not received_at) is what the panel orders and merges on. A wall clock can move
+        # *backwards* - an NTP correction or a manual change - which would make new events sort
+        # behind already-persisted ones, so they'd be truncated away as "old" and a stale
+        # low-battery entry could never be superseded by its own recovery. `seq` is strictly
+        # increasing for the life of this process, so ordering can't invert. received_at is kept
+        # alongside it for display/diagnostics only.
         broadcaster.broadcast(
             {
                 "type": "decoded_device",
                 "event_id": uuid.uuid4().hex,
+                "seq": next(event_seq),
                 "received_at": time.time(),
                 "receiver_id": receiver_id,
                 "device": device,

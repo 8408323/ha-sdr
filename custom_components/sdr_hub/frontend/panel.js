@@ -292,53 +292,84 @@ function batteryStateKey(d) {
 
 // Loads the canonical, cross-tab-shared low-battery-devices map (see BATTERY_LOW_KEY) as a
 // batteryStateKey -> {model, id, channel} Map.
-function loadBatteryLowState() {
+// Returns {gen, map}. The generation lives *inside* the stored value rather than in a separate
+// key so that every write is self-describing: a peer still processing a pre-gap event writes its
+// whole value stamped with the generation it knew about, and a reader can then tell that write
+// is superseded and discard it wholesale. Splitting them across two keys couldn't do that - the
+// stale write would carry no generation at all and merge straight back in.
+function loadBatteryState() {
   try {
     const raw = localStorage.getItem(BATTERY_LOW_KEY);
-    if (!raw) return new Map();
+    if (!raw) return { gen: 0, map: new Map() };
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
-    return new Map(
-      Object.entries(parsed).filter(([, v]) => v && typeof v === "object" && Number.isFinite(v.at) && typeof v.low === "boolean"),
-    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { gen: 0, map: new Map() };
+    const gen = Number.isInteger(parsed.gen) && parsed.gen >= 0 ? parsed.gen : 0;
+    const entries = parsed.entries && typeof parsed.entries === "object" ? parsed.entries : {};
+    return {
+      gen,
+      map: new Map(
+        Object.entries(entries).filter(
+          ([, v]) => v && typeof v === "object" && Number.isFinite(v.ord) && typeof v.low === "boolean",
+        ),
+      ),
+    };
   } catch {
-    return new Map();
+    return { gen: 0, map: new Map() };
   }
 }
 
-// Per-key last-writer-wins by the *server* transition time (received_at), which is what makes
+// Reconciles a local (gen, map) against a stored one. A higher generation means a stream_gap
+// invalidated everything older, so it replaces rather than merges; equal generations merge
+// normally; a lower one is a superseded write and is ignored outright.
+function reconcileBatteryState(local, remote) {
+  if (remote.gen > local.gen) return remote;
+  if (remote.gen < local.gen) return local;
+  return { gen: local.gen, map: mergeBatteryLowState(local.map, remote.map) };
+}
+
+// Per-key last-writer-wins by the *server* event order (see eventOrder), which is what makes
 // this map genuinely convergent rather than merely "usually the same".
 //
 // This map is not a set union like the decoded log - it's a fold over an ordered stream of
 // battery_ok transitions, so two tabs sitting at different positions in that stream legitimately
 // hold different maps. Storing a bare {model,id,channel} (as an earlier revision did) carried no
 // information to reconcile them, so a lagging tab's whole-map write could resurrect a device
-// that had already recovered. Tagging every entry with the transition's own server timestamp and
+// that had already recovered. Tagging every entry with its transition's own server order and
 // keeping the newer one makes the merge commutative, associative and idempotent - a real
 // LWW-register - so write order genuinely stops mattering.
 //
 // Recoveries are kept as tombstones (low:false) rather than deleted for exactly the same reason:
-// an absent key carries no timestamp, so a stale "still low" write would otherwise win over a
-// newer recovery simply by being present.
+// an absent key carries no order, so a stale "still low" write would otherwise win over a newer
+// recovery simply by being present.
 function mergeBatteryLowState(current, incoming) {
   const out = new Map(current);
   for (const [key, entry] of incoming) {
     const existing = out.get(key);
-    if (!existing || entry.at > existing.at) out.set(key, entry);
+    if (!existing || entry.ord > existing.ord) {
+      // Carry the alert marker forward across a low->low refresh. Each repeat low report from a
+      // still-low sensor has a newer ord, so replacing outright would drop alertedAt and make
+      // the next comparison see the transition as never-alerted - re-playing the tone on every
+      // single transmission, rather than once when it first went low.
+      const keepAlerted = existing && existing.low && entry.low ? existing.alertedAt : undefined;
+      out.set(key, keepAlerted !== undefined ? { ...entry, alertedAt: keepAlerted } : entry);
+    }
   }
-  // Bound total size (low entries *and* tombstones) by dropping the oldest transitions first -
-  // recency here is the transition timestamp, not insertion order, so eviction is deterministic
-  // across tabs too.
-  if (out.size > MAX_TRACKED_LOW_BATTERY_DEVICES) {
-    const keep = [...out.entries()].sort(([, a], [, b]) => b.at - a.at).slice(0, MAX_TRACKED_LOW_BATTERY_DEVICES);
-    return new Map(keep);
-  }
-  return out;
+  // Bound low entries and tombstones *separately*. A single shared cap let healthy devices push
+  // out a genuinely-low one: every healthy report refreshes its tombstone's ord, so ~100 chatty
+  // healthy sensors (or noisy/rotating decoded ids) would evict the silent low device that
+  // persistence exists to remember - exactly the dead-battery case, which never reports again to
+  // reinstate itself. Eviction orders by transition order, not Map insertion order, so it stays
+  // deterministic across tabs.
+  const byRecency = (entries) => entries.sort(([, a], [, b]) => b.ord - a.ord);
+  const low = byRecency([...out.entries()].filter(([, e]) => e.low)).slice(0, MAX_TRACKED_LOW_BATTERY_DEVICES);
+  const dead = byRecency([...out.entries()].filter(([, e]) => !e.low)).slice(0, MAX_TRACKED_BATTERY_TOMBSTONES);
+  if (low.length + dead.length === out.size) return out;
+  return new Map([...low, ...dead]);
 }
 
-function saveBatteryLowStateRaw(map) {
+function saveBatteryState(gen, map) {
   try {
-    localStorage.setItem(BATTERY_LOW_KEY, JSON.stringify(Object.fromEntries(map)));
+    localStorage.setItem(BATTERY_LOW_KEY, JSON.stringify({ gen, entries: Object.fromEntries(map) }));
   } catch {
     // Unavailable/quota-exceeded storage - losing this convenience isn't worth failing over.
   }
@@ -397,24 +428,37 @@ function saveDecodedLogGen(gen) {
   }
 }
 
-// Total order over decoded events, newest first. Uses only server-assigned fields
-// (received_at, then event_id as a deterministic tiebreak for same-timestamp events) so that
-// every tab sorts an identical event set into an identical array - which is precisely what lets
-// concurrent per-tab persists be safe without any mutual exclusion, since they then write the
-// same value rather than competing ones. Never uses per-tab arrival time, which differs between
-// tabs and would break that convergence.
+// The single value every cross-tab merge and sort orders on. Prefers the add-on's monotonic
+// `seq` over its wall-clock `received_at`: a host clock can move backwards (NTP correction,
+// manual change), which would make new events sort behind already-persisted ones - they'd be
+// truncated away as "old", and a stale low-battery entry could never be superseded by its own
+// recovery. `seq` only ever increases. received_at remains the fallback for events from an
+// add-on predating it; the two never interleave in practice (an add-on either sends seq or it
+// doesn't), and seq is seeded from epoch-ms so it also stays above any received_at in seconds.
+function eventOrder(e) {
+  return Number.isFinite(e.seq) ? e.seq : e.received_at;
+}
+
+// Total order over decoded events, newest first. Uses only server-assigned values (see
+// eventOrder, then event_id as a deterministic tiebreak) so that every tab sorts an identical
+// event set into an identical array - which is precisely what lets concurrent per-tab persists
+// be safe without any mutual exclusion, since they then write the same value rather than
+// competing ones. Never uses per-tab arrival time, which differs between tabs and would break
+// that convergence.
 function compareDecodedEvents(a, b) {
-  if (b.received_at !== a.received_at) return b.received_at - a.received_at;
+  const ao = eventOrder(a);
+  const bo = eventOrder(b);
+  if (bo !== ao) return bo - ao;
   return a.event_id < b.event_id ? 1 : a.event_id > b.event_id ? -1 : 0;
 }
 
-// Anything without the server-assigned event_id/received_at is from an add-on older than the
-// change that added them (main.py's on_device). Such an event can't participate in cross-tab
-// convergence - there's no shared identity to dedup on - so it's kept for *this* tab's live
-// display but deliberately never persisted (see _persistDecodedEvent), rather than being
+// Anything without a server-assigned event_id and orderable position is from an add-on older
+// than the change that added them (main.py's on_device). Such an event can't participate in
+// cross-tab convergence - there's no shared identity to dedup on - so it's kept for *this* tab's
+// live display but deliberately never persisted (see _persistDecodedEvent), rather than being
 // persisted under a fabricated client-side id that would duplicate across tabs.
 function isConvergentEvent(e) {
-  return !!e && typeof e.event_id === "string" && Number.isFinite(e.received_at);
+  return !!e && typeof e.event_id === "string" && Number.isFinite(eventOrder(e));
 }
 
 // Only entries tagged with the given generation are returned - one stamped with an older
@@ -626,6 +670,12 @@ const MAX_DECODED_LOG = 50;
 // kept (a recovery deletes its entry outright), but a cap still guards against a misbehaving
 // add-on or a receiver observing many changing/unique ids from filling the map without limit.
 const MAX_TRACKED_LOW_BATTERY_DEVICES = 100;
+// Recovered devices are retained as tombstones so a stale "still low" write can't beat a newer
+// recovery (see mergeBatteryLowState). They're bounded separately from, and never compete with,
+// actual low entries - a shared budget would let chatty healthy sensors evict a silent
+// low-battery one. Kept smaller since a tombstone only needs to outlive in-flight peer writes,
+// not remain indefinitely the way an unacknowledged low battery does.
+const MAX_TRACKED_BATTERY_TOMBSTONES = 50;
 
 class SdrHubPanel extends HTMLElement {
   constructor() {
@@ -658,7 +708,9 @@ class SdrHubPanel extends HTMLElement {
     //
     // The exception is a stream_gap/reconnect, where the loss is upstream of every tab so no
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
-    this._deviceBatteryOk = loadBatteryLowState();
+    const seededBattery = loadBatteryState();
+    this._deviceBatteryOk = seededBattery.map;
+    this._batteryGen = seededBattery.gen;
     this._decodedFilter = ""; // lowercased substring match against model/id, "" = show all
     this._sweepFilter = ""; // lowercased substring match against label/dongle/frequency, "" = show all
     this._receiverFilter = ""; // same as _sweepFilter, for the receivers list
@@ -818,7 +870,12 @@ class SdrHubPanel extends HTMLElement {
       // Same reasoning for the battery map, using its own LWW merge so a lagging peer's write
       // can't resurrect a device this tab already saw recover.
       if (ev.key === BATTERY_LOW_KEY) {
-        this._deviceBatteryOk = mergeBatteryLowState(this._deviceBatteryOk, loadBatteryLowState());
+        // reconcileBatteryState handles all three cases: a peer that processed a stream_gap
+        // (higher generation) replaces, a peer at the same generation merges, and a superseded
+        // pre-gap write (lower generation) is discarded rather than resurrecting stale entries.
+        const next = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
+        this._batteryGen = next.gen;
+        this._deviceBatteryOk = next.map;
         this._renderBatteryAlerts();
       }
       // The sound preference is a single user choice, not per-tab - keep the checkbox and the
@@ -828,8 +885,18 @@ class SdrHubPanel extends HTMLElement {
         this._batterySoundEnabled = loadBatterySoundEnabled();
         const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
         if (toggle) toggle.checked = this._batterySoundEnabled;
-        // Stop contending if it was just turned off here; the claim then expires on its own.
-        if (!this._batterySoundEnabled) this._releaseSoundLeadership();
+        if (this._batterySoundEnabled) {
+          // Re-arm the gesture unlock. _wireAudioUnlock consumes its listeners on the first
+          // gesture, and if sound happened to be disabled at that moment it created no
+          // AudioContext - so without re-arming, a tab enabled from elsewhere could never
+          // satisfy _canPlayAlertSound() and would stay silent (and stop contending for the
+          // alert) until a reload or a local toggle, even after the enabling tab closed.
+          this._audioUnlockWired = false;
+          this._wireAudioUnlock();
+        } else {
+          // Stop contending if it was just turned off here; the claim then expires on its own.
+          this._releaseSoundLeadership();
+        }
       }
     };
     window.addEventListener("storage", this._onStorageEvent);
@@ -884,11 +951,22 @@ class SdrHubPanel extends HTMLElement {
     // still torn down for its whole duration. While detached this instance misses both a live
     // battery_ok:true recovery from the add-on AND another tab's own update to BATTERY_LOW_KEY -
     // reloading picks up whatever the shared canonical state has settled on in the meantime.
-    this._deviceBatteryOk = loadBatteryLowState();
+    //
+    // Merged with what this instance still holds rather than adopting storage outright - same
+    // reasoning as the storage handler. A detach/reattach doesn't discard in-memory state, and
+    // that state can legitimately be ahead of storage (a peer wrote a staler value, or this
+    // tab's own writes were blocked by quota), so replacing would lose it.
+    const reattachBattery = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
+    this._batteryGen = reattachBattery.gen;
+    this._deviceBatteryOk = reattachBattery.map;
     this._renderBatteryAlerts();
-    // Same reasoning, for the decoded log and its clear-generation.
-    this._decodedLogGen = loadDecodedLogGen();
-    this._decodedLog = loadDecodedLog(this._decodedLogGen);
+    // Same for the decoded log - except that a *generation* change means the log was cleared
+    // while detached, which is the one case where replacing is the correct behaviour.
+    const reattachGen = loadDecodedLogGen();
+    const carriedOnReattach =
+      reattachGen === this._decodedLogGen ? this._decodedLog.filter((e) => isConvergentEvent(e)) : [];
+    this._decodedLogGen = reattachGen;
+    this._decodedLog = mergeDecodedLog(carriedOnReattach, loadDecodedLog(reattachGen));
     this._renderDecodedLog();
     if (!this._unsub && !this._subscribing) {
       this._loadState();
@@ -1069,8 +1147,13 @@ class SdrHubPanel extends HTMLElement {
       // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
+      // Bump the battery generation so this clear *dominates* rather than merges. A peer still
+      // processing a pre-gap event would otherwise persist its stale low entry after this write,
+      // and the union in the storage handler would pull it straight back in - leaving a banner
+      // asserting a low battery that nothing can now contradict.
+      this._batteryGen = Math.max(this._batteryGen, loadBatteryState().gen) + 1;
       this._deviceBatteryOk = new Map();
-      saveBatteryLowStateRaw(this._deviceBatteryOk);
+      saveBatteryState(this._batteryGen, this._deviceBatteryOk);
       this._renderBatteryAlerts();
       this._loadState();
     }
@@ -1121,26 +1204,36 @@ class SdrHubPanel extends HTMLElement {
     const decodedDevice = event.device || {};
     const key = batteryStateKey(decodedDevice);
     const isLow = !decodedDevice.battery_ok;
-    // Falls back to wall-clock only for events from an add-on predating received_at; those can't
-    // order against other tabs anyway (see isConvergentEvent), so this just keeps them locally sane.
-    const at = Number.isFinite(event.received_at) ? event.received_at : Date.now() / 1000;
+    // Falls back to wall-clock only for events from an add-on predating seq/received_at; those
+    // can't order against other tabs anyway (see isConvergentEvent), so this just keeps them
+    // locally sane.
+    const ord = Number.isFinite(eventOrder(event)) ? eventOrder(event) : Date.now();
     const previous = this._deviceBatteryOk.get(key);
     const incoming = new Map([
-      [key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, at }],
+      [key, { model: decodedDevice.model, id: decodedDevice.id, channel: decodedDevice.channel, low: isLow, ord }],
     ]);
+    // Re-read the generation at write time (not at event arrival) so a stream_gap that landed in
+    // between is always observed. If another tab bumped it, everything this tab held is
+    // invalidated and only the post-gap storage state plus this event survive.
+    const reconciled = reconcileBatteryState({ gen: this._batteryGen, map: this._deviceBatteryOk }, loadBatteryState());
+    this._batteryGen = reconciled.gen;
+    const base = reconciled.map;
     // Merge against both storage *and* this tab's own in-memory view, so a peer's concurrent
     // write can't erase knowledge this tab already had.
-    const merged = mergeBatteryLowState(mergeBatteryLowState(this._deviceBatteryOk, loadBatteryLowState()), incoming);
+    const merged = mergeBatteryLowState(base, incoming);
     this._deviceBatteryOk = merged;
-    saveBatteryLowStateRaw(merged);
+    saveBatteryState(this._batteryGen, merged);
     this._renderBatteryAlerts();
     // Only a transition that is genuinely newer than whatever has already been alerted for this
     // device is a candidate - covers both a repeat low report and an out-of-order/replayed one.
+    // Reads alertedAt off the *merged* entry rather than `previous`, since the merge carries it
+    // forward across a low->low refresh (see mergeBatteryLowState); using `previous` alone would
+    // miss a marker another tab had already written.
     const winner = merged.get(key);
-    if (!winner || !winner.low || winner.at !== at) return;
-    const alreadyAlerted = previous && Number.isFinite(previous.alertedAt) && previous.alertedAt >= at;
-    if (alreadyAlerted) return;
-    this._maybePlayLeaderAlert(key, at);
+    if (!winner || !winner.low || winner.ord !== ord) return;
+    const priorAlert = winner.alertedAt ?? previous?.alertedAt;
+    if (Number.isFinite(priorAlert)) return;
+    this._maybePlayLeaderAlert(key, ord);
   }
 
   // Plays the alert only in the tab currently holding sound leadership. Only tabs that can
@@ -1151,15 +1244,15 @@ class SdrHubPanel extends HTMLElement {
   // Recording alertedAt is done here, by the winning tab only, rather than in the shared state
   // write - that separation is what keeps a silent tab's state update from marking a transition
   // as already-alerted.
-  _maybePlayLeaderAlert(key, at) {
+  _maybePlayLeaderAlert(key, ord) {
     if (!this._canPlayAlertSound()) return;
     if (!this._claimSoundLeadership()) return;
     const entry = this._deviceBatteryOk.get(key);
     if (entry) {
       const marked = new Map(this._deviceBatteryOk);
-      marked.set(key, { ...entry, alertedAt: at });
+      marked.set(key, { ...entry, alertedAt: ord });
       this._deviceBatteryOk = marked;
-      saveBatteryLowStateRaw(marked);
+      saveBatteryState(this._batteryGen, marked);
     }
     this._playBatteryAlertSound();
   }
