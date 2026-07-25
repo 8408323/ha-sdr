@@ -1,5 +1,6 @@
 name: SDR Hub
-version: "0.1.0"
+# Bump together with the FastAPI `version=` in app/main.py - see the note there.
+version: "0.2.0"
 slug: sdr_hub
 description: RTL-SDR hardware access, wideband spectrum sweeps, and configurable receivers (fixed-frequency decoders), exposed over a local API for the sdr_hub HACS integration and other HACS add-ons/integrations to use
 url: https://github.com/8408323/ha-sdr

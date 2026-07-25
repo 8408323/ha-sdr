@@ -71,7 +71,13 @@ async def ws_get_state(hass: HomeAssistant, connection, msg) -> None:
             msg["id"], "refresh_failed", str(coordinator.last_exception or "SDR Hub add-on is unreachable")
         )
         return
-    connection.send_result(msg["id"], coordinator.data or {"devices": [], "receivers": [], "sweeps": []})
+    # session_id rides along with the state snapshot so the panel can detect a Home Assistant
+    # restart (a new coordinator instance) as distinct from its own socket dropping - see
+    # SdrHubCoordinator.session_id.
+    connection.send_result(
+        msg["id"],
+        {**(coordinator.data or {"devices": [], "receivers": [], "sweeps": []}), "session_id": coordinator.session_id},
+    )
 
 
 @websocket_api.websocket_command({vol.Required("type"): "sdr_hub/subscribe"})

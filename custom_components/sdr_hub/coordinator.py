@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -29,6 +30,13 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass, _LOGGER, config_entry=config_entry, name="sdr_hub", update_interval=UPDATE_INTERVAL
         )
         self.api = api
+        # Identifies *this* coordinator instance. A full Home Assistant restart builds a new one,
+        # so a panel that sees a different id across a reconnect knows the add-on event stream was
+        # interrupted for every tab - not just its own socket. Without that distinction the panel
+        # treated a global restart as a tab-local drop and adopted a peer's persisted battery map,
+        # even though no peer could have stayed connected either, so a recovery transmitted during
+        # the restart could leave a low-battery banner asserted indefinitely.
+        self.session_id = uuid.uuid4().hex
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
         self._suppress_broadcast_count = 0
@@ -123,7 +131,10 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # (and in addition to) the panel's own disconnectedCallback-driven clear,
                         # since the panel element can stay attached to HA the whole time this
                         # add-on-facing WS drops and reconnects underneath it.
-                        self._dispatch({"type": "stream_reconnected"})
+                        # See broadcaster.py's stream_gap for why this carries an id: it is a
+                        # single-source signal fanned out to every tab, so a shared identity lets
+                        # them converge on handling it exactly once.
+                        self._dispatch({"type": "stream_reconnected", "gap_id": uuid.uuid4().hex})
                     first_connection = False
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
