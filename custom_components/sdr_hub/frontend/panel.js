@@ -3730,7 +3730,7 @@ class SdrHubPanel extends HTMLElement {
         // entities still counting a carrier the user had explicitly asked to forget.
         traceReset.addEventListener("click", async () => {
           const errorToken = this._errorToken || 0;
-          this._rebuildTraceFromHistory(s.id);
+          this._clearPeakHold(s.id);
           try {
             await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
             // Cleared locally so the readout falls back to the local figure until the next row
@@ -5064,28 +5064,21 @@ class SdrHubPanel extends HTMLElement {
     return 10 * Math.log10(state.sum[i] / state.counts[i]);
   }
 
-  // Resets *only* peak hold, which is what the button offers. Rebuilding the whole state also
-  // rebuilt sum and counts from the retained window, so on a long-running sweep the average jumped
-  // to whatever the last 400 rows happened to say - a change the user did not ask for and did not
-  // see coming from a control labelled "Reset peak hold". The average is a session statistic and
-  // has its own meaning; only the peak is being forgotten here.
-  _rebuildTraceFromHistory(sweepId) {
+  // Resets *only* peak hold, which is what the button offers - the average is a session statistic
+  // with its own meaning, and moving it would be a change the user did not ask for from a control
+  // labelled "Reset peak hold".
+  //
+  // Cleared outright rather than recomputed from retained history. Rebuilding was defensible while
+  // the reset was local ("forget what scrolled away, not what I can still see"), but the reset now
+  // also clears the add-on's accumulator - and the add-on has no access to this tab's retained
+  // rows. A transient carrier still sitting in the waterfall would therefore be restored into the
+  // red trace while the served occupancy and the published entities had dropped it, recreating
+  // exactly the disagreement this reset exists to remove. Both sides now clear the same thing:
+  // everything, re-accumulating from the next row.
+  _clearPeakHold(sweepId) {
     const state = this._traceState[sweepId];
     if (!state) return;
-    const rows = this._sweepRowHistory[sweepId] || [];
     state.peak.fill(NaN);
-    // Recomputed from retained history rather than blanked: those rows are still visible in the
-    // waterfall above, so a peak-hold ignoring them would contradict what is on screen. "Reset"
-    // means "forget what scrolled away", not "forget what I can still see".
-    for (const row of rows) {
-      const power = row.power_db;
-      if (!power || power.length !== state.bins) continue;
-      for (let i = 0; i < power.length; i++) {
-        const v = power[i];
-        if (v === null || !Number.isFinite(v)) continue;
-        if (Number.isNaN(state.peak[i]) || v > state.peak[i]) state.peak[i] = v;
-      }
-    }
     this._drawTrace(sweepId);
     // The peak changed, so both readouts that quote it are stale until refreshed.
     this._renderMarkers(sweepId);

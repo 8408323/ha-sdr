@@ -202,6 +202,12 @@ async def ws_remove_sweep(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"])
 
 
+# require_admin, like every other command that mutates add-on state. The panel's reset used to be
+# local to one tab; now it clears an accumulator shared by every viewer and moves the HA sensor
+# values automations consume, so a dashboard viewer must not be able to alter measurements for
+# everyone. Widening what a command does without revisiting who may call it is how an authorization
+# boundary silently moves.
+@websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): "sdr_hub/reset_sweep_stats", vol.Required("sweep_id"): str})
 @websocket_api.async_response
 async def ws_reset_sweep_stats(hass: HomeAssistant, connection, msg) -> None:

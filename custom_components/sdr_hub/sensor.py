@@ -140,54 +140,52 @@ SWEEP_STAT_FIELDS: dict[str, tuple[str, str | None]] = {
 }
 
 
-def sweep_band_hz(event: dict[str, Any]) -> tuple[float, float] | None:
-    """The frequency range a sweep row actually covers, derived from the row's own geometry.
-
-    Taken from the row rather than the configured sweep, because the row is what the statistics
-    describe: the add-on tiles captures across the requested range and the emitted row's bin_hz is
-    the possibly-downsampled width, so the configured stop_hz and the measured one can differ.
-    """
-    start = event.get("start_hz")
-    bin_hz = event.get("bin_hz")
-    power = event.get("power_db")
-    if not isinstance(start, (int, float)) or not isinstance(bin_hz, (int, float)) or not isinstance(power, list):
-        return None
-    if not power or bin_hz <= 0:
-        return None
-    stop = event.get("stop_hz")
-    # The add-on's own figure when it sends one. len(power) * bin_hz overstates a downsampled row:
-    # it is padded up to a multiple of the reduction factor first, so the emitted length can cover
-    # up to one output bin that was never measured - about 162 kHz at the top of a full-range
-    # sweep, which is a wrong band in the device name and a wrong stop_hz attribute.
-    if isinstance(stop, (int, float)) and float(stop) > float(start):
-        return float(start), float(stop)
-    return float(start), float(start) + len(power) * float(bin_hz)
-
-
 def format_band(band: tuple[float, float] | None) -> str | None:
     if band is None:
         return None
     return f"{band[0] / 1e6:.3f}-{band[1] / 1e6:.3f} MHz"
 
 
-def sweep_stat_key(band: tuple[float, float] | None, dongle_serial: str | None) -> str | None:
-    """Stable identity for one band measured by one dongle.
+def sweep_stat_key(sweep: dict[str, Any] | None) -> str | None:
+    """Stable identity for one configured band on one dongle.
 
-    Keyed on what is being measured rather than on the sweep instance measuring it. A sweep id is a
-    fresh UUID every time, so stopping and restarting the same sweep produced a *new* entity while
-    the old one still held the slug - Home Assistant then appended `_2`, and every automation
-    referencing the original stopped receiving measurements. For entities whose whole purpose is
-    automation, an identity that changes on restart is not an identity.
+    Derived from the sweep's *configuration*, not from the rows it produces. Keying on the measured
+    band meant the key was unknown until the first row arrived, which needed a sweep-id-to-key map -
+    and that map is empty on every restart while the coordinator already lists the running sweeps,
+    so the first reconciliation retired every active entity and device before any row could
+    repopulate it. Recreating them afterwards is not harmless: registry removal discards entity
+    customisations and mints a new device-registry id, breaking device-targeted automations. The
+    configuration is known immediately and does not change, so nothing has to be remembered.
 
-    The dongle serial is the discriminator for concurrent identical sweeps, and it is the honest
-    one: two sweeps covering the same range on different hardware are genuinely different
-    measurements, while the same range on the same dongle cannot happen at all - the add-on allows
-    one owner per dongle. Rounded to whole Hz so a float that re-serialises a fraction differently
-    cannot silently mint a second identity for the same band.
+    Identity is (band, driver, serial) because that is how the add-on itself identifies hardware -
+    DeviceManager claims a dongle by (driver, serial) and accepts dongle_driver precisely to
+    disambiguate two devices sharing a serial. Keying on the serial alone would merge two such
+    dongles' measurements of the same band into one set of entities publishing alternating values,
+    and an empty serial - which several supported devices report - would collide immediately.
+
+    Rounded to whole Hz so a float that re-serialises a fraction differently cannot mint a second
+    identity for the same band.
     """
-    if band is None:
+    if not isinstance(sweep, dict):
         return None
-    return f"{round(band[0])}_{round(band[1])}_{dongle_serial or 'unknown'}"
+    start, stop = sweep.get("start_hz"), sweep.get("stop_hz")
+    if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+        return None
+    driver = sweep.get("dongle_driver") or "unknown"
+    serial = sweep.get("dongle_serial")
+    # "" is a real serial for devices that omit one, and is distinct from a missing field - so it is
+    # preserved rather than folded into the same placeholder as an absent value.
+    serial = "noserial" if serial is None else serial
+    return f"{round(start)}_{round(stop)}_{driver}_{serial}"
+
+
+def sweep_configured_band(sweep: dict[str, Any] | None) -> tuple[float, float] | None:
+    if not isinstance(sweep, dict):
+        return None
+    start, stop = sweep.get("start_hz"), sweep.get("stop_hz")
+    if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+        return None
+    return float(start), float(stop)
 
 
 def decoded_device_key(device: dict[str, Any]) -> str:
@@ -268,25 +266,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     @callback
     def live_stat_keys() -> set[str]:
-        """Stable keys for every sweep currently measuring something."""
+        """Stable keys for every sweep that is still measuring.
+
+        Computed straight from the coordinator snapshot, so it is correct on the very first
+        reconciliation after a restart rather than only once rows have started arriving.
+        """
         keys: set[str] = set()
         for sweep in (coordinator.data or {}).get("sweeps", []):
             if not isinstance(sweep, dict) or sweep.get("status") in TERMINAL_SWEEP_STATUSES:
                 continue
-            start, stop = sweep.get("start_hz"), sweep.get("stop_hz")
-            if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
-                continue
-            # The *configured* range here, where the row carries the measured one. They can differ
-            # by a rounded bin, so the live set is built from whatever the entity was actually
-            # created with rather than recomputed - see stat_key_for_sweep.
-            key = stat_key_for_sweep.get(sweep.get("id"))
+            key = sweep_stat_key(sweep)
             if key:
                 keys.add(key)
         return keys
-
-    # Remembers which stable key each live sweep id produced, so retirement compares like with like
-    # rather than recomputing a band from the configured range and missing by a bin.
-    stat_key_for_sweep: dict[str, str] = {}
 
     @callback
     def retire_sweep_stats() -> None:
@@ -341,19 +333,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # no entity asserting 0 dB - which for a noise floor is a real and very loud reading.
         if not isinstance(sweep_id, str) or not isinstance(stats, dict):
             return
-        band = sweep_band_hz(event)
-        serial = next(
-            (
-                s.get("dongle_serial")
-                for s in (coordinator.data or {}).get("sweeps", [])
-                if isinstance(s, dict) and s.get("id") == sweep_id
-            ),
+        sweep = next(
+            (s for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict) and s.get("id") == sweep_id),
             None,
         )
-        key = sweep_stat_key(band, serial)
+        key = sweep_stat_key(sweep)
         if key is None:
             return
-        stat_key_for_sweep[sweep_id] = key
+        # The configured band, matching the key. Labelling a device with the measured range while
+        # filing it under the configured one would show two different bands for one thing.
+        band = sweep_configured_band(sweep)
         new_stat_entities: list[SdrHubSweepStatSensor] = []
         for field in SWEEP_STAT_FIELDS:
             value = finite_reading(stats.get(field))
@@ -380,15 +369,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # DELETE route. Reconciling against the coordinator's live sweep list rather than acting on
         # the event's own id also cleans up anything missed while this listener was not attached.
         if event.get("type") in ("state_changed", "status"):
-            # Keys are rebuilt from what each live sweep actually produced, so a sweep that ended -
-            # by DELETE, which emits no status event, or by erroring, which never reaches the DELETE
-            # route - drops out of the live set and its statistics are retired.
-            for gone in [sid for sid in stat_key_for_sweep if sid not in {
-                s.get("id") for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)
-            }]:
-                stat_key_for_sweep.pop(gone, None)
-            if event.get("type") == "status" and event.get("kind") == "sweep" and event.get("status") in TERMINAL_SWEEP_STATUSES:
-                stat_key_for_sweep.pop(event.get("id"), None)
+            # Reconciled purely from the coordinator snapshot, with nothing remembered between
+            # events. A sweep that ended is either absent from it or carries a terminal status, and
+            # live_stat_keys handles both - so a restart, where nothing has been remembered yet,
+            # reconciles correctly instead of retiring every running sweep's entities.
             retire_sweep_stats()
             if event.get("type") == "status":
                 return
