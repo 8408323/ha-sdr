@@ -1017,7 +1017,13 @@ const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
 // refused or failed". Only the first justifies acting locally instead: the others leave real server
 // state in place that a local change would contradict.
 function isUnsupportedCommand(err) {
-  if (err && err.code === "unknown_command") return true;
+  // Two distinct mixed-version shapes, because the integration and the add-on update
+  // independently. "unknown_command" is Home Assistant refusing a command this *integration* does
+  // not register; "unsupported_by_addon" is the integration reporting that the *add-on* has no
+  // such endpoint. Only checking the first missed the case the local fallback was reinstated for -
+  // an integration upgraded ahead of its add-on - since the browser-facing command exists there
+  // and HA answers happily.
+  if (err && (err.code === "unknown_command" || err.code === "unsupported_by_addon")) return true;
   const message = String((err && err.message) || err || "").toLowerCase();
   return message.includes("unknown command");
 }
@@ -3674,7 +3680,7 @@ class SdrHubPanel extends HTMLElement {
             <span style="display:flex;align-items:center;gap:4px;">
               <span style="width:14px;height:2px;background:#8e8e8e;display:inline-block;"></span>average</span>
             <button type="button" data-sweep-trace-reset="${esc(s.id)}"
-              style="${BTN};padding:1px 6px;font-size:.7rem;">Reset peak hold</button>
+              style="${BTN};padding:1px 6px;font-size:.7rem;">Reset statistics</button>
             <button type="button" data-sweep-trace-csv="${esc(s.id)}"
               style="${BTN};padding:1px 6px;font-size:.7rem;">Export spectrum CSV</button>
             <button type="button" data-sweep-markers-clear="${esc(s.id)}"

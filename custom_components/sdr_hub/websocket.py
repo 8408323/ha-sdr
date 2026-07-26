@@ -218,7 +218,12 @@ async def ws_reset_sweep_stats(hass: HomeAssistant, connection, msg) -> None:
     try:
         await coordinator.api.async_reset_sweep_stats(msg["sweep_id"])
     except SdrHubApiError as err:
-        connection.send_error(msg["id"], "reset_sweep_stats_failed", err.detail)
+        # A 404 here means the add-on has no such route - the integration has been upgraded ahead
+        # of it. That is the one failure the panel may answer by clearing locally, and it needs a
+        # code of its own: the browser-facing command exists, so HA never reports "unknown command"
+        # and the panel could not otherwise tell this apart from a refusal or a real error.
+        code = "unsupported_by_addon" if err.status == 404 else "reset_sweep_stats_failed"
+        connection.send_error(msg["id"], code, err.detail)
         return
     # No async_refresh: this changes no sweep the snapshot describes, only the accumulator behind
     # the statistics, and the next row carries the reset values on the stream anyway.

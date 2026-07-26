@@ -310,6 +310,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         """
         nonlocal live_keys_cache
         live_keys_cache = live_stat_keys() - (just_ended or set())
+        live_sweep_for_key.clear()
+        for sweep in (coordinator.data or {}).get("sweeps", []):
+            if not isinstance(sweep, dict) or sweep.get("status") in TERMINAL_SWEEP_STATUSES:
+                continue
+            key = sweep_stat_key(sweep)
+            if key in live_keys_cache and isinstance(sweep.get("id"), str):
+                live_sweep_for_key[key] = sweep["id"]
         for entity in sweep_stat_entities.values():
             entity.async_write_ha_state_if_added()
 
@@ -318,9 +325,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # them all consistently.
     live_keys_cache: set[str] = set()
 
+    # Which sweep instance produced the value each key currently holds. Reusing a band creates a
+    # *new* sweep with the same stable key, so the key going live again does not mean the reading
+    # is current - it means a different sweep is about to start producing one. Until a row from
+    # that sweep arrives the entity still holds the previous sweep's last measurement, and
+    # publishing it as available republishes a stale reading exactly when the identity work makes
+    # the entity easiest to reuse.
+    value_source: dict[str, str] = {}
+    # Last stats generation seen per key, so a reset can bypass the write throttle exactly once.
+    last_generation: dict[str, int] = {}
+
     @callback
     def is_measuring(key: str) -> bool:
-        return key in live_keys_cache
+        if key not in live_keys_cache:
+            return False
+        producing = live_sweep_for_key.get(key)
+        return producing is not None and value_source.get(key) == producing
+
+    # Which live sweep currently owns each key, recomputed alongside live_keys_cache.
+    live_sweep_for_key: dict[str, str] = {}
 
     @callback
     def handle_sweep_stats(event: dict[str, Any]) -> None:
@@ -340,6 +363,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # The configured band, matching the key. Labelling a device with the measured range while
         # filing it under the configured one would show two different bands for one thing.
         band = sweep_configured_band(sweep)
+        value_source[key] = sweep_id
+        # A new generation means the add-on reset its accumulator, so the values in this row are
+        # discontinuous with the previous ones. The throttle exists to smooth a fast stream of
+        # similar readings; holding back the first row after a reset would leave the entity showing
+        # the pre-reset figure for up to the throttle interval, right when a user has just asked
+        # for it to be cleared and is looking at it.
+        generation = stats.get("generation")
+        forced = generation is not None and last_generation.get(key) != generation
+        if generation is not None:
+            last_generation[key] = generation
         new_stat_entities: list[SdrHubSweepStatSensor] = []
         for field in SWEEP_STAT_FIELDS:
             value = finite_reading(stats.get(field))
@@ -347,7 +380,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 continue
             existing = sweep_stat_entities.get((key, field))
             if existing is not None:
-                existing.update_reading(value, band)
+                existing.update_reading(value, band, force=forced)
                 continue
             entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band, is_measuring)
             sweep_stat_entities[(key, field)] = entity
@@ -571,7 +604,7 @@ class SdrHubSweepStatSensor(SensorEntity):
             self.async_write_ha_state()
 
     @callback
-    def update_reading(self, value: float, band: tuple[float, float] | None = None) -> None:
+    def update_reading(self, value: float, band: tuple[float, float] | None = None, *, force: bool = False) -> None:
         # The value is always recorded, so the entity holds the latest measurement whether or not
         # this particular row is written out - a throttle that also discarded data would turn a
         # write-rate problem into a measurement problem.
@@ -583,7 +616,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         if self.hass is None:
             return
         now = datetime.now(timezone.utc)
-        if self._last_written is not None and now - self._last_written < MIN_STAT_WRITE_INTERVAL:
+        if not force and self._last_written is not None and now - self._last_written < MIN_STAT_WRITE_INTERVAL:
             return
         self._last_written = now
         self.async_write_ha_state()

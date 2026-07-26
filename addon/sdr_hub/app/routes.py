@@ -91,7 +91,11 @@ async def reset_sweep_stats(sweep_id: str, request: Request) -> None:
         # already and will emit no further rows, so there is no boundary for the panel to observe -
         # and the panel deliberately waits for that boundary before clearing. Reporting success for
         # a reset that cannot happen left the button doing nothing at all, with nothing to say so.
-        raise HTTPException(status_code=404, detail=f"No live statistics for sweep {sweep_id}")
+        # 409, not 404. A 404 from this route must mean one thing only - "this add-on has no such
+        # endpoint" - so an integration talking to an older add-on can recognise the mixed-version
+        # case without parsing error text. "The sweep has no live accumulator" is a conflict with
+        # current state, which is what 409 says.
+        raise HTTPException(status_code=409, detail=f"No live statistics for sweep {sweep_id}")
 
 
 @router.delete("/sweeps/{sweep_id}", status_code=204, dependencies=[Depends(verify_token)])
