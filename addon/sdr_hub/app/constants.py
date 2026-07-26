@@ -39,6 +39,11 @@ MAX_CONSECUTIVE_READ_ERRORS: int = 10
 # quiet band rather than as missing data.
 OVERFLOW_READ_RETRIES: int = 2
 
+# A bin counts as "occupied" when its session peak stands this far above the estimated noise floor.
+# Matches the panel's per-row peak-callout threshold: two different answers to "is this a real
+# signal" would let two readouts disagree about the same bin.
+OCCUPANCY_MIN_DELTA_DB: float = 6.0
+
 # rtl_433 receiver defaults (ReceiverCreate / ReceiverConfig).
 DEFAULT_HOP_INTERVAL_S: int = 10
 

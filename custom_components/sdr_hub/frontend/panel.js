@@ -1351,6 +1351,8 @@ class SdrHubPanel extends HTMLElement {
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
     this._markers = {};
+    // Latest per-sweep statistics as computed by the add-on, keyed by sweep id.
+    this._sweepStats = {};
     // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
     // persisted or shared. Peak-hold answers "what has this dongle heard since I started watching",
     // which is a property of one observation session at one antenna - restoring a peak from a
@@ -2010,6 +2012,9 @@ class SdrHubPanel extends HTMLElement {
   async _handleEvent(event) {
     if (event.type === "sweep_row") {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
+      // Absent on an older add-on, and absent until a sweep has produced something measurable -
+      // both are "no server figure", which the readout distinguishes from a value of zero.
+      if (event.stats) this._sweepStats[event.sweep_id] = event.stats;
       const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
       rows.unshift(event);
       // Switching a sweep to "keep full history" only stops future rows being discarded -
@@ -2790,8 +2795,39 @@ class SdrHubPanel extends HTMLElement {
           0% { background-color: rgba(245,166,35,.6); }
           100% { background-color: rgba(245,166,35,.1); }
         }
+
+        /* Declared here rather than inline on the element, so the narrow-screen override below can
+           actually win: an inline style beats any non-important stylesheet rule regardless of
+           source order, and this padding was inline. */
+        #sdr-hub-root { padding: 16px; }
+
+        /* The panel had no media queries at all. It does not *overflow* on a phone - the existing
+           flex-wrap already prevents that, measured at both 390px and 320px with these rules
+           disabled - so this is a legibility change, not an overflow fix. What wrapping produces
+           is ragged: a row of desktop-width inputs breaks into arbitrary groups, so the frequency
+           and gain fields end up different widths on different lines with no relationship to
+           their content. Stacking gives each field the full width and a predictable order. */
+        @media (max-width: 700px) {
+          #sdr-hub-root { padding: 8px; }
+          .sdr-hub-form-row { flex-direction: column; align-items: stretch; }
+          .sdr-hub-form-row > * { width: 100%; }
+          #sdr-hub-root h1 { font-size: 1.2rem; }
+          #sdr-hub-root h2 { font-size: 1rem; }
+        }
+        /* Every text container that sits beside something flexible. Applied at all widths: a
+           2000-character device name overflows a desktop card too, just less often. */
+        #sdr-hub-root .sdr-hub-shrinkable { min-width: 0; overflow-wrap: anywhere; }
+
+
+        /* A visible focus ring on the plots, which are now keyboard-operable. Without it a
+           keyboard user can move markers with no indication of which plot has focus - the browser
+           default outline is suppressed on canvas in some HA themes. */
+        #sdr-hub-root canvas:focus-visible {
+          outline: 2px solid var(--primary-color, #03a9f4);
+          outline-offset: 2px;
+        }
       </style>
-      <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
+      <div id="sdr-hub-root" style="max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
           <div style="display:flex;align-items:center;gap:10px;">
             <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
@@ -2837,7 +2873,7 @@ class SdrHubPanel extends HTMLElement {
             <button id="sdr-hub-db-auto" type="button" title="Set the contrast range from the signal levels currently being received"
               style="${BTN_SECONDARY};align-self:end;">Auto</button>
           </div>
-          <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <form id="sdr-hub-add-sweep" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${SWEEP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -2861,7 +2897,7 @@ class SdrHubPanel extends HTMLElement {
 
         <div style="${CARD}">
           <h2 style="margin:0 0 8px;font-size:1.1rem;">Receivers (rtl_433)</h2>
-          <form id="sdr-hub-add-receiver" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <form id="sdr-hub-add-receiver" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -3419,6 +3455,12 @@ class SdrHubPanel extends HTMLElement {
     // sweep is gone - and keyed by the same never-reused UUID, so they would accumulate silently.
     for (const id of Object.keys(this._markers)) {
       if (!activeIds.has(id)) delete this._markers[id];
+    }
+    for (const id of Object.keys(this._sweepStats)) {
+      if (!activeIds.has(id)) delete this._sweepStats[id];
+    }
+    for (const id of Object.keys(this._markerCursor || {})) {
+      if (!activeIds.has(id)) delete this._markerCursor[id];
     }
     // The resize observers are a fifth per-sweep resource and are released here with the other
     // four, above both early returns below. They were previously pruned further down, past the
@@ -4021,7 +4063,7 @@ class SdrHubPanel extends HTMLElement {
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
-              <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <span class="sdr-hub-shrinkable" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
                   aria-label="${fav ? "Remove" : "Add"} ${esc(deviceAccessibleName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
                   aria-pressed="${fav}"
@@ -4601,6 +4643,11 @@ class SdrHubPanel extends HTMLElement {
       // lives on the element so a fresh one is wired while an existing one is not re-wired.
       canvas._markerWired = true;
       canvas.style.cursor = "crosshair";
+      // Reachable and operable without a pointer. Placing a marker was click-only, which made the
+      // one genuinely interactive part of this panel unusable by keyboard - and unlike the icon
+      // buttons, there was no equivalent control to fall back on.
+      canvas.setAttribute("tabindex", "0");
+      canvas.addEventListener("keydown", (ev) => this._onMarkerKey(sweepId, ev));
       canvas.addEventListener("click", (ev) => {
         const rect = canvas.getBoundingClientRect();
         if (!rect.width) return;
@@ -4620,6 +4667,73 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
+  // Keyboard equivalent of clicking the plot. Enter/Space places a marker at the cursor, arrows
+  // move it, Escape clears. The cursor starts mid-band rather than at bin 0: an edge is the least
+  // useful place to begin, and with 5973 bins arrowing in from one would be unusable.
+  _onMarkerKey(sweepId, ev) {
+    const state = this._traceState[sweepId];
+    if (!state || !state.bins) return;
+    const bins = state.bins;
+    const list = (this._markers[sweepId] ??= []);
+    // Coarse step for PageUp/PageDown and Shift-arrow: 1% of the span crosses a 7 MHz sweep in a
+    // hundred presses instead of six thousand, while a plain arrow still gives single-bin precision.
+    const coarse = Math.max(1, Math.round(bins / 100));
+    const cursor = this._markerCursor?.[sweepId] ?? Math.floor(bins / 2);
+    const setCursor = (bin) => {
+      (this._markerCursor ??= {})[sweepId] = Math.max(0, Math.min(bins - 1, bin));
+      this._renderMarkerCursor(sweepId);
+    };
+    switch (ev.key) {
+      case "ArrowLeft":
+        setCursor(cursor - (ev.shiftKey ? coarse : 1));
+        break;
+      case "ArrowRight":
+        setCursor(cursor + (ev.shiftKey ? coarse : 1));
+        break;
+      case "PageDown":
+        setCursor(cursor - coarse);
+        break;
+      case "PageUp":
+        setCursor(cursor + coarse);
+        break;
+      case "Home":
+        setCursor(0);
+        break;
+      case "End":
+        setCursor(bins - 1);
+        break;
+      case "Enter":
+      case " ":
+        list.push(this._markerCursor?.[sweepId] ?? cursor);
+        while (list.length > 2) list.shift();
+        this._renderMarkers(sweepId);
+        this._drawTrace(sweepId);
+        break;
+      case "Escape":
+        delete this._markers[sweepId];
+        if (this._markerCursor) delete this._markerCursor[sweepId];
+        this._renderMarkers(sweepId);
+        this._drawTrace(sweepId);
+        break;
+      default:
+        return; // not ours - leave it to the browser rather than swallowing it
+    }
+    // Only for keys actually handled above, so Tab still moves focus and a screen reader's own
+    // navigation keys are not captured.
+    ev.preventDefault();
+  }
+
+  // The cursor is announced rather than only drawn: a keyboard user moving it needs to know which
+  // frequency they are on, and the plot itself conveys nothing to a screen reader.
+  _renderMarkerCursor(sweepId) {
+    // Routed through _renderMarkers rather than writing the readout directly. Rows arrive several
+    // times a second and each one re-renders that element, so a cursor announcement written here
+    // would be erased within a few hundred milliseconds - exactly while a keyboard user is reading
+    // it. One renderer owning the element is what keeps it on screen.
+    this._renderMarkers(sweepId);
+    this._drawTrace(sweepId);
+  }
+
   _markerFrequencyHz(sweepId, bin) {
     const row = (this._sweepRowHistory[sweepId] || [])[0];
     if (!row) return null;
@@ -4631,7 +4745,10 @@ class SdrHubPanel extends HTMLElement {
     if (!el) return;
     const list = this._markers[sweepId] || [];
     const state = this._traceState[sweepId];
-    if (!list.length || !state) {
+    // The cursor counts as something to show: bailing on an empty marker list would blank the
+    // readout for a keyboard user who has moved the cursor but not yet placed anything - which is
+    // precisely when they most need to know where they are.
+    if (!state || (!list.length && this._markerCursor?.[sweepId] == null)) {
       el.textContent = "";
       return;
     }
@@ -4645,6 +4762,16 @@ class SdrHubPanel extends HTMLElement {
       return parts.join(" ");
     };
     const texts = list.map((bin, i) => describe(bin, String.fromCharCode(65 + i)));
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) {
+      const hz = this._markerFrequencyHz(sweepId, cursorBin);
+      const cur = state.latest ? state.latest[cursorBin] : null;
+      texts.unshift(
+        `Cursor ${hz == null ? "?" : fmtMHz(hz)} MHz` +
+          (Number.isFinite(cur) ? ` ${cur.toFixed(1)} dB` : "") +
+          " (Enter places, Esc clears)",
+      );
+    }
     if (list.length === 2) {
       const [a, b] = list;
       const fa = this._markerFrequencyHz(sweepId, a);
@@ -4670,6 +4797,21 @@ class SdrHubPanel extends HTMLElement {
   _renderOccupancy(sweepId) {
     const el = this.querySelector(`[data-sweep-occupancy="${CSS.escape(sweepId)}"]`);
     if (!el) return;
+    // The add-on's figures win when present. It computes the same statistics over the same rows,
+    // but on the side that owns them: one accumulator shared by every tab, unaffected by a reload,
+    // and the same numbers Home Assistant publishes as entities. Two tabs quoting different
+    // occupancy for one dongle - or the panel disagreeing with the sensor an automation fires on -
+    // is a worse failure than the local computation is a feature.
+    const served = this._sweepStats[sweepId];
+    if (served) {
+      el.textContent =
+        `Noise floor ~${served.noise_floor_db.toFixed(1)} dB \u00b7 ` +
+        `${served.occupancy_pct.toFixed(1)}% of the band occupied ` +
+        `(peak \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${served.bins_measured} bins measured`;
+      return;
+    }
+    // Local fallback, for an add-on predating the stats field. Kept rather than blanking the line:
+    // an older add-on still produces spectra, and the panel can still describe them.
     const state = this._traceState[sweepId];
     if (!state) {
       el.textContent = "";
@@ -4886,6 +5028,21 @@ class SdrHubPanel extends HTMLElement {
 
     // Markers last, so they are never hidden under a trace. Drawn full height rather than as a
     // point on a curve: the marker identifies a *frequency*, and all three traces are read at it.
+    // Dashed, and drawn before the markers, so the transient keyboard cursor is distinguishable
+    // from a placed marker rather than looking like a third one.
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) {
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = "#00897b";
+      ctx.lineWidth = 1;
+      const cx = Math.round(xFor(cursorBin)) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, h);
+      ctx.stroke();
+      ctx.restore();
+    }
     const markers = this._markers[sweepId] || [];
     ctx.strokeStyle = "#00897b";
     ctx.lineWidth = 1;

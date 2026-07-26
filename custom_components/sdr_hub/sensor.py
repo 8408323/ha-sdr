@@ -121,6 +121,19 @@ FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None, SensorSta
 # easily remove. Reaching it is logged once so the behaviour is visible rather than mysterious.
 MAX_DECODED_ENTITIES = 200
 
+# Statistics the add-on computes per sweep, published so automations can act on band activity -
+# "notify me when 868 MHz gets busy" is a question about the band, not about any decoded device,
+# and nothing in the integration could answer it before. Not capped by MAX_DECODED_ENTITIES: that
+# limit protects against unbounded growth from whatever happens to be on the air, while these are
+# three per sweep and a sweep only exists because someone created it.
+SWEEP_STAT_FIELDS: dict[str, tuple[str, str | None]] = {
+    # dB, and no SIGNAL_STRENGTH device class, for the same reason as the decoded rssi/snr fields:
+    # these are receiver-relative levels, not calibrated absolute power.
+    "noise_floor_db": ("Noise floor", "dB"),
+    "peak_db": ("Peak", "dB"),
+    "occupancy_pct": ("Band occupancy", "%"),
+}
+
 
 def decoded_device_key(device: dict[str, Any]) -> str:
     """Identity of one physical sensor: model, id and channel.
@@ -184,9 +197,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         }
         return len(registered | pending)
 
+    sweep_stat_entities: dict[tuple[str, str], SdrHubSweepStatSensor] = {}
+
+    @callback
+    def handle_sweep_stats(event: dict[str, Any]) -> None:
+        sweep_id = event.get("sweep_id")
+        stats = event.get("stats")
+        # Absent rather than null when the sweep has produced nothing measurable yet, so there is
+        # no entity asserting 0 dB - which for a noise floor is a real and very loud reading.
+        if not isinstance(sweep_id, str) or not isinstance(stats, dict):
+            return
+        new_stat_entities: list[SdrHubSweepStatSensor] = []
+        for field in SWEEP_STAT_FIELDS:
+            value = finite_reading(stats.get(field))
+            if value is None:
+                continue
+            existing = sweep_stat_entities.get((sweep_id, field))
+            if existing is not None:
+                existing.update_reading(value)
+                continue
+            entity = SdrHubSweepStatSensor(entry, sweep_id, field, value)
+            sweep_stat_entities[(sweep_id, field)] = entity
+            new_stat_entities.append(entity)
+        if new_stat_entities:
+            async_add_entities(new_stat_entities)
+
     @callback
     def handle_event(event: dict[str, Any]) -> None:
         nonlocal capped
+        if event.get("type") == "sweep_row":
+            handle_sweep_stats(event)
+            return
         if event.get("type") != "decoded_device":
             return
         device = event.get("device") or {}
@@ -310,3 +351,42 @@ class SdrHubDecodedSensor(SensorEntity):
         # only when they choose to, so a value with no timestamp gives no way to tell a current
         # reading from one several days old.
         return {"last_seen": self._last_seen.isoformat()}
+
+
+class SdrHubSweepStatSensor(SensorEntity):
+    """One statistic about one sweep's band, as measured by the add-on.
+
+    Deliberately not a CoordinatorEntity, for the same reason as SdrHubDecodedSensor: the value
+    arrives on the event stream when a row is emitted, not on the coordinator's polling interval,
+    and binding it to that interval would make the reading lag the hardware by up to 30 seconds.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, entry: ConfigEntry, sweep_id: str, field: str, value: float) -> None:
+        name, unit = SWEEP_STAT_FIELDS[field]
+        self._attr_name = name
+        self._attr_native_unit_of_measurement = unit
+        self._attr_native_value = value
+        self._attr_unique_id = f"{entry.entry_id}_sweep_{sweep_id}_{field}"
+        self._attr_icon = "mdi:chart-bell-curve-cumulative"
+        # Its own device, grouped under the hub. A sweep is a distinct thing a user started, with a
+        # lifetime of its own, so hanging three statistics off the hub device would mix them with
+        # every other sweep's and leave no way to tell which band they describe.
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{entry.entry_id}_sweep_{sweep_id}")},
+            name=f"SDR Hub sweep {sweep_id[:8]}",
+            manufacturer="ha-sdr (unofficial)",
+            model="Spectrum sweep",
+            via_device=(DOMAIN, entry.entry_id),
+        )
+
+    @callback
+    def update_reading(self, value: float) -> None:
+        self._attr_native_value = value
+        # Same guard as the decoded sensor: an entity constructed but not yet added to hass cannot
+        # write state, and attempting it raises rather than being ignored.
+        if self.hass is not None:
+            self.async_write_ha_state()

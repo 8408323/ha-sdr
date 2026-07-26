@@ -81,6 +81,9 @@ async def create_sweep(cfg: SweepCreate, request: Request) -> Sweep:
 async def delete_sweep(sweep_id: str, request: Request) -> None:
     try:
         await request.app.state.manager.remove_sweep(sweep_id)
+        # Only after the removal actually succeeded - a SweepStopTimeoutError below leaves the sweep
+        # and its dongle claim in place, so its statistics are still live and must not be discarded.
+        request.app.state.forget_sweep_stats(sweep_id)
     except SweepStopTimeoutError as err:
         # The sweeper thread didn't exit in time and may still hold the dongle open;
         # the sweep/claim are deliberately left in place by DeviceManager, so surface
