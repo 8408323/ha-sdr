@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,6 +29,26 @@ NON_MEASUREMENT_FIELDS = frozenset({"id", "channel", "model", "time", "mic", "pr
 # with a battery has one, so they would also consume the entity budget. Exposing them properly
 # needs a binary_sensor platform, which is deliberately out of scope here.
 FLAG_FIELDS = frozenset({"battery_ok", "battery", "button", "tamper", "alarm", "learn", "test"})
+
+
+def finite_reading(value: Any) -> float | None:
+    """Return value as a finite float, or None if it cannot be one.
+
+    A decoded payload is JSON produced by an external process from whatever happened to be on the
+    air, so "syntactically valid number" and "usable sensor state" are not the same thing. A
+    mismatched decoder can emit an integer too large for a float (float() raises OverflowError) or
+    a literal like 1e400, which json parses to inf without complaint. Neither is caught by a type
+    check, and the cost of letting one through is not a bad reading: handle_event runs synchronously
+    inside SdrHubCoordinator._dispatch, whose caller treats *any* exception as a lost connection, so
+    a single malformed field would drop the WebSocket and be logged as a transport failure.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 # Known rtl_433 field names mapped to their Home Assistant semantics. Anything numeric that is not
 # listed still becomes a sensor, just without a device class or unit - a decoder this integration
@@ -132,26 +153,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             return
         key = decoded_device_key(device)
         new_entities: list[SdrHubDecodedSensor] = []
+        # Slots claimed by *this* payload but not yet visible to the registry. async_add_entities
+        # runs once after the loop, so the registry count is identical on every iteration: a device
+        # reporting ten new fields at 199 registered entities would see "199 < 200" ten times and
+        # take the registry to 209. The ceiling is only a ceiling if a claim is charged when it is
+        # made rather than when it is committed.
+        reserved = 0
         for field, value in device.items():
             if field in NON_MEASUREMENT_FIELDS or field in FLAG_FIELDS:
                 continue
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
+            reading = finite_reading(value)
+            if reading is None:
                 continue
             existing = known.get((key, field))
             if existing is not None:
-                existing.update_reading(float(value), device)
+                existing.update_reading(reading, device)
                 continue
             unique_id = f"{entry.entry_id}_{key}_{field}"
-            if _is_new_registration(unique_id) and _registered_decoded_count() >= MAX_DECODED_ENTITIES:
-                if not capped:
-                    capped = True
-                    _LOGGER.warning(
-                        "Reached the %s decoded-device entity limit; further devices will appear in the "
-                        "SDR Hub panel but will not be created as entities",
-                        MAX_DECODED_ENTITIES,
-                    )
-                continue
-            entity = SdrHubDecodedSensor(entry, device, field, float(value))
+            if _is_new_registration(unique_id):
+                if _registered_decoded_count() + reserved >= MAX_DECODED_ENTITIES:
+                    if not capped:
+                        capped = True
+                        _LOGGER.warning(
+                            "Reached the %s decoded-device entity limit; further devices will appear in the "
+                            "SDR Hub panel but will not be created as entities",
+                            MAX_DECODED_ENTITIES,
+                        )
+                    continue
+                # Only a genuinely new unique id is reserved. Recreating one the registry already
+                # holds does not grow it, for the same reason it is not charged against the cap.
+                reserved += 1
+            entity = SdrHubDecodedSensor(entry, device, field, reading)
             known[(key, field)] = entity
             new_entities.append(entity)
         if new_entities:

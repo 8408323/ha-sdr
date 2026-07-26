@@ -149,4 +149,13 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _dispatch(self, event: dict[str, Any]) -> None:
         for listener in list(self._event_listeners):
-            listener(event)
+            # A listener fault is not a transport fault, but ws_loop cannot tell the difference:
+            # its except-Exception is deliberately broad so any *connection* failure reconnects, and
+            # an exception raised here arrives through the same path. Unisolated, one listener
+            # raising on one event would drop the WebSocket, log it as "connection lost", and take
+            # every other listener's stream down with it - a misdiagnosis that would recur for any
+            # listener added later, so it is fixed at the dispatch boundary rather than per listener.
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - one listener must not break the stream for the rest
+                _LOGGER.exception("sdr_hub event listener failed handling a %s event", event.get("type"))
