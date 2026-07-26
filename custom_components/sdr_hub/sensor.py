@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -125,6 +125,16 @@ MAX_DECODED_ENTITIES = 200
 # stopped and remove it deliberately, which means "still listed" is not the same as "still measuring"
 # - and statistics from a sweep that has stopped measuring are stale by definition.
 TERMINAL_SWEEP_STATUSES = frozenset({"error", "stopped"})
+
+# Minimum interval between state writes for one statistic entity.
+#
+# A narrow sweep finishes a row per capture with no pacing, so at the default sample rate the
+# add-on can emit rows tens of times a second - and every row would otherwise write all three
+# entities. That is event-loop work and, because these are measurement states, a Recorder row each
+# time: a database growing at hundreds of rows a second for as long as the sweep runs. Nothing
+# consuming a noise floor or a band-occupancy percentage needs sub-second resolution, so the raw
+# rows keep flowing to the panel at full rate while the entities settle to an automation cadence.
+MIN_STAT_WRITE_INTERVAL = timedelta(seconds=5)
 
 # Statistics the add-on computes per sweep, published so automations can act on band activity -
 # "notify me when 868 MHz gets busy" is a question about the band, not about any decoded device,
@@ -523,6 +533,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         band: tuple[float, float] | None,
     ) -> None:
         self._coordinator = coordinator
+        self._last_written: datetime | None = None
         name, unit = SWEEP_STAT_FIELDS[field]
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
@@ -546,13 +557,21 @@ class SdrHubSweepStatSensor(SensorEntity):
 
     @callback
     def update_reading(self, value: float, band: tuple[float, float] | None = None) -> None:
+        # The value is always recorded, so the entity holds the latest measurement whether or not
+        # this particular row is written out - a throttle that also discarded data would turn a
+        # write-rate problem into a measurement problem.
         self._attr_native_value = value
         if band is not None:
             self._band = band
         # Same guard as the decoded sensor: an entity constructed but not yet added to hass cannot
         # write state, and attempting it raises rather than being ignored.
-        if self.hass is not None:
-            self.async_write_ha_state()
+        if self.hass is None:
+            return
+        now = datetime.now(timezone.utc)
+        if self._last_written is not None and now - self._last_written < MIN_STAT_WRITE_INTERVAL:
+            return
+        self._last_written = now
+        self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
         """Re-evaluates availability whenever the coordinator reports success or failure.

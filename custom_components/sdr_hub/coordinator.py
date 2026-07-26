@@ -200,6 +200,14 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # them converge on handling it exactly once.
                         self._dispatch({"type": "stream_reconnected", "gap_id": uuid.uuid4().hex})
                     first_connection = False
+                    # The snapshot is refreshed *before* the stream is reported up. Opening the
+                    # WebSocket succeeds the moment a restarted add-on is listening, while
+                    # coordinator.data still describes the process that died - so marking the
+                    # stream connected first re-enabled the statistic entities against sweeps that
+                    # no longer exist, republishing their last readings as current for up to a
+                    # polling interval. Availability should not return before the state behind it
+                    # is true.
+                    await self.async_refresh()
                     self._set_stream_connected(True)
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:

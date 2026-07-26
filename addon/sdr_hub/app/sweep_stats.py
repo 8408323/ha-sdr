@@ -18,6 +18,13 @@ class SweepStats:
     """Accumulates one sweep's session statistics across the rows it emits."""
 
     def __init__(self) -> None:
+        # Incremented on every reset and published with each snapshot. A reset is a *boundary* in
+        # the row stream, and only the side that owns the accumulator can say where it falls: a
+        # client clearing its own copy when the button is pressed cannot know whether a row already
+        # in flight belongs before or after, so a transient in that row would be kept by one view
+        # and dropped by the other. Carrying the generation lets every consumer place the boundary
+        # exactly where this side did. Same mechanism the decoded log already uses for its clear.
+        self.generation = 0
         self._bins = 0
         self._peak: list[float | None] = []
         # Linear power, not dB. Summing decibels computes a geometric mean, which understates an
@@ -28,6 +35,7 @@ class SweepStats:
         self._counts: list[int] = []
 
     def reset(self) -> None:
+        self.generation += 1
         self._bins = 0
         self._peak = []
         self._sum_linear = []
@@ -73,6 +81,7 @@ class SweepStats:
             return None
         occupied = sum(1 for p in measured if p >= noise_floor + OCCUPANCY_MIN_DELTA_DB)
         return {
+            "generation": self.generation,
             "noise_floor_db": round(noise_floor, 1),
             "occupancy_pct": round(100.0 * occupied / len(measured), 1),
             "peak_db": round(max(measured), 1),

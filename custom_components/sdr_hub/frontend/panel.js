@@ -1215,6 +1215,10 @@ const PEAK_MIN_DELTA_DB = 6;
 // floor. Deliberately the same 6 dB the per-row peak readout already requires: two thresholds for
 // "is this a real signal" would let the two readouts disagree about the same bin.
 const OCCUPANCY_MIN_DELTA_DB = PEAK_MIN_DELTA_DB;
+
+// Statuses after which a sweep emits no further rows. Mirrors the integration's own set: a sweep
+// stays listed after erroring so the user can see why, so "listed" is not "measuring".
+const TERMINAL_SWEEP_STATUSES = new Set(["error", "stopped"]);
 // "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
 // fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
 // few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
@@ -1365,6 +1369,8 @@ class SdrHubPanel extends HTMLElement {
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
     this._markers = {};
+    // Last stats generation seen per sweep - see the reset boundary in _handleEvent.
+    this._statsGen = {};
     // Latest per-sweep statistics as computed by the add-on, keyed by sweep id.
     this._sweepStats = {};
     // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
@@ -2028,7 +2034,22 @@ class SdrHubPanel extends HTMLElement {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       // Absent on an older add-on, and absent until a sweep has produced something measurable -
       // both are "no server figure", which the readout distinguishes from a value of zero.
-      if (event.stats) this._sweepStats[event.sweep_id] = event.stats;
+      if (event.stats) {
+        // A new generation means the add-on reset its accumulator, and this row is the first that
+        // belongs after the boundary. The local trace is cleared *here*, before this row is
+        // accumulated, so both sides start from exactly the same row - peak, sum and counts
+        // together, matching what SweepStats.reset clears rather than only the peak.
+        const gen = event.stats.generation;
+        if (gen != null && this._statsGen[event.sweep_id] !== gen) {
+          const known = this._statsGen[event.sweep_id] !== undefined;
+          this._statsGen[event.sweep_id] = gen;
+          // Not on first sight of a sweep: an unknown generation is simply the first row, not a
+          // reset, and clearing then would discard a session this tab had already accumulated
+          // before the add-on's snapshot first arrived.
+          if (known) this._clearTraceState(event.sweep_id);
+        }
+        this._sweepStats[event.sweep_id] = event.stats;
+      }
       const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
       rows.unshift(event);
       // Switching a sweep to "keep full history" only stops future rows being discarded -
@@ -3496,8 +3517,20 @@ class SdrHubPanel extends HTMLElement {
     for (const id of Object.keys(this._markers)) {
       if (!activeIds.has(id)) delete this._markers[id];
     }
+    // Terminal sweeps are dropped here even though they stay in the snapshot. An errored sweep is
+    // kept listed so the user can see why it stopped - which is right - but it emits no further
+    // rows, so its served noise floor and occupancy would sit frozen on screen looking current.
+    // The entity path already treats terminal statistics as stale and removes them; the panel has
+    // to agree, or the same band reads as measured in one place and gone in the other. The
+    // waterfall history is deliberately kept: those rows were really received.
+    const measuringIds = new Set(
+      (this._state.sweeps || []).filter((s) => !TERMINAL_SWEEP_STATUSES.has(s.status)).map((s) => s.id),
+    );
     for (const id of Object.keys(this._sweepStats)) {
-      if (!activeIds.has(id)) delete this._sweepStats[id];
+      if (!measuringIds.has(id)) delete this._sweepStats[id];
+    }
+    for (const id of Object.keys(this._statsGen)) {
+      if (!activeIds.has(id)) delete this._statsGen[id];
     }
     for (const id of Object.keys(this._markerCursor || {})) {
       if (!activeIds.has(id)) delete this._markerCursor[id];
@@ -3730,19 +3763,21 @@ class SdrHubPanel extends HTMLElement {
         // entities still counting a carrier the user had explicitly asked to forget.
         traceReset.addEventListener("click", async () => {
           const errorToken = this._errorToken || 0;
-          this._clearPeakHold(s.id);
           try {
             await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
-            // Cleared locally so the readout falls back to the local figure until the next row
-            // arrives with the add-on's fresh one, rather than showing the pre-reset value.
-            delete this._sweepStats[s.id];
-            this._renderOccupancy(s.id);
             this._clearErrorIfOwnedBy("statsReset", errorToken);
           } catch (err) {
-            // An older add-on has no such endpoint. Say so rather than leaving the two views
-            // silently inconsistent, which is the defect this call exists to remove.
-            this._showError(`Peak hold reset locally only: ${err.message || err}`, { owner: "statsReset" });
+            // An older add-on has no such endpoint, so nothing was reset anywhere. Say so rather
+            // than clearing locally and leaving the two views inconsistent - which is the defect
+            // this call exists to remove.
+            this._showError(`Could not reset peak hold: ${err.message || err}`, { owner: "statsReset" });
+            return;
           }
+          // Deliberately nothing local here. The clear happens when the add-on's next row carries
+          // a new stats generation, so the boundary is placed by the side that owns the
+          // accumulator. Clearing on the click instead meant a row already in flight was counted
+          // by one view and not the other, and a transient in that row stayed on the trace forever
+          // while the entities never saw it.
         });
       }
       el.querySelector(`[data-sweep-trace-csv="${CSS.escape(s.id)}"]`)
@@ -4971,6 +5006,16 @@ class SdrHubPanel extends HTMLElement {
   _renderOccupancy(sweepId) {
     const el = this.querySelector(`[data-sweep-occupancy="${CSS.escape(sweepId)}"]`);
     if (!el) return;
+    // A sweep that has stopped measuring gets no figure at all - not the served one, which is gone,
+    // and not the local fallback either. Dropping only the served value left the readout quietly
+    // switching to a locally-computed number for a dead sweep, which looks exactly as current as
+    // the real thing: the same defect one layer down. The waterfall above keeps its history,
+    // because those rows genuinely were received.
+    const sweep = (this._state.sweeps || []).find((x) => x.id === sweepId);
+    if (sweep && TERMINAL_SWEEP_STATUSES.has(sweep.status)) {
+      el.textContent = "";
+      return;
+    }
     // The add-on's figures win when present. It computes the same statistics over the same rows,
     // but on the side that owns them: one accumulator shared by every tab, unaffected by a reload,
     // and the same numbers Home Assistant publishes as entities. Two tabs quoting different
@@ -5064,23 +5109,17 @@ class SdrHubPanel extends HTMLElement {
     return 10 * Math.log10(state.sum[i] / state.counts[i]);
   }
 
-  // Resets *only* peak hold, which is what the button offers - the average is a session statistic
-  // with its own meaning, and moving it would be a change the user did not ask for from a control
-  // labelled "Reset peak hold".
-  //
-  // Cleared outright rather than recomputed from retained history. Rebuilding was defensible while
-  // the reset was local ("forget what scrolled away, not what I can still see"), but the reset now
-  // also clears the add-on's accumulator - and the add-on has no access to this tab's retained
-  // rows. A transient carrier still sitting in the waterfall would therefore be restored into the
-  // red trace while the served occupancy and the published entities had dropped it, recreating
-  // exactly the disagreement this reset exists to remove. Both sides now clear the same thing:
-  // everything, re-accumulating from the next row.
-  _clearPeakHold(sweepId) {
+  // Clears the whole accumulator - peak, linear sums and counts - because that is exactly what
+  // SweepStats.reset clears on the add-on. Clearing only the peak left the grey average trace and
+  // the CSV describing the pre-reset session while the served noise floor, occupancy and the HA
+  // entities restarted, so the two halves of one plot disagreed about which window they covered.
+  _clearTraceState(sweepId) {
     const state = this._traceState[sweepId];
     if (!state) return;
     state.peak.fill(NaN);
+    state.sum.fill(0);
+    state.counts.fill(0);
     this._drawTrace(sweepId);
-    // The peak changed, so both readouts that quote it are stale until refreshed.
     this._renderMarkers(sweepId);
     this._renderOccupancy(sweepId);
   }
