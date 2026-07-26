@@ -896,6 +896,19 @@ function sparklineSvg(values, width = 120, height = 24) {
 
 // The name to show for a decoded device: the user's alias if set, otherwise the decoder's model
 // string. Callers that need to disambiguate still render id/channel separately.
+// Accessible label for a device: the display name plus the identity the card shows separately.
+// deviceDisplayName alone returns alias-or-model, so two unaliased sensors of the same model get
+// identical accessible names for their favorite/rename/history controls even though the visible
+// card distinguishes them by id and channel - a screen reader user would hear three pairs of
+// identical buttons with no way to tell which device each acts on.
+function deviceAccessibleName(device, aliases) {
+  const parts = [];
+  if (device?.id != null) parts.push(`id ${device.id}`);
+  if (device?.channel != null) parts.push(`channel ${device.channel}`);
+  const name = deviceDisplayName(device, aliases);
+  return parts.length ? `${name}, ${parts.join(", ")}` : name;
+}
+
 function deviceDisplayName(device, aliases) {
   const alias = aliases.get(deviceInstanceKey(device || {}));
   return alias || device?.model || "Unknown device";
@@ -2539,6 +2552,11 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _showError(message, { isLoadError = false, owner = null } = {}) {
+    // Every caller supplies an owner (or isLoadError). "general" remains only as a backstop for a
+    // future call site that forgets: without it such a message would be unclearable, which is
+    // worse than sharing a slot. The audit is two-sided - every owner that can display needs a
+    // clear path, AND every display needs an owner - and only the first half was checked before,
+    // which is how the bulk-stop handlers kept landing in "general".
     const key = owner || (isLoadError ? "loadState" : "general");
     if (message) {
       // Monotonic, so a clear can tell "this is the message my attempt raised" from "a later
@@ -3729,7 +3747,7 @@ class SdrHubPanel extends HTMLElement {
              ${
                isFirstForKey
                  ? `<button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
-                      aria-label="${alias ? "Rename" : "Name"} ${esc(deviceDisplayName(d, this._deviceAliases))}"
+                      aria-label="${alias ? "Rename" : "Name"} ${esc(deviceAccessibleName(d, this._deviceAliases))}"
                       style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`
                  : ""
              }`;
@@ -3738,7 +3756,7 @@ class SdrHubPanel extends HTMLElement {
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
               <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
-                  aria-label="${fav ? "Remove" : "Add"} ${esc(deviceDisplayName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
+                  aria-label="${fav ? "Remove" : "Add"} ${esc(deviceAccessibleName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
                   aria-pressed="${fav}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
                 ${nameCell}
@@ -3748,7 +3766,7 @@ class SdrHubPanel extends HTMLElement {
                 ${
                   isFirstForKey
                     ? `<button data-history-device="${esc(key)}" aria-expanded="${expanded}"
-                         aria-label="${expanded ? "Hide" : "Show"} readings history for ${esc(deviceDisplayName(d, this._deviceAliases))}"
+                         aria-label="${expanded ? "Hide" : "Show"} readings history for ${esc(deviceAccessibleName(d, this._deviceAliases))}"
                          title="${expanded ? "Hide readings history" : "Show readings history"}"
                          style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.8rem;color:var(--secondary-text-color,#727272);">${expanded ? "▾" : "▸"}</button>`
                     : ""
@@ -4715,7 +4733,7 @@ class SdrHubPanel extends HTMLElement {
     try {
       config = JSON.parse(await file.text());
     } catch (err) {
-      this._showError(`Could not read config file: ${err.message || err}`);
+      this._showError(`Could not read config file: ${err.message || err}`, { owner: "configImport" });
       return;
     }
     // Requires the actual shape _exportConfig() writes (a numeric version marker plus real
@@ -4732,7 +4750,7 @@ class SdrHubPanel extends HTMLElement {
       !Array.isArray(config.sweeps) ||
       !Array.isArray(config.receivers)
     ) {
-      this._showError("Config file is not a valid SDR Hub backup");
+      this._showError("Config file is not a valid SDR Hub backup", { owner: "configImport" });
       return;
     }
     const sweeps = config.sweeps;
@@ -4786,7 +4804,7 @@ class SdrHubPanel extends HTMLElement {
         errors.push(`Receiver ${r.label || r.dongle_serial}: ${err.message || err}`);
       }
     }
-    this._showError(errors.length ? `Imported with ${errors.length} issue(s): ${errors.join("; ")}` : "");
+    this._showError(errors.length ? `Imported with ${errors.length} issue(s): ${errors.join("; ")}` : "", { owner: "configImport" });
     await this._loadState();
   }
 
@@ -4883,7 +4901,10 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    this._showError(errors.length ? `Could not stop all sweeps: ${errors.join("; ")}` : "");
+    // Same owner as the individual stop handler: a successful "stop all" genuinely does supersede
+    // an earlier single-stop failure, and sharing the slot is what expresses that. Landing in
+    // "general" instead left the older sweepAction failure on screen after everything had stopped.
+    this._showError(errors.length ? `Could not stop all sweeps: ${errors.join("; ")}` : "", { owner: "sweepAction" });
   }
 
   async _onAddReceiver(ev) {
@@ -4943,7 +4964,7 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    this._showError(errors.length ? `Could not stop all receivers: ${errors.join("; ")}` : "");
+    this._showError(errors.length ? `Could not stop all receivers: ${errors.join("; ")}` : "", { owner: "receiverAction" });
   }
 }
 

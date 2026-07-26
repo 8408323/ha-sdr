@@ -47,7 +47,11 @@ FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None, SensorSta
     "wind_max_km_h": (SensorDeviceClass.WIND_SPEED, "km/h", SensorStateClass.MEASUREMENT),
     "wind_dir_deg": (None, "°", SensorStateClass.MEASUREMENT),
     "moisture": (SensorDeviceClass.MOISTURE, "%", SensorStateClass.MEASUREMENT),
-    "rssi": (SensorDeviceClass.SIGNAL_STRENGTH, "dBm", SensorStateClass.MEASUREMENT),
+    # dB, not dBm, and no SIGNAL_STRENGTH class - which implies calibrated absolute power.
+    # rtl_433 reports these three from the same metadata block as receiver-relative levels, so
+    # publishing rssi as dBm would state a physically different quantity and make any dBm-based
+    # automation threshold quietly wrong.
+    "rssi": (None, "dB", SensorStateClass.MEASUREMENT),
     "snr": (None, "dB", SensorStateClass.MEASUREMENT),
     "noise": (None, "dB", SensorStateClass.MEASUREMENT),
     # Cumulative: rtl_433's rain_mm is a lifetime total from the gauge, not a rate.
@@ -96,17 +100,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     known: dict[tuple[str, str], SdrHubDecodedSensor] = {}
     capped = False
 
-    # Seeded from the entity registry, not from zero. Unique ids are stable across restarts, so HA
-    # remembers every device ever discovered while this dict is rebuilt empty on each setup - a
-    # different set of neighbours after each reload could otherwise register another 200 every
-    # session, and the registry would grow without bound while the counter kept reporting a clean
-    # slate. Counting what already exists makes the cap mean what it says.
+    # What the cap protects is *registry growth*, not session activity - so it is evaluated
+    # against the registry, and only for unique ids the registry has never seen.
+    #
+    # Counting registered entities and adding the session's own count double-counted every one of
+    # them as it was recreated: after a restart `known` starts empty while the registry is already
+    # full, so with 150 entries only the first 50 devices could reload and at the cap none could
+    # load at all - the integration locked out of its own entities. Recreating an existing unique
+    # id does not grow the registry, so it must not be charged against a limit on growth.
     registry = er.async_get(hass)
-    already_registered = sum(
-        1
-        for e in er.async_entries_for_config_entry(registry, entry.entry_id)
-        if e.domain == "sensor" and e.unique_id != f"{entry.entry_id}_status"
-    )
+
+    def _is_new_registration(unique_id: str) -> bool:
+        return registry.async_get_entity_id("sensor", DOMAIN, unique_id) is None
+
+    def _registered_decoded_count() -> int:
+        return sum(
+            1
+            for e in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if e.domain == "sensor" and e.unique_id != f"{entry.entry_id}_status"
+        )
 
     @callback
     def handle_event(event: dict[str, Any]) -> None:
@@ -129,7 +141,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if existing is not None:
                 existing.update_reading(float(value), device)
                 continue
-            if len(known) + already_registered >= MAX_DECODED_ENTITIES:
+            unique_id = f"{entry.entry_id}_{key}_{field}"
+            if _is_new_registration(unique_id) and _registered_decoded_count() >= MAX_DECODED_ENTITIES:
                 if not capped:
                     capped = True
                     _LOGGER.warning(
