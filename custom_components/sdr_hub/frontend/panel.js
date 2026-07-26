@@ -1217,7 +1217,12 @@ class SdrHubPanel extends HTMLElement {
     // Identifies which operation put the currently displayed error on screen, and when. A later
     // success clears only its own message, and only if nothing has been displayed since it began -
     // see _showError.
-    this._errorOwner = null;
+    // owner -> { message, token }. One slot per owner rather than a single shared string: a load
+    // failure and a copy failure describe different things and were previously mutually exclusive,
+    // so whichever arrived second silently erased the first no matter which predicate arbitrated.
+    // Identity is now structural - an operation owns its slot - and the token disambiguates
+    // concurrent invocations *within* one owner, which a slot alone cannot. See issue #18.
+    this._errorMessages = new Map();
     this._errorToken = 0;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
@@ -2511,39 +2516,42 @@ class SdrHubPanel extends HTMLElement {
   // Clears the banner only if it belongs to `owner`. Success paths use this instead of
   // _showError("") so an operation can retract its own message without touching anyone else's.
   //
-  // This replaces an epoch counter that compared *recency*. Recency detects an error raised after
-  // the operation started, but is blind to one that was already on screen when it began - so
-  // copying YAML successfully would clear a get_state failure that was displayed beforehand and
-  // has not recovered. Ownership is the property actually wanted, and the file already had a
-  // narrow version of it in _loadStateErrorShowing, now generalised.
+  // Ownership rather than recency: a clear must not retract a message it did not raise, whether
+  // that message arrived before the operation started or during it. The token handles the second
+  // case - two invocations sharing one owner - which the per-owner slot alone cannot.
   _clearErrorIfOwnedBy(owner, sinceToken) {
-    if (!owner || this._errorOwner !== owner) return;
+    const entry = owner ? this._errorMessages.get(owner) : null;
+    if (!entry) return;
     // Owner alone is a *category*, not an invocation. Two concurrent sweep starts, or a
     // double-clicked copy, share one owner - so one attempt failing and a second succeeding let
     // the success retract a failure that is still true. sinceToken is captured when the operation
     // begins: anything displayed after that belongs to a later attempt and is not ours to clear.
-    if (Number.isFinite(sinceToken) && this._errorToken > sinceToken) return;
-    this._showError("");
+    if (Number.isFinite(sinceToken) && entry.token > sinceToken) return;
+    this._errorMessages.delete(owner);
+    this._renderErrors();
   }
 
   _showError(message, { isLoadError = false, owner = null } = {}) {
+    const key = owner || (isLoadError ? "loadState" : "general");
+    if (message) {
+      // Monotonic, so a clear can tell "this is the message my attempt raised" from "a later
+      // attempt of the same kind raised this while I was still running".
+      this._errorToken = (this._errorToken || 0) + 1;
+      this._errorMessages.set(key, { message, token: this._errorToken });
+    } else {
+      this._errorMessages.delete(key);
+    }
+    this._renderErrors();
+  }
+
+  _renderErrors() {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
-    // Tracks whether the *currently displayed* error is specifically a get_state load
-    // failure, so a later successful reload can clear just that one - without this, an
-    // unrelated action error (e.g. "could not start sweep") showing would get silently wiped
-    // out the next time a background state refresh happens to succeed, even though the user
-    // still needs to see it. Whichever call to _showError ran most recently determines this.
-    this._loadStateErrorShowing = isLoadError && !!message;
-    // Who owns what is on screen now. Cleared along with the message, so an empty banner is owned
-    // by nobody and cannot be "cleared" a second time by a stale success handler.
-    this._errorOwner = message ? owner || (isLoadError ? "loadState" : null) : null;
-    // Monotonic, bumped on every display. Lets a clear tell "this is the message my attempt
-    // raised" from "a later attempt raised this while I was still running".
-    if (message) this._errorToken = (this._errorToken || 0) + 1;
-
-    el.textContent = message;
-    el.style.display = message ? "block" : "none";
+    const messages = [...this._errorMessages.values()].map((e) => e.message);
+    // Rendered as separate lines rather than joined: these are unrelated conditions, and running
+    // them together as one sentence reads as a single compound failure.
+    el.innerHTML = messages.map((m) => `<div>${esc(m)}</div>`).join("");
+    el.style.display = messages.length ? "block" : "none";
   }
 
   // ── shell ────────────────────────────────────────────────────────────────
@@ -2600,7 +2608,8 @@ class SdrHubPanel extends HTMLElement {
           </ul>
           <button data-dismiss-help style="${BTN}">Got it, don't show again</button>
         </div>
-        <div id="sdr-hub-error" style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
+        <div id="sdr-hub-error" role="alert" aria-live="assertive" aria-atomic="true"
+          style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
         <div id="sdr-hub-battery-alert" role="alert" aria-live="assertive" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
@@ -3713,6 +3722,7 @@ class SdrHubPanel extends HTMLElement {
              ${
                isFirstForKey
                  ? `<button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
+                      aria-label="${alias ? "Rename" : "Name"} ${esc(deviceDisplayName(d, this._deviceAliases))}"
                       style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`
                  : ""
              }`;
@@ -3721,6 +3731,8 @@ class SdrHubPanel extends HTMLElement {
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
               <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
+                  aria-label="${fav ? "Remove" : "Add"} ${esc(deviceDisplayName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
+                  aria-pressed="${fav}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
                 ${nameCell}
               </span>
@@ -3729,6 +3741,7 @@ class SdrHubPanel extends HTMLElement {
                 ${
                   isFirstForKey
                     ? `<button data-history-device="${esc(key)}" aria-expanded="${expanded}"
+                         aria-label="${expanded ? "Hide" : "Show"} readings history for ${esc(deviceDisplayName(d, this._deviceAliases))}"
                          title="${expanded ? "Hide readings history" : "Show readings history"}"
                          style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.8rem;color:var(--secondary-text-color,#727272);">${expanded ? "▾" : "▸"}</button>`
                     : ""
