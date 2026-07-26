@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -20,6 +21,63 @@ _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
 _RECONNECT_DELAY_S = 5
+
+
+def _sanitize_event(event: Any) -> Any:
+    """Drop decoded numbers that cannot survive being re-serialized to JSON by Home Assistant.
+
+    A decoded payload is JSON produced by an external process from whatever was on the air, and
+    "valid JSON on the wire" is a weaker guarantee than "HA can send this to a browser". An integer
+    wider than 64 bits parses here without complaint and then fails in websocket_api's serializer -
+    which discards the *whole* message, so one unusable field silently costs the panel every other
+    field of that decode, and the panel cannot tell a dropped event from a quiet band.
+
+    Sanitizing at the point events enter the coordinator, rather than in each listener, is what
+    keeps the entity path and the panel path agreeing on which readings exist: the same value must
+    not become a sensor and reach the panel, or be rejected by one and shown by the other.
+    """
+    if not isinstance(event, dict) or event.get("type") != "decoded_device":
+        return event
+    device = event.get("device")
+    if not isinstance(device, dict):
+        return event
+    dropped = [
+        field
+        for field, value in device.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and not _is_serializable_number(value)
+    ]
+    if not dropped:
+        return event
+    _LOGGER.warning(
+        "Dropped unrepresentable numeric field(s) %s from a %s decode",
+        ", ".join(sorted(dropped)),
+        device.get("model"),
+    )
+    return {**event, "device": {k: v for k, v in device.items() if k not in dropped}}
+
+
+# The range Home Assistant's JSON serializer accepts for an integer. Outside it the value is
+# rejected outright, whatever its magnitude as a float.
+_MIN_SERIALIZABLE_INT = -(2**63)
+_MAX_SERIALIZABLE_INT = 2**64 - 1
+
+
+def _is_serializable_number(value: int | float) -> bool:
+    """Whether the value survives being serialized, as the type it will actually be sent as.
+
+    Integers are range-checked rather than tested for float finiteness, because those are different
+    questions and only the first one is the one being asked: float(10**100) is 1e100, perfectly
+    finite, so a finiteness test passes and the *original* oversized integer is kept and forwarded -
+    and the serializer rejects it anyway. That failure is worse than no check at all, because the
+    sensor path would meanwhile accept the rounded float, leaving the two paths disagreeing about a
+    reading in exactly the way sanitizing here is meant to prevent.
+    """
+    if isinstance(value, int):
+        return _MIN_SERIALIZABLE_INT <= value <= _MAX_SERIALIZABLE_INT
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -139,7 +197,7 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            self._dispatch(msg.json())
+                            self._dispatch(_sanitize_event(msg.json()))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - reconnect on any transport failure, not just expected ones
@@ -149,4 +207,13 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _dispatch(self, event: dict[str, Any]) -> None:
         for listener in list(self._event_listeners):
-            listener(event)
+            # A listener fault is not a transport fault, but ws_loop cannot tell the difference:
+            # its except-Exception is deliberately broad so any *connection* failure reconnects, and
+            # an exception raised here arrives through the same path. Unisolated, one listener
+            # raising on one event would drop the WebSocket, log it as "connection lost", and take
+            # every other listener's stream down with it - a misdiagnosis that would recur for any
+            # listener added later, so it is fixed at the dispatch boundary rather than per listener.
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - one listener must not break the stream for the rest
+                _LOGGER.exception("sdr_hub event listener failed handling a %s event", event.get("type"))

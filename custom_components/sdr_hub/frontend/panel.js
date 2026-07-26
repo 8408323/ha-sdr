@@ -896,6 +896,19 @@ function sparklineSvg(values, width = 120, height = 24) {
 
 // The name to show for a decoded device: the user's alias if set, otherwise the decoder's model
 // string. Callers that need to disambiguate still render id/channel separately.
+// Accessible label for a device: the display name plus the identity the card shows separately.
+// deviceDisplayName alone returns alias-or-model, so two unaliased sensors of the same model get
+// identical accessible names for their favorite/rename/history controls even though the visible
+// card distinguishes them by id and channel - a screen reader user would hear three pairs of
+// identical buttons with no way to tell which device each acts on.
+function deviceAccessibleName(device, aliases) {
+  const parts = [];
+  if (device?.id != null) parts.push(`id ${device.id}`);
+  if (device?.channel != null) parts.push(`channel ${device.channel}`);
+  const name = deviceDisplayName(device, aliases);
+  return parts.length ? `${name}, ${parts.join(", ")}` : name;
+}
+
 function deviceDisplayName(device, aliases) {
   const alias = aliases.get(deviceInstanceKey(device || {}));
   return alias || device?.model || "Unknown device";
@@ -1217,7 +1230,12 @@ class SdrHubPanel extends HTMLElement {
     // Identifies which operation put the currently displayed error on screen, and when. A later
     // success clears only its own message, and only if nothing has been displayed since it began -
     // see _showError.
-    this._errorOwner = null;
+    // owner -> { message, token }. One slot per owner rather than a single shared string: a load
+    // failure and a copy failure describe different things and were previously mutually exclusive,
+    // so whichever arrived second silently erased the first no matter which predicate arbitrated.
+    // Identity is now structural - an operation owns its slot - and the token disambiguates
+    // concurrent invocations *within* one owner, which a slot alone cannot. See issue #18.
+    this._errorMessages = new Map();
     this._errorToken = 0;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
@@ -1758,6 +1776,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _subscribe() {
+    const errorToken = this._errorToken || 0;
     if (this._unsub || this._subscribing) return; // already subscribed, or another call is in flight
     this._subscribing = true; // set synchronously, before the await below, to close that race
     try {
@@ -1775,6 +1794,12 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       this._unsub = unsub;
+      // The one owner that could display but never release. Harmless while the banner held a
+      // single message - any later error displaced a stale subscribe failure - but the per-owner
+      // map makes every slot independent and permanent, so a missing clear path turns from
+      // invisible into a banner that stays until reload. Every owner that can display must have
+      // one; this was the gap.
+      this._clearErrorIfOwnedBy("subscribe", errorToken);
     } catch (err) {
       this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
     } finally {
@@ -2137,10 +2162,28 @@ class SdrHubPanel extends HTMLElement {
   _noteOutdatedAddon() {
     if (this._outdatedAddonNoticeShown) return;
     this._outdatedAddonNoticeShown = true;
+    // Owned so it cannot be overwritten from the shared "general" slot by an unrelated call site.
+    // Unlike every other owner it is not cleared by the operation that raised it - it describes the
+    // deployment, not an attempt - but it is emphatically not permanent: see
+    // _clearOutdatedAddonNotice for what retracts it.
     this._showError(
       "The SDR Hub add-on is out of date: decoded events arrive without a server-assigned id, " +
         "so the decoded log and low-battery alerts are disabled. Update the add-on to re-enable them.",
+      { owner: "outdatedAddon" },
     );
+  }
+
+  _clearOutdatedAddonNotice() {
+    if (!this._outdatedAddonNoticeShown) return;
+    // The latch is reset alongside the message, not instead of it: leaving it set would suppress
+    // the notice if the add-on were later downgraded or rolled back in the same session, which is
+    // the same "reports a stale deployment" failure in the opposite direction.
+    this._outdatedAddonNoticeShown = false;
+    // Not token-guarded, unlike the operation owners. There is no concurrent second attempt to
+    // confuse this with - the condition is a property of the connected add-on, and a convergent
+    // event is proof about that add-on, so whatever raised the notice is answered by it.
+    this._errorMessages.delete("outdatedAddon");
+    this._renderErrors();
   }
 
   async _persistDecodedEvent(event) {
@@ -2155,6 +2198,12 @@ class SdrHubPanel extends HTMLElement {
       this._noteOutdatedAddon();
       return;
     }
+    // Reaching here IS the recovery signal: this event carries the server-assigned identity whose
+    // absence the notice reports, so the features it says are disabled are demonstrably working
+    // again. The add-on can be upgraded and restarted while the panel stays open, so treating the
+    // notice as permanent left it asserting that the decoded log and battery alerts were off while
+    // both were processing these very events.
+    this._clearOutdatedAddonNotice();
     // Legacy (non-convergent) entries from an older add-on are kept in the local view - they
     // only need excluding from *persistence*, and dropping them here would blank the visible
     // history the moment the add-on is upgraded mid-session.
@@ -2511,39 +2560,47 @@ class SdrHubPanel extends HTMLElement {
   // Clears the banner only if it belongs to `owner`. Success paths use this instead of
   // _showError("") so an operation can retract its own message without touching anyone else's.
   //
-  // This replaces an epoch counter that compared *recency*. Recency detects an error raised after
-  // the operation started, but is blind to one that was already on screen when it began - so
-  // copying YAML successfully would clear a get_state failure that was displayed beforehand and
-  // has not recovered. Ownership is the property actually wanted, and the file already had a
-  // narrow version of it in _loadStateErrorShowing, now generalised.
+  // Ownership rather than recency: a clear must not retract a message it did not raise, whether
+  // that message arrived before the operation started or during it. The token handles the second
+  // case - two invocations sharing one owner - which the per-owner slot alone cannot.
   _clearErrorIfOwnedBy(owner, sinceToken) {
-    if (!owner || this._errorOwner !== owner) return;
+    const entry = owner ? this._errorMessages.get(owner) : null;
+    if (!entry) return;
     // Owner alone is a *category*, not an invocation. Two concurrent sweep starts, or a
     // double-clicked copy, share one owner - so one attempt failing and a second succeeding let
     // the success retract a failure that is still true. sinceToken is captured when the operation
     // begins: anything displayed after that belongs to a later attempt and is not ours to clear.
-    if (Number.isFinite(sinceToken) && this._errorToken > sinceToken) return;
-    this._showError("");
+    if (Number.isFinite(sinceToken) && entry.token > sinceToken) return;
+    this._errorMessages.delete(owner);
+    this._renderErrors();
   }
 
   _showError(message, { isLoadError = false, owner = null } = {}) {
+    // Every caller supplies an owner (or isLoadError). "general" remains only as a backstop for a
+    // future call site that forgets: without it such a message would be unclearable, which is
+    // worse than sharing a slot. The audit is two-sided - every owner that can display needs a
+    // clear path, AND every display needs an owner - and only the first half was checked before,
+    // which is how the bulk-stop handlers kept landing in "general".
+    const key = owner || (isLoadError ? "loadState" : "general");
+    if (message) {
+      // Monotonic, so a clear can tell "this is the message my attempt raised" from "a later
+      // attempt of the same kind raised this while I was still running".
+      this._errorToken = (this._errorToken || 0) + 1;
+      this._errorMessages.set(key, { message, token: this._errorToken });
+    } else {
+      this._errorMessages.delete(key);
+    }
+    this._renderErrors();
+  }
+
+  _renderErrors() {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
-    // Tracks whether the *currently displayed* error is specifically a get_state load
-    // failure, so a later successful reload can clear just that one - without this, an
-    // unrelated action error (e.g. "could not start sweep") showing would get silently wiped
-    // out the next time a background state refresh happens to succeed, even though the user
-    // still needs to see it. Whichever call to _showError ran most recently determines this.
-    this._loadStateErrorShowing = isLoadError && !!message;
-    // Who owns what is on screen now. Cleared along with the message, so an empty banner is owned
-    // by nobody and cannot be "cleared" a second time by a stale success handler.
-    this._errorOwner = message ? owner || (isLoadError ? "loadState" : null) : null;
-    // Monotonic, bumped on every display. Lets a clear tell "this is the message my attempt
-    // raised" from "a later attempt raised this while I was still running".
-    if (message) this._errorToken = (this._errorToken || 0) + 1;
-
-    el.textContent = message;
-    el.style.display = message ? "block" : "none";
+    const messages = [...this._errorMessages.values()].map((e) => e.message);
+    // Rendered as separate lines rather than joined: these are unrelated conditions, and running
+    // them together as one sentence reads as a single compound failure.
+    el.innerHTML = messages.map((m) => `<div>${esc(m)}</div>`).join("");
+    el.style.display = messages.length ? "block" : "none";
   }
 
   // ── shell ────────────────────────────────────────────────────────────────
@@ -2600,7 +2657,8 @@ class SdrHubPanel extends HTMLElement {
           </ul>
           <button data-dismiss-help style="${BTN}">Got it, don't show again</button>
         </div>
-        <div id="sdr-hub-error" style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
+        <div id="sdr-hub-error" role="alert" aria-live="assertive" aria-atomic="true"
+          style="display:none;color:var(--error-color,#db4437);margin-bottom:12px;"></div>
         <div id="sdr-hub-battery-alert" role="alert" aria-live="assertive" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
@@ -2714,6 +2772,14 @@ class SdrHubPanel extends HTMLElement {
         </div>
       </div>
     `;
+
+    // The markup above recreates #sdr-hub-error empty, but _errorMessages still holds whatever is
+    // currently wrong - so without this a rebuild silently erases a live, still-relevant failure,
+    // and nothing would redraw it until the *next* error operation happened to occur. Restoring it
+    // here rather than at each _renderShell() call site is deliberate: the map is state that
+    // outlives the DOM, exactly like the decoded log and battery alerts, and a rebuild added later
+    // would otherwise have to remember to repaint it.
+    this._renderErrors();
 
     this.querySelector("#sdr-hub-decoded-filter").addEventListener("input", (ev) => {
       this._decodedFilter = ev.target.value.trim().toLowerCase();
@@ -3713,6 +3779,7 @@ class SdrHubPanel extends HTMLElement {
              ${
                isFirstForKey
                  ? `<button data-alias-edit="${esc(key)}" title="${alias ? "Rename device" : "Give this device a name"}"
+                      aria-label="${alias ? "Rename" : "Name"} ${esc(deviceAccessibleName(d, this._deviceAliases))}"
                       style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.85rem;color:var(--secondary-text-color,#727272);">✎</button>`
                  : ""
              }`;
@@ -3721,6 +3788,8 @@ class SdrHubPanel extends HTMLElement {
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
               <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
+                  aria-label="${fav ? "Remove" : "Add"} ${esc(deviceAccessibleName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
+                  aria-pressed="${fav}"
                   style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:1rem;color:${fav ? "#f5a623" : "var(--secondary-text-color,#727272)"};">${fav ? "★" : "☆"}</button>
                 ${nameCell}
               </span>
@@ -3729,6 +3798,7 @@ class SdrHubPanel extends HTMLElement {
                 ${
                   isFirstForKey
                     ? `<button data-history-device="${esc(key)}" aria-expanded="${expanded}"
+                         aria-label="${expanded ? "Hide" : "Show"} readings history for ${esc(deviceAccessibleName(d, this._deviceAliases))}"
                          title="${expanded ? "Hide readings history" : "Show readings history"}"
                          style="border:none;background:none;cursor:pointer;padding:0;line-height:1;font-size:.8rem;color:var(--secondary-text-color,#727272);">${expanded ? "▾" : "▸"}</button>`
                     : ""
@@ -4691,11 +4761,18 @@ class SdrHubPanel extends HTMLElement {
     const file = ev.target.files[0];
     ev.target.value = ""; // clears the input so re-selecting the same file later still fires "change"
     if (!file) return;
+    // Captured before the first await, not before the import loop. file.text() is itself an await,
+    // so a second import picked during it can parse, fail validation and display its error while
+    // this call is still reading - and a token taken afterwards would treat that newer error as
+    // pre-existing and let this import's success delete it, hiding that the user's most recently
+    // chosen file was invalid. "Before the loop" is not the same as "before the operation"; only
+    // the latter is what the token is for.
+    const errorToken = this._errorToken || 0;
     let config;
     try {
       config = JSON.parse(await file.text());
     } catch (err) {
-      this._showError(`Could not read config file: ${err.message || err}`);
+      this._showError(`Could not read config file: ${err.message || err}`, { owner: "configImport" });
       return;
     }
     // Requires the actual shape _exportConfig() writes (a numeric version marker plus real
@@ -4712,7 +4789,7 @@ class SdrHubPanel extends HTMLElement {
       !Array.isArray(config.sweeps) ||
       !Array.isArray(config.receivers)
     ) {
-      this._showError("Config file is not a valid SDR Hub backup");
+      this._showError("Config file is not a valid SDR Hub backup", { owner: "configImport" });
       return;
     }
     const sweeps = config.sweeps;
@@ -4766,7 +4843,11 @@ class SdrHubPanel extends HTMLElement {
         errors.push(`Receiver ${r.label || r.dongle_serial}: ${err.message || err}`);
       }
     }
-    this._showError(errors.length ? `Imported with ${errors.length} issue(s): ${errors.join("; ")}` : "");
+    if (errors.length) {
+      this._showError(`Imported with ${errors.length} issue(s): ${errors.join("; ")}`, { owner: "configImport" });
+    } else {
+      this._clearErrorIfOwnedBy("configImport", errorToken);
+    }
     await this._loadState();
   }
 
@@ -4854,6 +4935,12 @@ class SdrHubPanel extends HTMLElement {
   // failure's message even though that sweep is still running. Errors are accumulated instead
   // and reported together once the whole loop finishes.
   async _onStopAllSweeps() {
+    // Captured before the first removal. Sharing sweepAction with the individual handler is right -
+    // a successful "stop all" does supersede an earlier single-stop failure - but this loop awaits
+    // each removal in turn, so a *later* single-sweep failure can be displayed while it is still
+    // running. Clearing unconditionally on success would retract that newer, still-true message;
+    // the token confines this operation to superseding what it could actually have seen.
+    const errorToken = this._errorToken || 0;
     const errors = [];
     for (const id of this._state.sweeps.map((s) => s.id)) {
       try {
@@ -4863,7 +4950,8 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    this._showError(errors.length ? `Could not stop all sweeps: ${errors.join("; ")}` : "");
+    if (errors.length) this._showError(`Could not stop all sweeps: ${errors.join("; ")}`, { owner: "sweepAction" });
+    else this._clearErrorIfOwnedBy("sweepAction", errorToken);
   }
 
   async _onAddReceiver(ev) {
@@ -4914,6 +5002,7 @@ class SdrHubPanel extends HTMLElement {
   // See _onStopAllSweeps above - same snapshot-ids-then-sequentially-remove reasoning, and same
   // reason for accumulating errors instead of delegating to _onRemoveReceiver.
   async _onStopAllReceivers() {
+    const errorToken = this._errorToken || 0;
     const errors = [];
     for (const id of this._state.receivers.map((r) => r.id)) {
       try {
@@ -4923,7 +5012,8 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    this._showError(errors.length ? `Could not stop all receivers: ${errors.join("; ")}` : "");
+    if (errors.length) this._showError(`Could not stop all receivers: ${errors.join("; ")}`, { owner: "receiverAction" });
+    else this._clearErrorIfOwnedBy("receiverAction", errorToken);
   }
 }
 

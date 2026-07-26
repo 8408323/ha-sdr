@@ -33,6 +33,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: SdrHubConfigEntry) -> bo
 
     await coordinator.async_config_entry_first_refresh()
 
+    # Platforms are set up BEFORE the WebSocket task starts. The sensor platform discovers
+    # decoded devices from the live event stream, so any event arriving between the stream opening
+    # and its listener being registered is silently discarded - and a low-duty-cycle transmitter
+    # (a weather station on a several-minute cycle, or a door sensor that fires once) would then
+    # have no entity until it happens to transmit again. The forward is awaited, so by the time
+    # the stream opens every listener is in place.
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     entry.async_create_background_task(hass, coordinator.ws_loop(), "sdr_hub-ws")
     entry.async_on_unload(coordinator.stop_ws)
 
@@ -49,7 +57,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: SdrHubConfigEntry) -> bo
         websocket.async_register(hass)
         hass.data[_WS_REGISTERED] = True
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
