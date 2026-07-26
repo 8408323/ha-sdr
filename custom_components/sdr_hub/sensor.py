@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -135,6 +135,29 @@ SWEEP_STAT_FIELDS: dict[str, tuple[str, str | None]] = {
 }
 
 
+def sweep_band_hz(event: dict[str, Any]) -> tuple[float, float] | None:
+    """The frequency range a sweep row actually covers, derived from the row's own geometry.
+
+    Taken from the row rather than the configured sweep, because the row is what the statistics
+    describe: the add-on tiles captures across the requested range and the emitted row's bin_hz is
+    the possibly-downsampled width, so the configured stop_hz and the measured one can differ.
+    """
+    start = event.get("start_hz")
+    bin_hz = event.get("bin_hz")
+    power = event.get("power_db")
+    if not isinstance(start, (int, float)) or not isinstance(bin_hz, (int, float)) or not isinstance(power, list):
+        return None
+    if not power or bin_hz <= 0:
+        return None
+    return float(start), float(start) + len(power) * float(bin_hz)
+
+
+def format_band(band: tuple[float, float] | None) -> str | None:
+    if band is None:
+        return None
+    return f"{band[0] / 1e6:.3f}-{band[1] / 1e6:.3f} MHz"
+
+
 def decoded_device_key(device: dict[str, Any]) -> str:
     """Identity of one physical sensor: model, id and channel.
 
@@ -189,15 +212,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     def _is_new_registration(unique_id: str) -> bool:
         return registry.async_get_entity_id("sensor", DOMAIN, unique_id) is None
 
+    def _is_decoded_unique_id(unique_id: str) -> bool:
+        """Whether a unique id belongs to the decoded-device population the cap governs.
+
+        Excluding only the status sensor was correct while decoded sensors were the only other kind.
+        Sweep statistics broke that assumption without changing the filter, so three entities per
+        sweep were silently charged against a limit documented as not applying to them - and because
+        registry entries outlive their sweep, 67 create/delete cycles would exhaust it with no
+        decoded device ever having existed.
+        """
+        return unique_id != f"{entry.entry_id}_status" and not unique_id.startswith(f"{entry.entry_id}_sweep_")
+
     def _projected_decoded_count() -> int:
         registered = {
             e.unique_id
             for e in er.async_entries_for_config_entry(registry, entry.entry_id)
-            if e.domain == "sensor" and e.unique_id != f"{entry.entry_id}_status"
+            if e.domain == "sensor" and _is_decoded_unique_id(e.unique_id)
         }
-        return len(registered | pending)
+        return len(registered | {uid for uid in pending if _is_decoded_unique_id(uid)})
 
     sweep_stat_entities: dict[tuple[str, str], SdrHubSweepStatSensor] = {}
+
+    @callback
+    def retire_sweep_stats(live_sweep_ids: set[str]) -> None:
+        """Removes statistic entities for sweeps that no longer exist.
+
+        A stale occupancy reading is worse than a missing one: it looks current, and an automation
+        acting on "868 MHz is busy" cannot tell that the sweep measuring it stopped an hour ago.
+        The entity and its device are removed from the registry too, not merely dropped from the
+        dict - otherwise every create/delete cycle leaves a permanent device behind.
+        """
+        for (sweep_id, field), entity in list(sweep_stat_entities.items()):
+            if sweep_id in live_sweep_ids:
+                continue
+            del sweep_stat_entities[(sweep_id, field)]
+            entity_id = registry.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
+            if entity_id:
+                registry.async_remove(entity_id)
+        device_registry = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
+            for domain, identifier in device.identifiers:
+                prefix = f"{entry.entry_id}_sweep_"
+                if domain != DOMAIN or not identifier.startswith(prefix):
+                    continue
+                if identifier[len(prefix) :] not in live_sweep_ids:
+                    device_registry.async_remove_device(device.id)
+                break
 
     @callback
     def handle_sweep_stats(event: dict[str, Any]) -> None:
@@ -207,6 +267,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # no entity asserting 0 dB - which for a noise floor is a real and very loud reading.
         if not isinstance(sweep_id, str) or not isinstance(stats, dict):
             return
+        band = sweep_band_hz(event)
         new_stat_entities: list[SdrHubSweepStatSensor] = []
         for field in SWEEP_STAT_FIELDS:
             value = finite_reading(stats.get(field))
@@ -214,9 +275,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 continue
             existing = sweep_stat_entities.get((sweep_id, field))
             if existing is not None:
-                existing.update_reading(value)
+                existing.update_reading(value, band)
                 continue
-            entity = SdrHubSweepStatSensor(entry, sweep_id, field, value)
+            entity = SdrHubSweepStatSensor(entry, sweep_id, field, value, band)
             sweep_stat_entities[(sweep_id, field)] = entity
             new_stat_entities.append(entity)
         if new_stat_entities:
@@ -228,6 +289,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if event.get("type") == "sweep_row":
             handle_sweep_stats(event)
             return
+        # Both paths a sweep can end by, because neither covers the other: a DELETE emits no status
+        # event and is only visible as a state change, while an errored sweep never reaches the
+        # DELETE route. Reconciling against the coordinator's live sweep list rather than acting on
+        # the event's own id also cleans up anything missed while this listener was not attached.
+        if event.get("type") in ("state_changed", "status"):
+            live = {s.get("id") for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)}
+            retire_sweep_stats({sid for sid in live if isinstance(sid, str)})
+            if event.get("type") == "status":
+                return
         if event.get("type") != "decoded_device":
             return
         device = event.get("device") or {}
@@ -365,28 +435,44 @@ class SdrHubSweepStatSensor(SensorEntity):
     _attr_should_poll = False
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, entry: ConfigEntry, sweep_id: str, field: str, value: float) -> None:
+    def __init__(
+        self, entry: ConfigEntry, sweep_id: str, field: str, value: float, band: tuple[float, float] | None
+    ) -> None:
         name, unit = SWEEP_STAT_FIELDS[field]
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
         self._attr_native_value = value
         self._attr_unique_id = f"{entry.entry_id}_sweep_{sweep_id}_{field}"
         self._attr_icon = "mdi:chart-bell-curve-cumulative"
-        # Its own device, grouped under the hub. A sweep is a distinct thing a user started, with a
-        # lifetime of its own, so hanging three statistics off the hub device would mix them with
-        # every other sweep's and leave no way to tell which band they describe.
+        self._band = band
+        # Named by the band, falling back to the id only when the geometry is unavailable. The id is
+        # a random UUID, so a name built from it answers none of the questions actually asked of
+        # this device: with two sweeps running, "which of these identical occupancy sensors is
+        # 868 MHz" is exactly what someone writing that automation needs, and the UUID prefix is
+        # unguessable from HA's device list.
+        band_label = format_band(band)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry.entry_id}_sweep_{sweep_id}")},
-            name=f"SDR Hub sweep {sweep_id[:8]}",
+            name=f"SDR Hub sweep {band_label}" if band_label else f"SDR Hub sweep {sweep_id[:8]}",
             manufacturer="ha-sdr (unofficial)",
             model="Spectrum sweep",
             via_device=(DOMAIN, entry.entry_id),
         )
 
     @callback
-    def update_reading(self, value: float) -> None:
+    def update_reading(self, value: float, band: tuple[float, float] | None = None) -> None:
         self._attr_native_value = value
+        if band is not None:
+            self._band = band
         # Same guard as the decoded sensor: an entity constructed but not yet added to hass cannot
         # write state, and attempting it raises rather than being ignored.
         if self.hass is not None:
             self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        # Machine-readable alongside the human-readable device name: a template picking the right
+        # occupancy sensor needs numbers to compare, not a formatted label to parse.
+        if self._band is None:
+            return {}
+        return {"start_hz": self._band[0], "stop_hz": self._band[1], "band": format_band(self._band)}

@@ -2811,6 +2811,20 @@ class SdrHubPanel extends HTMLElement {
           #sdr-hub-root { padding: 8px; }
           .sdr-hub-form-row { flex-direction: column; align-items: stretch; }
           .sdr-hub-form-row > * { width: 100%; }
+          /* The controls themselves, not only the labels wrapping them. Stretching the direct
+             children alone left every input at its inline width (80px, 100px, 140px, 180px...),
+             which is what actually determines the ragged edge - so the change looked applied while
+             changing nothing a user sees. !important because those widths are inline, and an
+             inline style otherwise wins regardless of specificity or source order. */
+          .sdr-hub-form-row input:not([type="checkbox"]):not([type="radio"]),
+          .sdr-hub-form-row select {
+            width: 100% !important;
+            box-sizing: border-box;
+          }
+          /* A checkbox has an intrinsic size and no content to fit, so stretching it produces a
+             13px control inside a 262px hit area - the box floats at one end of a wide blank
+             stripe, which reads as a rendering fault rather than a wider target. Excluded rather
+             than special-cased afterwards, since the same is true of radios. */
           #sdr-hub-root h1 { font-size: 1.2rem; }
           #sdr-hub-root h2 { font-size: 1rem; }
         }
@@ -3589,9 +3603,19 @@ class SdrHubPanel extends HTMLElement {
               style="${BTN_SECONDARY};padding:1px 6px;font-size:.7rem;">Clear markers</button>
             <span style="opacity:.75;">click the plot to place up to two markers</span>
           </div>
-          <div data-sweep-markers="${esc(s.id)}" role="status" aria-live="polite"
+          <div data-sweep-markers="${esc(s.id)}"
             style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
             color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
+          <!-- Announcements are a separate, visually hidden region written only when a key moves
+               the cursor. The visible readout above quotes the live power at the cursor, which
+               changes several times a second as rows arrive, so making *it* the live region queued
+               a fresh announcement continuously even while the user pressed nothing - which does
+               not merely annoy, it makes the control unusable, since the announcement a keypress
+               should produce is buried. A live region has to carry only what changed *because the
+               user did something*. -->
+          <div data-sweep-announce="${esc(s.id)}" role="status" aria-live="polite" aria-atomic="true"
+            style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+            clip-path:inset(50%);white-space:nowrap;"></div>
           <div data-sweep-occupancy="${esc(s.id)}"
             style="min-height:1.2em;font-size:.7rem;color:var(--secondary-text-color,#727272);
             margin-bottom:6px;"></div>
@@ -4721,6 +4745,19 @@ class SdrHubPanel extends HTMLElement {
     // Only for keys actually handled above, so Tab still moves focus and a screen reader's own
     // navigation keys are not captured.
     ev.preventDefault();
+    const bin = this._markerCursor?.[sweepId];
+    if (ev.key === "Escape") {
+      this._announceMarker(sweepId, "Markers cleared");
+    } else if (ev.key === "Enter" || ev.key === " ") {
+      const hz = bin == null ? null : this._markerFrequencyHz(sweepId, bin);
+      this._announceMarker(
+        sweepId,
+        `Marker ${String.fromCharCode(64 + list.length)} placed at ${hz == null ? "cursor" : `${fmtMHz(hz)} megahertz`}`,
+      );
+    } else if (bin != null) {
+      const hz = this._markerFrequencyHz(sweepId, bin);
+      this._announceMarker(sweepId, hz == null ? `Bin ${bin}` : `${fmtMHz(hz)} megahertz`);
+    }
   }
 
   // The cursor is announced rather than only drawn: a keyboard user moving it needs to know which
@@ -4732,6 +4769,14 @@ class SdrHubPanel extends HTMLElement {
     // it. One renderer owning the element is what keeps it on screen.
     this._renderMarkers(sweepId);
     this._drawTrace(sweepId);
+  }
+
+  // Written only from the keydown handler, so the live region speaks once per keypress rather than
+  // once per row. Deliberately omits the power level: it changes continuously, so including it
+  // would mean two presses of the same key produce different announcements for the same position.
+  _announceMarker(sweepId, text) {
+    const el = this.querySelector(`[data-sweep-announce="${CSS.escape(sweepId)}"]`);
+    if (el) el.textContent = text;
   }
 
   _markerFrequencyHz(sweepId, bin) {
