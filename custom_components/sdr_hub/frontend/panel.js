@@ -1626,8 +1626,14 @@ class SdrHubPanel extends HTMLElement {
     const previousColormap = this._colormap;
     const previousMin = this._dbMin;
     const previousMax = this._dbMax;
+    const previousTraceEnabled = this._spectrumTraceEnabled;
     this._deviceAliases = loadDeviceAliases();
     this._batterySoundEnabled = loadBatterySoundEnabled();
+    // Re-read with the rest. Initialising it only in the constructor left a reattached panel
+    // showing the value it had when it detached, so a peer's change or a "Reset all preferences"
+    // was invisible here - and the next local toggle would then persist this tab's stale view over
+    // the newer one. Exactly the split this whole block exists to prevent.
+    this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
     this._decodedTimeMode = loadDecodedTimeMode();
     this._favoriteDevices = loadFavoriteDevices();
     this._colormap = loadColormap();
@@ -1663,6 +1669,9 @@ class SdrHubPanel extends HTMLElement {
     if (dbMinEl) dbMinEl.value = this._dbMin;
     const dbMaxEl = this.querySelector("#sdr-hub-db-max");
     if (dbMaxEl) dbMaxEl.value = this._dbMax;
+    const traceToggle = this.querySelector("#sdr-hub-spectrum-trace-toggle");
+    if (traceToggle) traceToggle.checked = this._spectrumTraceEnabled;
+    if (previousTraceEnabled !== this._spectrumTraceEnabled) this._applySpectrumTraceVisibility();
     this._renderDecodedLog();
     if (previousColormap !== this._colormap || previousMin !== this._dbMin || previousMax !== this._dbMax) {
       this._renderSweeps(true);
@@ -1942,10 +1951,15 @@ class SdrHubPanel extends HTMLElement {
       this._showError(`Could not load SDR Hub state: ${err.message || err}`, { isLoadError: true });
       return;
     }
-    // get_state is registered. Only this operation is reported ready - subscribe may still be
-    // waiting, and it owns its own half of that decision.
-    this._noteIntegrationReady("loadState");
     if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
+    // Reported ready only *after* the supersession check. During a config-entry reload an older
+    // request can capture the pre-reload coordinator and land after a newer one has already been
+    // told not_loaded and scheduled a retry - so marking readiness first let a response this
+    // method discards on the very next line cancel the retry the live failure depends on. The
+    // request that is thrown away must not also be the one that reports success.
+    //
+    // Only this operation is reported ready; subscribe owns its own half of that decision.
+    this._noteIntegrationReady("loadState");
     // Recovered from a prior load failure - clear its banner now that fresh state actually
     // arrived. Only do this if the banner currently showing IS that load error (the flag
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
@@ -2972,17 +2986,7 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-spectrum-trace-toggle").addEventListener("change", (ev) => {
       this._spectrumTraceEnabled = ev.target.checked;
       saveSpectrumTraceEnabled(this._spectrumTraceEnabled);
-      // Toggled by showing/hiding rather than rebuilding the shell: a rebuild would discard every
-      // waterfall bitmap and replay all retained rows, which is a lot of work to reveal a plot
-      // whose data is already accumulated. The accumulated state is deliberately kept while
-      // hidden, so re-enabling shows the peak hold that built up meanwhile rather than starting
-      // from whatever arrives next.
-      for (const wrap of this.querySelectorAll("[data-sweep-trace-wrap]")) {
-        wrap.style.display = this._spectrumTraceEnabled ? "" : "none";
-      }
-      if (this._spectrumTraceEnabled) {
-        for (const id of Object.keys(this._traceState)) this._drawTrace(id);
-      }
+      this._applySpectrumTraceVisibility();
     });
     this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
       this._batterySoundEnabled = ev.target.checked;
@@ -4366,7 +4370,15 @@ class SdrHubPanel extends HTMLElement {
     const existing = this._sweepResizeObservers.get(sweepId);
     if (existing && existing.canvas === canvas) return;
     if (existing) existing.observer.disconnect();
-    const observer = new ResizeObserver(() => this._renderFrequencyAxis(sweepId));
+    // The trace is redrawn alongside the axis, and for the same reason. Its width is pinned in
+    // pixels to match the waterfall (see _drawTrace), which trades away the responsiveness that
+    // width:100% gave for free - so a sidebar toggle, a rotation or a scrollbar appearing leaves
+    // it at the old width. An active sweep would correct on its next row; a stopped or errored one
+    // never would, and that is exactly when a stale trace sits on screen indefinitely.
+    const observer = new ResizeObserver(() => {
+      this._renderFrequencyAxis(sweepId);
+      this._drawTrace(sweepId);
+    });
     observer.observe(canvas);
     this._sweepResizeObservers.set(sweepId, { observer, canvas });
   }
@@ -4446,16 +4458,19 @@ class SdrHubPanel extends HTMLElement {
     // defensively anyway - a zero-length power_db would make canvas.width 0, and
     // getImageData/createImageData throw on a zero-size request.
     if (!row.power_db || row.power_db.length === 0) return;
+    // Accumulated *before* the canvas lookup, and independently of whether one exists. A row can
+    // arrive before its card has been built - get_state and the subscription overlap during load,
+    // and a sweep created elsewhere is announced by an event - and those rows are retained in
+    // _sweepRowHistory. Accumulating only when a canvas was found meant the replay suppression
+    // below then skipped them for good when the card appeared, so an early intermittent peak was
+    // omitted permanently. Skipped only during a rebuild's replay, where the rows are already
+    // counted and a second pass would pull the average toward the retained window.
+    if (!this._replayingRows) this._updateTrace(sweepId, row);
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     if (!canvas) return;
     const peak = this._findPeak(row);
     this._renderPeakReadout(sweepId, peak);
-    // Skipped during a canvas rebuild's replay - those rows are already in the trace state, and
-    // counting them twice would pull the average toward the retained window (see _renderSweeps).
-    if (!this._replayingRows) {
-      this._updateTrace(sweepId, row);
-      this._drawTrace(sweepId);
-    }
+    if (!this._replayingRows) this._drawTrace(sweepId);
     if (this._scrollMode[sweepId]) {
       this._drawScrollRow(canvas, sweepId, row, peak);
     } else {
@@ -4504,17 +4519,48 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
+  // Shown/hidden rather than rebuilding the shell: a rebuild would discard every waterfall bitmap
+  // and replay all retained rows, which is a lot of work to reveal a plot whose data is already
+  // accumulated. The accumulated state is deliberately kept while hidden, so re-enabling shows the
+  // peak hold that built up meanwhile rather than starting from whatever arrives next. Shared with
+  // _reconcilePreferences so a peer's change applies the same way a local toggle does.
+  _applySpectrumTraceVisibility() {
+    for (const wrap of this.querySelectorAll("[data-sweep-trace-wrap]")) {
+      wrap.style.display = this._spectrumTraceEnabled ? "" : "none";
+    }
+    if (this._spectrumTraceEnabled) {
+      for (const id of Object.keys(this._traceState)) this._drawTrace(id);
+    }
+  }
+
   // Mean power of a bin, converted back to dB for plotting, or NaN if nothing landed in it.
   _traceAverageDb(state, i) {
     if (!state.counts[i]) return NaN;
     return 10 * Math.log10(state.sum[i] / state.counts[i]);
   }
 
+  // Resets *only* peak hold, which is what the button offers. Rebuilding the whole state also
+  // rebuilt sum and counts from the retained window, so on a long-running sweep the average jumped
+  // to whatever the last 400 rows happened to say - a change the user did not ask for and did not
+  // see coming from a control labelled "Reset peak hold". The average is a session statistic and
+  // has its own meaning; only the peak is being forgotten here.
   _rebuildTraceFromHistory(sweepId) {
-    delete this._traceState[sweepId];
-    const rows = this._sweepRowHistory[sweepId];
-    // Oldest first, so `latest` ends up holding the newest row - _sweepRowHistory is newest-first.
-    if (rows) for (let i = rows.length - 1; i >= 0; i--) this._updateTrace(sweepId, rows[i]);
+    const state = this._traceState[sweepId];
+    if (!state) return;
+    const rows = this._sweepRowHistory[sweepId] || [];
+    state.peak.fill(NaN);
+    // Recomputed from retained history rather than blanked: those rows are still visible in the
+    // waterfall above, so a peak-hold ignoring them would contradict what is on screen. "Reset"
+    // means "forget what scrolled away", not "forget what I can still see".
+    for (const row of rows) {
+      const power = row.power_db;
+      if (!power || power.length !== state.bins) continue;
+      for (let i = 0; i < power.length; i++) {
+        const v = power[i];
+        if (v === null || !Number.isFinite(v)) continue;
+        if (Number.isNaN(state.peak[i]) || v > state.peak[i]) state.peak[i] = v;
+      }
+    }
     this._drawTrace(sweepId);
   }
 
