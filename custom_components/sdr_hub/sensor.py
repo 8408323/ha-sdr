@@ -309,7 +309,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if existing is not None:
                 existing.update_reading(value, band)
                 continue
-            entity = SdrHubSweepStatSensor(entry, sweep_id, field, value, band)
+            entity = SdrHubSweepStatSensor(entry, coordinator, sweep_id, field, value, band)
             sweep_stat_entities[(sweep_id, field)] = entity
             new_stat_entities.append(entity)
         if new_stat_entities:
@@ -482,8 +482,15 @@ class SdrHubSweepStatSensor(SensorEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
-        self, entry: ConfigEntry, sweep_id: str, field: str, value: float, band: tuple[float, float] | None
+        self,
+        entry: ConfigEntry,
+        coordinator: SdrHubCoordinator,
+        sweep_id: str,
+        field: str,
+        value: float,
+        band: tuple[float, float] | None,
     ) -> None:
+        self._coordinator = coordinator
         name, unit = SWEEP_STAT_FIELDS[field]
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
@@ -514,6 +521,32 @@ class SdrHubSweepStatSensor(SensorEntity):
         # write state, and attempting it raises rather than being ignored.
         if self.hass is not None:
             self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Re-evaluates availability whenever the coordinator reports success or failure.
+
+        The property below is only consulted when something writes state, and these entities write
+        only on an incoming row - which is precisely what stops arriving when the add-on drops. So
+        without this subscription the entity would stay "available" with a stale value forever,
+        and the property would be correct but never observed. Not a CoordinatorEntity, because the
+        *value* must still come from the event stream rather than the 30-second poll; only the
+        availability follows the coordinator.
+        """
+        await super().async_added_to_hass()
+        self.async_on_remove(self._coordinator.async_add_listener(self.async_write_ha_state))
+
+    @property
+    def available(self) -> bool:
+        """Whether the add-on is still reachable.
+
+        These are push entities, so nothing marks them stale on its own: if the add-on stops or the
+        connection drops without a terminal sweep status - being killed, restarted, or losing the
+        network - the last noise floor, peak and occupancy simply stay published. An automation
+        acting on "the band is busy" would keep firing on a measurement that ended hours ago, and
+        the entity gives it nothing to distinguish that from a quiet, steady band. Unavailable is
+        the honest state, and it is what every other integration's consumers already know to check.
+        """
+        return self._coordinator.last_update_success
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

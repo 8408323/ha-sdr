@@ -995,6 +995,20 @@ function compareDecodedEvents(a, b) {
 // every HA restart, showing a message ("Unknown command") that reads like a version mismatch or a
 // broken install, while the waterfall silently stopped advancing.
 const INTEGRATION_NOT_READY_CODES = new Set(["unknown_command", "not_loaded"]);
+
+// Keys the marker control claims. Checked before any state is touched, so navigating past a plot
+// with Tab cannot leave a cursor behind on it.
+const MARKER_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "PageDown",
+  "PageUp",
+  "Home",
+  "End",
+  "Enter",
+  " ",
+  "Escape",
+]);
 // Escalating, and finite: if the integration genuinely is not installed the message must eventually
 // be shown rather than retried forever behind a "starting" notice that would never resolve.
 const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
@@ -3615,9 +3629,7 @@ class SdrHubPanel extends HTMLElement {
               style="${BTN_SECONDARY};padding:1px 6px;font-size:.7rem;">Clear markers</button>
             <span style="opacity:.75;">click the plot to place up to two markers</span>
           </div>
-          <div data-sweep-markers="${esc(s.id)}"
-            style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
-            color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
+
           <!-- Announcements are a separate, visually hidden region written only when a key moves
                the cursor. The visible readout above quotes the live power at the cursor, which
                changes several times a second as rows arrive, so making *it* the live region queued
@@ -3638,12 +3650,25 @@ class SdrHubPanel extends HTMLElement {
         <div data-sweep-announce="${esc(s.id)}" role="status" aria-live="polite" aria-atomic="true"
           style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
           clip-path:inset(50%);white-space:nowrap;"></div>
+        <!-- Outside the trace wrapper for the same reason the announcement is: markers are a
+             property of the sweep, not of the trace, and they can be placed on the waterfall with
+             the trace switched off. Leaving the readout inside meant a sighted keyboard user in
+             that state saw a cursor move with no frequency anywhere on screen. -->
+        <div data-sweep-markers="${esc(s.id)}"
+          style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
+          color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
             <canvas data-sweep-canvas="${esc(s.id)}" width="${rowWidth}" height="${canvasHeight}"
               style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
             <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
+            <!-- Markers are drawn as overlay elements rather than onto the waterfall bitmap: that
+                 bitmap is scrolled a row at a time and is what "Save PNG" exports, so painting into
+                 it would both smear the lines downward with the history and put them in the saved
+                 image. An overlay also survives every repaint for free. -->
+            <div data-sweep-marker-overlay="${esc(s.id)}" aria-hidden="true"
+              style="position:absolute;inset:0;pointer-events:none;overflow:hidden;"></div>
           </div>
         </div>
         <div data-sweep-resize="${esc(s.id)}" title="Drag to resize" role="separator" aria-label="Resize waterfall height"
@@ -4724,6 +4749,11 @@ class SdrHubPanel extends HTMLElement {
       (this._markerCursor ??= {})[sweepId] = Math.max(0, Math.min(bins - 1, bin));
       this._renderMarkerCursor(sweepId);
     };
+    // Handled keys are decided before any state is touched. Materialising the cursor first meant
+    // Tab - the ordinary way to leave a canvas - created a midpoint cursor that the next row then
+    // drew, leaving a marker-like indicator on a plot the user had only navigated past. The switch
+    // below already returns for unhandled keys; the mutation simply happened above it.
+    if (!MARKER_KEYS.has(ev.key)) return;
     // Materialised, not just defaulted into a local. Enter as the very first key after focusing
     // left the midpoint living only in that local, so the marker landed correctly while the
     // announcement read "placed at cursor" with no frequency - and since the visible readout is
@@ -4786,6 +4816,38 @@ class SdrHubPanel extends HTMLElement {
 
   // The cursor is announced rather than only drawn: a keyboard user moving it needs to know which
   // frequency they are on, and the plot itself conveys nothing to a screen reader.
+  // The waterfall's own marker/cursor lines. Kept in step with the trace's, and drawn regardless of
+  // whether the trace is visible - the waterfall is focusable and accepts the same keys either way.
+  _renderMarkerOverlay(sweepId) {
+    const overlay = this.querySelector(`[data-sweep-marker-overlay="${CSS.escape(sweepId)}"]`);
+    if (!overlay) return;
+    const state = this._traceState[sweepId];
+    const bins = state?.bins;
+    if (!bins) {
+      overlay.innerHTML = "";
+      return;
+    }
+    const line = (bin, color, dashed, label) => {
+      const pct = (bin / (bins - 1 || 1)) * 100;
+      return (
+        `<div style="position:absolute;top:0;bottom:0;left:${pct}%;width:0;` +
+        `border-left:1px ${dashed ? "dashed" : "solid"} ${color};">` +
+        (label
+          ? `<span style="position:absolute;top:0;left:2px;font-size:10px;color:${color};` +
+            `background:var(--card-background-color,#fff);padding:0 2px;border-radius:2px;">${esc(label)}</span>`
+          : "") +
+        `</div>`
+      );
+    };
+    const parts = [];
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) parts.push(line(cursorBin, "#00897b", true, null));
+    (this._markers[sweepId] || []).forEach((bin, i) => {
+      parts.push(line(bin, "#00897b", false, String.fromCharCode(65 + i)));
+    });
+    overlay.innerHTML = parts.join("");
+  }
+
   _renderMarkerCursor(sweepId) {
     // Routed through _renderMarkers rather than writing the readout directly. Rows arrive several
     // times a second and each one re-renders that element, so a cursor announcement written here
@@ -4988,6 +5050,11 @@ class SdrHubPanel extends HTMLElement {
   }
 
   _drawTrace(sweepId) {
+    // Before the early return, deliberately. Every path that shows markers already calls this, so
+    // one owner here beats nine call sites each remembering to refresh the overlay - and the
+    // trace-disabled case is exactly the one where the waterfall overlay is the *only* place a
+    // marker can appear, so it must not be skipped along with the trace.
+    this._renderMarkerOverlay(sweepId);
     if (!this._spectrumTraceEnabled) return;
     const canvas = this.querySelector(`[data-sweep-trace="${CSS.escape(sweepId)}"]`);
     const state = this._traceState[sweepId];
