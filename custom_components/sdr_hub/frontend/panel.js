@@ -1214,9 +1214,11 @@ class SdrHubPanel extends HTMLElement {
     this._deviceBatteryOk = new Map();
     this._maxSeenOrd = 0;
     // Monotonic counter identifying the currently displayed error - see _showError.
-    // Identifies which operation put the currently displayed error on screen, so a later success
-    // clears only its own message - see _showError.
+    // Identifies which operation put the currently displayed error on screen, and when. A later
+    // success clears only its own message, and only if nothing has been displayed since it began -
+    // see _showError.
     this._errorOwner = null;
+    this._errorToken = 0;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
     // from "an invalidation ran while I waited" - the generation alone cannot, since after the
@@ -1805,7 +1807,9 @@ class SdrHubPanel extends HTMLElement {
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
     // action error isn't wiped out just because this background refresh happened to succeed.
     // The original one-owner version of this idea, now expressed with the shared mechanism.
-    this._clearErrorIfOwnedBy("loadState");
+    // No token: _loadState already guards overlapping calls with _loadStateRequestId above, so by
+    // this line it is established that this is the most recent request.
+    this._clearErrorIfOwnedBy("loadState", this._errorToken);
     // A different coordinator session means Home Assistant restarted, so the add-on event stream
     // was interrupted for *every* tab - not just this one's socket. The reconnect path otherwise
     // treats the loss as tab-local and adopts the shared battery map from a peer that could not
@@ -2019,6 +2023,7 @@ class SdrHubPanel extends HTMLElement {
   // rather than a ragged file - and the fixed columns come first so the useful ones are readable
   // without scrolling.
   _exportDecodedCsv() {
+    const errorToken = this._errorToken || 0;
     if (this._decodedLog.length === 0) {
       this._showError("Nothing to export - no devices have been decoded yet.", { owner: "csvExport" });
       return;
@@ -2028,7 +2033,7 @@ class SdrHubPanel extends HTMLElement {
     // to race: the user can click Export while a get_state failure is already on screen, and the
     // cached log still exports fine, so an unconditional clear hid a load failure that had not
     // recovered. Ownership, not timing, is what makes a clear safe.
-    this._clearErrorIfOwnedBy("csvExport");
+    this._clearErrorIfOwnedBy("csvExport", errorToken);
     const fixed = ["received_at", "name", "model", "id", "channel"];
     // Only the device fields the fixed columns already carry are dropped, derived from `fixed`
     // itself so the promise made in this method's comment stays true by construction.
@@ -2511,8 +2516,14 @@ class SdrHubPanel extends HTMLElement {
   // copying YAML successfully would clear a get_state failure that was displayed beforehand and
   // has not recovered. Ownership is the property actually wanted, and the file already had a
   // narrow version of it in _loadStateErrorShowing, now generalised.
-  _clearErrorIfOwnedBy(owner) {
-    if (owner && this._errorOwner === owner) this._showError("");
+  _clearErrorIfOwnedBy(owner, sinceToken) {
+    if (!owner || this._errorOwner !== owner) return;
+    // Owner alone is a *category*, not an invocation. Two concurrent sweep starts, or a
+    // double-clicked copy, share one owner - so one attempt failing and a second succeeding let
+    // the success retract a failure that is still true. sinceToken is captured when the operation
+    // begins: anything displayed after that belongs to a later attempt and is not ours to clear.
+    if (Number.isFinite(sinceToken) && this._errorToken > sinceToken) return;
+    this._showError("");
   }
 
   _showError(message, { isLoadError = false, owner = null } = {}) {
@@ -2527,6 +2538,9 @@ class SdrHubPanel extends HTMLElement {
     // Who owns what is on screen now. Cleared along with the message, so an empty banner is owned
     // by nobody and cannot be "cleared" a second time by a stale success handler.
     this._errorOwner = message ? owner || (isLoadError ? "loadState" : null) : null;
+    // Monotonic, bumped on every display. Lets a clear tell "this is the message my attempt
+    // raised" from "a later attempt raised this while I was still running".
+    if (message) this._errorToken = (this._errorToken || 0) + 1;
 
     el.textContent = message;
     el.style.display = message ? "block" : "none";
@@ -2904,6 +2918,7 @@ class SdrHubPanel extends HTMLElement {
     const autoBtn = this.querySelector("#sdr-hub-db-auto");
     if (autoBtn) {
       autoBtn.addEventListener("click", () => {
+        const errorToken = this._errorToken || 0;
         // Derived from every retained row across all running sweeps, so a single anomalous row
         // can't set the range. Nothing is changed if no rows have arrived yet - silently
         // applying a default would look like the button had done something.
@@ -2915,7 +2930,7 @@ class SdrHubPanel extends HTMLElement {
         }
         // Releases only Auto's own message - see the CSV export's clear for why an unconditional
         // one is wrong even in a synchronous handler.
-        this._clearErrorIfOwnedBy("autoContrast");
+        this._clearErrorIfOwnedBy("autoContrast", errorToken);
         this._dbMin = range.min;
         this._dbMax = range.max;
         dbMinInput.value = range.min;
@@ -4449,6 +4464,7 @@ class SdrHubPanel extends HTMLElement {
     button.addEventListener("click", async () => {
       const original = button.textContent;
       const text = textFn();
+      const errorToken = this._errorToken || 0;
 
       try {
         // navigator.clipboard requires a secure context (HTTPS or localhost) - it's simply
@@ -4464,7 +4480,7 @@ class SdrHubPanel extends HTMLElement {
         // Completes the stale-banner sweep. Conditional rather than unconditional: this runs after
         // an await, so an unrelated action may have raised a newer error while the permission
         // prompt was open, and clearing that would hide something the user still needs.
-        this._clearErrorIfOwnedBy("clipboard");
+        this._clearErrorIfOwnedBy("clipboard", errorToken);
         button.textContent = "Copied!";
       } catch (err) {
         this._showError(`Could not copy to clipboard: ${err.message || err}`, { owner: "clipboard" });
@@ -4509,6 +4525,7 @@ class SdrHubPanel extends HTMLElement {
     // added to solve, reintroduced in the one artefact a user is most likely to keep or share.
     // Composited here rather than drawn into the live canvas: the canvas is the pixel history and
     // gets shifted, resized and blitted, so permanent furniture in it would scroll away.
+    const errorToken = this._errorToken || 0;
     const composited = this._compositeSweepImage(sweepId, canvas);
 
     (composited || canvas).toBlob((blob) => {
@@ -4518,7 +4535,7 @@ class SdrHubPanel extends HTMLElement {
       }
       // Same stale-banner class as the CSV export and the Auto contrast handler, but conditional:
       // toBlob is asynchronous, so an unrelated failure may have been raised since.
-      this._clearErrorIfOwnedBy("saveImage");
+      this._clearErrorIfOwnedBy("saveImage", errorToken);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -4754,6 +4771,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onAddSweep(ev) {
+    const errorToken = this._errorToken || 0;
     ev.preventDefault();
     // Captured once, synchronously, rather than reading `ev.target` again after the `await`
     // below - some environments null out an Event's `target` once its dispatch has finished,
@@ -4800,7 +4818,7 @@ class SdrHubPanel extends HTMLElement {
       // asserts something about a banner the operation may not have raised: starting a sweep
       // successfully says nothing about whether a get_state failure has recovered, and hiding it
       // would suggest the panel is healthy when it is not still receiving state.
-      this._clearErrorIfOwnedBy("sweepAction");
+      this._clearErrorIfOwnedBy("sweepAction", errorToken);
     } catch (err) {
       this._showError(`Could not start sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
@@ -4815,9 +4833,10 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onRemoveSweep(sweepId) {
+    const errorToken = this._errorToken || 0;
     try {
       await this._callWS({ type: "sdr_hub/remove_sweep", sweep_id: sweepId });
-      this._clearErrorIfOwnedBy("sweepAction");
+      this._clearErrorIfOwnedBy("sweepAction", errorToken);
     } catch (err) {
       this._showError(`Could not stop sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
@@ -4848,6 +4867,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onAddReceiver(ev) {
+    const errorToken = this._errorToken || 0;
     ev.preventDefault();
     // See _onAddSweep's identical formEl capture above - same reasoning.
     const formEl = ev.target;
@@ -4873,7 +4893,7 @@ class SdrHubPanel extends HTMLElement {
         frequencies_mhz: form.get("frequencies_mhz"),
         hop_interval_s: form.get("hop_interval_s"),
       });
-      this._clearErrorIfOwnedBy("receiverAction");
+      this._clearErrorIfOwnedBy("receiverAction", errorToken);
     } catch (err) {
       this._showError(`Could not start receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
@@ -4881,9 +4901,10 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onRemoveReceiver(receiverId) {
+    const errorToken = this._errorToken || 0;
     try {
       await this._callWS({ type: "sdr_hub/remove_receiver", receiver_id: receiverId });
-      this._clearErrorIfOwnedBy("receiverAction");
+      this._clearErrorIfOwnedBy("receiverAction", errorToken);
     } catch (err) {
       this._showError(`Could not stop receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
