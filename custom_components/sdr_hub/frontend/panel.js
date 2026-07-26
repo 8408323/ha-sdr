@@ -415,6 +415,83 @@ const COLORMAPS = {
   grayscale: { label: "Grayscale", fn: grayscaleColor },
 };
 
+// Contrast bounds derived from what the hardware is actually producing, rather than a fixed
+// default. The static -95..-15 dB range suits a scale where 0 dB is a strong signal, but this
+// add-on's power_db runs well above 0 for ordinary noise on an RTL-SDR at typical gain - measured
+// live, 96% of bins clamped to the maximum and the waterfall showed no structure at all (see
+// issue #15). The correct range depends on gain, antenna and band, so no static default can suit
+// every setup; deriving it is the only thing that generalises.
+//
+// Percentiles, not min/max: a single blanked-adjacent outlier or one strong carrier would
+// otherwise stretch the range and flatten everything else. The low percentile sits near the noise
+// floor and the high one just above the strongest routine signal, which is the span worth
+// spending colour on.
+const AUTO_CONTRAST_LOW_PCT = 0.05;
+const AUTO_CONTRAST_HIGH_PCT = 0.995;
+// Widened slightly so the extremes aren't sitting exactly on the clamp boundary, and floored so a
+// nearly-flat spectrum still gets a usable (not degenerate) span.
+const AUTO_CONTRAST_MARGIN_DB = 3;
+const AUTO_CONTRAST_MIN_SPAN_DB = 10;
+
+// Bucket count for the histogram below. dB values span a bounded physical range, so a few
+// thousand buckets put the quantisation error far below the 1 dB the contrast inputs accept.
+const AUTO_CONTRAST_BUCKETS = 4096;
+
+function autoContrastRange(rows) {
+  // Deliberately NOT "collect every value and sort". A wide sweep in full-history mode retains up
+  // to scrollRowCapForWidth rows - 2048 rows x 8192 bins is ~16.7M values for a single sweep, and
+  // this runs over every sweep at once. Materialising that as a JS array (repeated reallocation,
+  // ~134MB) and then sorting it with a comparator callback, synchronously on the UI thread with
+  // no yield, could freeze or OOM the Home Assistant tab on one button press.
+  //
+  // Only percentiles are needed, and the values are physically bounded, so two O(n) passes over a
+  // fixed-size histogram give the same answer in constant memory: one pass for the extent, one to
+  // bucket, then a cumulative walk over the buckets.
+  let lo = Infinity;
+  let hi = -Infinity;
+  let count = 0;
+  for (const row of rows) {
+    for (const v of row.power_db) {
+      if (!Number.isFinite(v)) continue;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+      count++;
+    }
+  }
+  if (count < 2) return null;
+  // A completely flat spectrum has no distribution to take percentiles from; the span floor below
+  // is the only sensible answer, so short-circuit rather than dividing by a zero-width extent.
+  if (hi === lo) {
+    return { min: Math.round(lo - AUTO_CONTRAST_MIN_SPAN_DB / 2), max: Math.round(lo + AUTO_CONTRAST_MIN_SPAN_DB / 2) };
+  }
+  const buckets = new Int32Array(AUTO_CONTRAST_BUCKETS);
+  const scale = (AUTO_CONTRAST_BUCKETS - 1) / (hi - lo);
+  for (const row of rows) {
+    for (const v of row.power_db) {
+      if (!Number.isFinite(v)) continue;
+      buckets[Math.round((v - lo) * scale)]++;
+    }
+  }
+  // Walks the cumulative distribution once, resolving every requested quantile in order.
+  const at = (q) => {
+    const target = Math.min(count - 1, Math.max(0, Math.floor(count * q)));
+    let seen = 0;
+    for (let i = 0; i < buckets.length; i++) {
+      seen += buckets[i];
+      if (seen > target) return lo + i / scale;
+    }
+    return hi;
+  };
+  let min = at(AUTO_CONTRAST_LOW_PCT) - AUTO_CONTRAST_MARGIN_DB;
+  let max = at(AUTO_CONTRAST_HIGH_PCT) + AUTO_CONTRAST_MARGIN_DB;
+  if (max - min < AUTO_CONTRAST_MIN_SPAN_DB) {
+    const mid = (min + max) / 2;
+    min = mid - AUTO_CONTRAST_MIN_SPAN_DB / 2;
+    max = mid + AUTO_CONTRAST_MIN_SPAN_DB / 2;
+  }
+  return { min: Math.round(min), max: Math.round(max) };
+}
+
 // CSS gradient sampled from the same colormap function the waterfall painter uses, so the legend
 // cannot drift from what is actually drawn - a hand-written gradient would silently disagree the
 // moment a ramp changed. Sampled rather than exact: ten stops is visually indistinguishable from
@@ -1136,6 +1213,12 @@ class SdrHubPanel extends HTMLElement {
     // peer's value is any better - _handleEvent clears it outright there rather than restoring.
     this._deviceBatteryOk = new Map();
     this._maxSeenOrd = 0;
+    // Monotonic counter identifying the currently displayed error - see _showError.
+    // Identifies which operation put the currently displayed error on screen, and when. A later
+    // success clears only its own message, and only if nothing has been displayed since it began -
+    // see _showError.
+    this._errorOwner = null;
+    this._errorToken = 0;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
     // from "an invalidation ran while I waited" - the generation alone cannot, since after the
@@ -1607,6 +1690,20 @@ class SdrHubPanel extends HTMLElement {
     this._aliasComposing = false;
     this._decodedRenderDeferred = false;
     this._aliasHadFocus = false;
+    if (this._sweepResizeObservers) {
+      for (const entry of this._sweepResizeObservers.values()) entry.observer.disconnect();
+      this._sweepResizeObservers.clear();
+    }
+    // Cleared with them. _renderSweeps skips its rebuild when the sweep id set is unchanged, and
+    // that rebuild is the only path that re-registers observers - so tearing them down while
+    // leaving the memo key intact meant a reattached panel never got them back. The axis then
+    // stopped following sidebar, rotation and window resizes until some later row forced a
+    // rebuild, which for a stopped or errored sweep never comes.
+    //
+    // Invalidating the cache that gates recreation belongs with the teardown itself; the two are
+    // one operation, and separating them is what made this reachable at all.
+    this._renderedSweepIdsKey = null;
+    this._renderedSweepStatusKey = null;
     if (this._unsub) {
       this._unsub();
       this._unsub = null;
@@ -1679,7 +1776,7 @@ class SdrHubPanel extends HTMLElement {
       }
       this._unsub = unsub;
     } catch (err) {
-      this._showError(`Could not subscribe to live updates: ${err.message || err}`);
+      this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
     } finally {
       this._subscribing = false;
     }
@@ -1709,7 +1806,10 @@ class SdrHubPanel extends HTMLElement {
     // arrived. Only do this if the banner currently showing IS that load error (the flag
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
     // action error isn't wiped out just because this background refresh happened to succeed.
-    if (this._loadStateErrorShowing) this._showError("");
+    // The original one-owner version of this idea, now expressed with the shared mechanism.
+    // No token: _loadState already guards overlapping calls with _loadStateRequestId above, so by
+    // this line it is established that this is the most recent request.
+    this._clearErrorIfOwnedBy("loadState", this._errorToken);
     // A different coordinator session means Home Assistant restarted, so the add-on event stream
     // was interrupted for *every* tab - not just this one's socket. The reconnect path otherwise
     // treats the loss as tab-local and adopts the shared battery map from a peer that could not
@@ -1742,6 +1842,12 @@ class SdrHubPanel extends HTMLElement {
       if (rows.length > cap) rows.length = cap;
       this._appendRow(event.sweep_id, event);
       this._renderTimeAxis(event.sweep_id);
+      // The frequency axis is deliberately NOT rendered per row. It depends only on the sweep's
+      // bounds and the canvas width - neither of which a row changes - so rebuilding it here cost
+      // two synchronous getBoundingClientRect reads and a full tick-DOM replacement for every
+      // row, and scanner.py can emit one per FFT capture. Bounds changes come through
+      // _renderSweeps; width changes come through the ResizeObserver. The call only became
+      // redundant when that observer was added, which is why it survived until now.
     } else if (event.type === "decoded_device") {
       // Purely for this tab's own relative-age labels. Ordering and identity come from the
       // add-on's event_id/received_at instead (see compareDecodedEvents) - those are identical
@@ -1886,6 +1992,107 @@ class SdrHubPanel extends HTMLElement {
     } catch {
       // No usable store - whatever is in memory stands.
     }
+  }
+
+  // One CSV cell. Quoted whenever it contains a delimiter, quote or newline, with embedded quotes
+  // doubled - RFC 4180. rtl_433 emits free-form model strings and users choose their own aliases,
+  // so a comma or quote in a field is entirely plausible and would otherwise shift every
+  // subsequent column on that row.
+  //
+  // A leading =, +, - or @ is prefixed with a single quote: spreadsheet applications interpret
+  // those as formulas, so a device model beginning with one could execute on open. This is data
+  // from the air, and it is written to a file the user is likely to open in Excel.
+  _csvCell(value) {
+    if (value === null || value === undefined) return "";
+    // Numbers are emitted as-is. Neutralising them broke the common case rather than a corner
+    // one: a negative temperature or RSSI starts with "-", so String()-then-test turned -5.2 into
+    // '-5.2 and every spreadsheet imported it as text - unplottable and uncalculable, which is
+    // exactly what this export exists for. A finite number cannot be a formula.
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    let text = String(value);
+    // Leading whitespace and control characters are skipped before looking for the sigil.
+    // Spreadsheets trim them and then evaluate what follows, so an anchored /^[=+\-@]/ test was
+    // bypassed outright by "\t=HYPERLINK(...)" - which arrives over the air in a model string and
+    // would execute when the file is opened. Tab and CR are the documented carriers.
+    if (/^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  // Exports what the log actually holds. Columns are the union of every device field present
+  // across the retained events, so a mixed set of sensor types produces one table with blanks
+  // rather than a ragged file - and the fixed columns come first so the useful ones are readable
+  // without scrolling.
+  _exportDecodedCsv() {
+    const errorToken = this._errorToken || 0;
+    if (this._decodedLog.length === 0) {
+      this._showError("Nothing to export - no devices have been decoded yet.", { owner: "csvExport" });
+      return;
+    }
+    // Releases only this export's own message. It was an unconditional clear, on the reasoning
+    // that a synchronous handler cannot be interleaved - true, and beside the point. Nothing has
+    // to race: the user can click Export while a get_state failure is already on screen, and the
+    // cached log still exports fine, so an unconditional clear hid a load failure that had not
+    // recovered. Ownership, not timing, is what makes a clear safe.
+    this._clearErrorIfOwnedBy("csvExport", errorToken);
+    const fixed = ["received_at", "name", "model", "id", "channel"];
+    // Only the device fields the fixed columns already carry are dropped, derived from `fixed`
+    // itself so the promise made in this method's comment stays true by construction.
+    //
+    // It previously filtered through DECODED_HIDDEN_FIELDS, which exists to keep clutter off the
+    // on-screen cards - so time, mic, protocol and raw_message were silently dropped from the
+    // file. Those are diagnostics a user exporting to a spreadsheet has every reason to want, and
+    // hiding something on a card is a different decision from omitting it from an export.
+    const carriedByFixedColumns = new Set(["model", "id", "channel"]);
+    const extras = new Set();
+    for (const event of this._decodedLog) {
+      for (const key of Object.keys(event.device || {})) {
+        if (!carriedByFixedColumns.has(key)) extras.add(key);
+      }
+    }
+    // A device field named "name" or "received_at" collides with a synthesised column rather than
+    // duplicating it - the fixed ones hold the *alias* and the *event* timestamp, which are not
+    // the same data. Such a field is emitted under a "device_" prefix instead of being discarded,
+    // since a decoder emitting either is losing real information otherwise.
+    // Headers are made unique against everything already claimed, not just against the fixed
+    // list. A device carrying both `name` and `device_name` would otherwise produce two columns
+    // headed device_name, which a header-based importer resolves arbitrarily - one prefix pass is
+    // not collision-free on its own.
+    const taken = new Set(fixed);
+    const uniqueHeader = (key) => {
+      let header = fixed.includes(key) ? `device_${key}` : key;
+      while (taken.has(header)) header = `device_${header}`;
+      taken.add(header);
+      return header;
+    };
+    const columnDefs = [
+      ...fixed.map((header) => ({ header, fixed: true, key: header })),
+      ...[...extras].sort().map((key) => ({ header: uniqueHeader(key), fixed: false, key })),
+    ];
+    const columns = columnDefs.map((c) => c.header);
+    const rows = [columns.map((c) => this._csvCell(c)).join(",")];
+    // Oldest first: the in-memory log is newest-first for display, but a time series read in a
+    // spreadsheet or plotted from a file is expected to run forwards.
+    for (const event of [...this._decodedLog].reverse()) {
+      const d = event.device || {};
+      const shownAt = decodedDisplayTime(event);
+      const values = columnDefs.map((col) => {
+        if (col.fixed && col.key === "received_at") return shownAt ? new Date(shownAt).toISOString() : "";
+        if (col.fixed && col.key === "name") return deviceDisplayName(d, this._deviceAliases);
+        return d[col.key];
+      });
+      rows.push(values.map((v) => this._csvCell(v)).join(","));
+    }
+    // CRLF and a UTF-8 BOM: RFC 4180 specifies CRLF, and without the BOM Excel misreads non-ASCII
+    // device names and aliases as the local codepage.
+    const blob = new Blob(["\ufeff" + rows.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sdr-hub-decoded-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   // The Clear-log transaction, split out so it can be published as a barrier before its first
@@ -2301,7 +2508,25 @@ class SdrHubPanel extends HTMLElement {
     releaseLeadership(SOUND_LEADER_KEY, this._tabId);
   }
 
-  _showError(message, { isLoadError = false } = {}) {
+  // Clears the banner only if it belongs to `owner`. Success paths use this instead of
+  // _showError("") so an operation can retract its own message without touching anyone else's.
+  //
+  // This replaces an epoch counter that compared *recency*. Recency detects an error raised after
+  // the operation started, but is blind to one that was already on screen when it began - so
+  // copying YAML successfully would clear a get_state failure that was displayed beforehand and
+  // has not recovered. Ownership is the property actually wanted, and the file already had a
+  // narrow version of it in _loadStateErrorShowing, now generalised.
+  _clearErrorIfOwnedBy(owner, sinceToken) {
+    if (!owner || this._errorOwner !== owner) return;
+    // Owner alone is a *category*, not an invocation. Two concurrent sweep starts, or a
+    // double-clicked copy, share one owner - so one attempt failing and a second succeeding let
+    // the success retract a failure that is still true. sinceToken is captured when the operation
+    // begins: anything displayed after that belongs to a later attempt and is not ours to clear.
+    if (Number.isFinite(sinceToken) && this._errorToken > sinceToken) return;
+    this._showError("");
+  }
+
+  _showError(message, { isLoadError = false, owner = null } = {}) {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
     // Tracks whether the *currently displayed* error is specifically a get_state load
@@ -2310,6 +2535,13 @@ class SdrHubPanel extends HTMLElement {
     // out the next time a background state refresh happens to succeed, even though the user
     // still needs to see it. Whichever call to _showError ran most recently determines this.
     this._loadStateErrorShowing = isLoadError && !!message;
+    // Who owns what is on screen now. Cleared along with the message, so an empty banner is owned
+    // by nobody and cannot be "cleared" a second time by a stale success handler.
+    this._errorOwner = message ? owner || (isLoadError ? "loadState" : null) : null;
+    // Monotonic, bumped on every display. Lets a clear tell "this is the message my attempt
+    // raised" from "a later attempt raised this while I was still running".
+    if (message) this._errorToken = (this._errorToken || 0) + 1;
+
     el.textContent = message;
     el.style.display = message ? "block" : "none";
   }
@@ -2391,6 +2623,8 @@ class SdrHubPanel extends HTMLElement {
             </select></label>
             <label style="${LABEL}">Contrast min dB<input id="sdr-hub-db-min" type="number" step="1" value="${esc(this._dbMin)}" style="${INPUT};width:90px"></label>
             <label style="${LABEL}">Contrast max dB<input id="sdr-hub-db-max" type="number" step="1" value="${esc(this._dbMax)}" style="${INPUT};width:90px"></label>
+            <button id="sdr-hub-db-auto" type="button" title="Set the contrast range from the signal levels currently being received"
+              style="${BTN_SECONDARY};align-self:end;">Auto</button>
           </div>
           <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
@@ -2439,6 +2673,8 @@ class SdrHubPanel extends HTMLElement {
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
             <button id="sdr-hub-decoded-time-toggle" type="button" title="Toggle between relative and absolute timestamps" style="${BTN_SECONDARY};white-space:nowrap;">${this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time"}</button>
+            <button id="sdr-hub-export-decoded" type="button" title="Download the decoded log as a CSV file"
+              style="${BTN_SECONDARY};white-space:nowrap;">Export CSV</button>
             <button id="sdr-hub-clear-decoded" type="button" style="${BTN_SECONDARY};white-space:nowrap;">Clear log</button>
           </div>
           <div id="sdr-hub-decoded" style="max-height:240px;overflow-y:auto;"></div>
@@ -2489,6 +2725,7 @@ class SdrHubPanel extends HTMLElement {
       ev.target.textContent = this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time";
       this._renderDecodedLog();
     });
+    this.querySelector("#sdr-hub-export-decoded")?.addEventListener("click", () => this._exportDecodedCsv());
     this.querySelector("#sdr-hub-clear-decoded").addEventListener("click", async () => {
       // Only clears the *displayed* log, not the low-battery state - a device that's genuinely
       // still reporting low battery should keep showing in the alert banner even after the user
@@ -2678,6 +2915,30 @@ class SdrHubPanel extends HTMLElement {
     };
     dbMinInput.addEventListener("change", applyDbRange);
     dbMaxInput.addEventListener("change", applyDbRange);
+    const autoBtn = this.querySelector("#sdr-hub-db-auto");
+    if (autoBtn) {
+      autoBtn.addEventListener("click", () => {
+        const errorToken = this._errorToken || 0;
+        // Derived from every retained row across all running sweeps, so a single anomalous row
+        // can't set the range. Nothing is changed if no rows have arrived yet - silently
+        // applying a default would look like the button had done something.
+        const rows = Object.values(this._sweepRowHistory || {}).flat();
+        const range = autoContrastRange(rows);
+        if (!range) {
+          this._showError("No spectrum data yet - start a sweep and let a few rows arrive first.", { owner: "autoContrast" });
+          return;
+        }
+        // Releases only Auto's own message - see the CSV export's clear for why an unconditional
+        // one is wrong even in a synchronous handler.
+        this._clearErrorIfOwnedBy("autoContrast", errorToken);
+        this._dbMin = range.min;
+        this._dbMax = range.max;
+        dbMinInput.value = range.min;
+        dbMaxInput.value = range.max;
+        saveDbRange(range.min, range.max);
+        this._renderSweeps(true);
+      });
+    }
   }
 
   // Fills the form's fields from the chosen preset - a starting point the user can still edit
@@ -2918,6 +3179,13 @@ class SdrHubPanel extends HTMLElement {
         delete this._viewportHeight[id];
       }
     }
+    // The resize observers are a fifth per-sweep resource and are released here with the other
+    // four, above both early returns below. They were previously pruned further down, past the
+    // empty-list return - so stopping the *last* sweep skipped the cleanup entirely and left an
+    // observer holding a detached canvas whose backing store can be as large as the area cap,
+    // until the panel disconnected or another sweep started. Anything scoped per sweep belongs in
+    // this loop; keeping them together is what stops the next such resource drifting off again.
+    this._pruneSweepResizeObservers(activeIds);
     // _loadState() (and thus this) runs on every state_changed event, including the harmless
     // 30s poll and other panels' unrelated actions - not just changes to *this* sweep list. The
     // full rebuild below recreates every canvas element and replays its whole retained history
@@ -2939,8 +3207,18 @@ class SdrHubPanel extends HTMLElement {
       }
       return;
     }
-    this._renderedSweepIdsKey = idsKey;
-    this._renderedSweepStatusKey = statusKey;
+    // Not cached while detached. A get_state still in flight when the panel detaches resolves
+    // afterwards and rebuilds into DOM nobody can see - harmless in itself, but recording the id
+    // set means the *next* load after reattachment takes the memo early return, so the rebuild
+    // loop never runs again and the observers it registers are never re-armed.
+    //
+    // Suppressing the write rather than adding an explicit re-arm: rendering into detached DOM has
+    // no user-visible value, so the cache entry is the only thing with consequences, and leaving
+    // it unwritten makes reattachment take the rebuild path naturally.
+    if (this.isConnected) {
+      this._renderedSweepIdsKey = idsKey;
+      this._renderedSweepStatusKey = statusKey;
+    }
     if (this._state.sweeps.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
@@ -3019,6 +3297,8 @@ class SdrHubPanel extends HTMLElement {
           style="height:20px;margin-top:2px;border-radius:4px;cursor:ns-resize;touch-action:none;
           background:repeating-linear-gradient(to right,var(--divider-color,#e0e0e0) 0 6px,transparent 0 12px);
           display:flex;align-items:center;justify-content:center;"></div>
+        <div data-sweep-freq-axis="${esc(s.id)}" aria-hidden="true"
+          style="position:relative;height:14px;font-size:.65rem;color:var(--secondary-text-color,#727272);"></div>
         <div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--secondary-text-color,#727272);">
           <div data-sweep-hover="${esc(s.id)}" style="height:1.2em;"></div>
           <div data-sweep-peak="${esc(s.id)}" style="height:1.2em;"></div>
@@ -3079,6 +3359,7 @@ class SdrHubPanel extends HTMLElement {
         }
       }
       this._renderTimeAxis(s.id);
+      this._renderFrequencyAxis(s.id);
       // Restore the position captured above, now that the replacement container has its
       // history replayed back in (so scrollHeight reflects the final content size). A
       // bottom-pinned view is restored by re-pinning to the new bottom rather than replaying
@@ -3752,6 +4033,104 @@ class SdrHubPanel extends HTMLElement {
     });
   }
 
+  // Frequency ticks beneath the waterfall. The panel already had a *time* axis and a hover
+  // readout, so a visible signal could be located in time but its frequency could only be found
+  // by hovering over it - which is no help for reading a printed screenshot, comparing two
+  // sweeps, or just seeing at a glance which part of the band is busy.
+  //
+  // Tick count is derived from the rendered width rather than fixed, so a narrow card does not
+  // collapse into unreadable overlapping labels.
+  _renderFrequencyAxis(sweepId) {
+    const axisEl = this.querySelector(`[data-sweep-freq-axis="${CSS.escape(sweepId)}"]`);
+    if (!axisEl) return;
+    const sweep = (this._state.sweeps || []).find((s) => s.id === sweepId);
+    if (!sweep || !Number.isFinite(sweep.start_hz) || !Number.isFinite(sweep.stop_hz)) {
+      axisEl.innerHTML = "";
+      return;
+    }
+    // Measured from the canvas's own rendered box, not the axis element's. In full-history mode
+    // the canvas sits inside a scroll container, so with classic (space-consuming) scrollbars the
+    // container is narrower than the card while the axis - a sibling of the container - is not.
+    // Measuring the card shifted every tick rightward relative to the data as soon as the
+    // scrollbar appeared. The axis is also inset to match, so tick zero lines up with bin zero.
+    const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
+    const canvasBox = canvas ? canvas.getBoundingClientRect() : null;
+    // The inset is measured against the axis's *parent*, which this code never mutates. Deriving
+    // it from the axis's own box was self-invalidating: applying marginLeft moves that box, so the
+    // next render measured a difference of zero and removed the inset, and the render after that
+    // restored it - an oscillation that only became visible once the ResizeObserver started
+    // re-rendering without a width change.
+    const parentBox = axisEl.parentElement ? axisEl.parentElement.getBoundingClientRect() : null;
+    const width = canvasBox && canvasBox.width > 0 ? canvasBox.width : axisEl.clientWidth || 0;
+    if (canvasBox && parentBox) {
+      axisEl.style.marginLeft = `${Math.max(0, canvasBox.left - parentBox.left)}px`;
+      axisEl.style.width = `${width}px`;
+    }
+    // Pinning the width fixed the scrollbar offset but gave up the fluidity the old
+    // axisEl.clientWidth measurement had for free: the canvas still follows its container via
+    // width:100%, so toggling HA's sidebar, rotating a device or resizing the window moved the
+    // waterfall while the ticks stayed put - until the next row arrived, which for a slow or
+    // errored sweep is never. An observer restores what the substituted mechanism used to provide.
+    this._observeSweepResize(sweepId, canvas);
+    // ~90px per label keeps them from colliding at the smallest widths the card reaches.
+    const ticks = Math.max(2, Math.min(6, Math.floor(width / 90)));
+    const span = sweep.stop_hz - sweep.start_hz;
+    const parts = [];
+    for (let i = 0; i < ticks; i++) {
+      const frac = ticks === 1 ? 0 : i / (ticks - 1);
+      const hz = sweep.start_hz + span * frac;
+      // Same convention as the exported ruler. On screen the sweep heading a few pixels above
+      // already shows the unit, so this is latent rather than a live defect - but the axis should
+      // not depend on a sibling element for its meaning, and the two rulers reading differently
+      // would be its own small confusion.
+      const unit = i === ticks - 1 ? " MHz" : "";
+      // The first and last labels are pulled inside the bounds rather than centred, so neither
+      // is clipped by the card edge.
+      const align = i === 0 ? "left:0;text-align:left;" : i === ticks - 1 ? "right:0;text-align:right;" : `left:${(frac * 100).toFixed(2)}%;transform:translateX(-50%);`;
+      parts.push(
+        `<span style="position:absolute;top:0;${align}white-space:nowrap;">${esc(fmtMHz(hz) + unit)}</span>` +
+          `<span style="position:absolute;top:-3px;left:${(frac * 100).toFixed(2)}%;width:1px;height:3px;background:var(--divider-color,#e0e0e0);"></span>`,
+      );
+    }
+    axisEl.innerHTML = parts.join("");
+  }
+
+  // One ResizeObserver per sweep canvas, re-registered idempotently. Observes the canvas rather
+  // than the axis, since the canvas is the element whose width the ticks must match.
+  _observeSweepResize(sweepId, canvas) {
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    // Refuse to register once the panel is detached. disconnectedCallback tears observers down,
+    // but a sdr_hub/get_state still in flight resolves afterwards, and its _loadState ->
+    // _renderSweeps would register a fresh observer on a detached canvas that nothing will ever
+    // clean up - retaining the panel and its whole row history.
+    //
+    // This was previously blocked by accident: the memo key survived the detach, so a late
+    // _renderSweeps hit its early return before reaching here. Clearing that key to fix the
+    // reconnect bug removed the incidental guard, so the guard now has to be explicit.
+    if (!this.isConnected) return;
+    this._sweepResizeObservers ??= new Map();
+    const existing = this._sweepResizeObservers.get(sweepId);
+    if (existing && existing.canvas === canvas) return;
+    if (existing) existing.observer.disconnect();
+    const observer = new ResizeObserver(() => this._renderFrequencyAxis(sweepId));
+    observer.observe(canvas);
+    this._sweepResizeObservers.set(sweepId, { observer, canvas });
+  }
+
+  // Disconnects observers for sweeps that no longer exist, so a removed sweep's observer does not
+  // outlive its canvas and keep the element alive. Takes the live id set from the caller, which
+  // has already computed it, rather than re-deriving it from state.
+  _pruneSweepResizeObservers(activeIds) {
+    if (!this._sweepResizeObservers) return;
+    const live = activeIds || new Set((this._state.sweeps || []).map((s) => s.id));
+    for (const [id, entry] of this._sweepResizeObservers) {
+      if (!live.has(id)) {
+        entry.observer.disconnect();
+        this._sweepResizeObservers.delete(id);
+      }
+    }
+  }
+
   _renderTimeAxis(sweepId) {
     const axisEl = this.querySelector(`[data-sweep-axis="${CSS.escape(sweepId)}"]`);
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
@@ -4085,6 +4464,8 @@ class SdrHubPanel extends HTMLElement {
     button.addEventListener("click", async () => {
       const original = button.textContent;
       const text = textFn();
+      const errorToken = this._errorToken || 0;
+
       try {
         // navigator.clipboard requires a secure context (HTTPS or localhost) - it's simply
         // undefined otherwise, which is exactly the case for the plain-HTTP HA installs this
@@ -4096,9 +4477,13 @@ class SdrHubPanel extends HTMLElement {
         } else if (!this._copyViaExecCommand(text)) {
           throw new Error("Clipboard access unavailable in this browser context");
         }
+        // Completes the stale-banner sweep. Conditional rather than unconditional: this runs after
+        // an await, so an unrelated action may have raised a newer error while the permission
+        // prompt was open, and clearing that would hide something the user still needs.
+        this._clearErrorIfOwnedBy("clipboard", errorToken);
         button.textContent = "Copied!";
       } catch (err) {
-        this._showError(`Could not copy to clipboard: ${err.message || err}`);
+        this._showError(`Could not copy to clipboard: ${err.message || err}`, { owner: "clipboard" });
       }
       setTimeout(() => {
         button.textContent = original;
@@ -4135,11 +4520,22 @@ class SdrHubPanel extends HTMLElement {
   _saveSweepImage(sweepId) {
     const canvas = this.querySelector(`[data-sweep-canvas="${CSS.escape(sweepId)}"]`);
     if (!canvas) return;
-    canvas.toBlob((blob) => {
+    // The frequency axis is a sibling DOM element, so exporting the canvas alone produced a PNG
+    // that cannot be located in frequency without outside context - the very problem the axis was
+    // added to solve, reintroduced in the one artefact a user is most likely to keep or share.
+    // Composited here rather than drawn into the live canvas: the canvas is the pixel history and
+    // gets shifted, resized and blitted, so permanent furniture in it would scroll away.
+    const errorToken = this._errorToken || 0;
+    const composited = this._compositeSweepImage(sweepId, canvas);
+
+    (composited || canvas).toBlob((blob) => {
       if (!blob) {
-        this._showError("Could not save image: canvas produced no data");
+        this._showError("Could not save image: canvas produced no data", { owner: "saveImage" });
         return;
       }
+      // Same stale-banner class as the CSV export and the Auto contrast handler, but conditional:
+      // toBlob is asynchronous, so an unrelated failure may have been raised since.
+      this._clearErrorIfOwnedBy("saveImage", errorToken);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -4149,6 +4545,87 @@ class SdrHubPanel extends HTMLElement {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }, "image/png");
+  }
+
+  // Canvas carrying the waterfall plus a frequency ruler beneath it. Returns null if the sweep's
+  // range is unknown, in which case the caller falls back to exporting the bare waterfall rather
+  // than failing the save outright.
+  _compositeSweepImage(sweepId, canvas) {
+    const sweep = (this._state.sweeps || []).find((s) => s.id === sweepId);
+    if (!sweep || !Number.isFinite(sweep.start_hz) || !Number.isFinite(sweep.stop_hz)) return null;
+    const axisHeight = 18;
+    // The source canvas may already be sitting exactly on a cap: scrollRowCapForWidth returns
+    // min(MAX_CANVAS_HEIGHT_PX, memoryCap, areaCap), so when the area cap binds,
+    // width x height *equals* MAX_CANVAS_AREA_PX and any added row overflows it. Growing blindly
+    // produced a canvas the browser may refuse - getContext, drawing or toBlob can fail - so Save
+    // image would report no data or silently drop the ruler on exactly the longest histories.
+    //
+    // The ruler is worth more than the oldest few rows of a scrollback that is already thousands
+    // deep, so when there is no headroom the waterfall is cropped from the top by the strip's
+    // height rather than the export being abandoned.
+    const heightBudget = Math.min(MAX_CANVAS_HEIGHT_PX, Math.floor(MAX_CANVAS_AREA_PX / Math.max(1, canvas.width)));
+    const outHeight = Math.min(canvas.height + axisHeight, heightBudget);
+    const drawnHeight = outHeight - axisHeight;
+    // No room for even the strip - fall back to the bare waterfall rather than export a sliver.
+    if (drawnHeight <= 0) return null;
+    const sourceY = Math.max(0, canvas.height - drawnHeight);
+    const out = document.createElement("canvas");
+    out.width = canvas.width;
+    out.height = outHeight;
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+    ctx.font = "10px sans-serif";
+    ctx.textBaseline = "top";
+    const span = sweep.stop_hz - sweep.start_hz;
+    // How many labels actually fit is measured, not assumed. A narrow sweep produces a canvas only
+    // a few pixels wide - width is the bin count - while the labels stay a fixed pixel size, so a
+    // hardcoded tick count drew text wider than the image and clipped the ruler unreadable.
+    // Measures the *rendered* endpoint labels, including the " MHz" the last one now carries.
+    // Measuring the bare number while drawing the wider string let the two-label case be selected
+    // when it does not actually fit.
+    const labelWidth = Math.max(
+      ctx.measureText(fmtMHz(sweep.start_hz)).width,
+      ctx.measureText(`${fmtMHz(sweep.stop_hz)} MHz`).width,
+    );
+    const fits = Math.floor(out.width / (labelWidth + 8));
+    const ticks = Math.max(2, Math.min(6, fits));
+    // Below two labels there is no honest way to letter the ruler, so the marks are drawn without
+    // text rather than overlapping into illegibility.
+    const drawLabels = fits >= 2;
+
+    // Only the axis strip is filled. Filling the whole canvas destroyed the alpha that _paintRow
+    // deliberately writes for blanked bins - and under the Grayscale colormap pure white *is* the
+    // strongest signal, so missing capture data would have exported as maximum signal. Leaving the
+    // waterfall region transparent keeps "no data" distinguishable in the PNG, which is the whole
+    // point of issue #16's fix.
+    // Cropped from the top (oldest rows) when the budget bound, so the newest history - the part
+    // a user is looking at - always survives.
+    ctx.drawImage(canvas, 0, sourceY, canvas.width, drawnHeight, 0, 0, canvas.width, drawnHeight);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, drawnHeight, out.width, axisHeight);
+    ctx.fillStyle = "#000000";
+    for (let i = 0; i < ticks; i++) {
+      const frac = ticks === 1 ? 0 : i / (ticks - 1);
+      const x = frac * out.width;
+      ctx.fillRect(Math.min(out.width - 1, Math.max(0, Math.round(x))), drawnHeight, 1, 3);
+      if (!drawLabels) continue;
+      // The unit rides on the last label. fmtMHz returns a bare number and every other call site
+      // appends " MHz" itself, but this one is a standalone artifact: the sweep heading that
+      // supplies the unit on screen does not travel with the PNG, and the filename carries only
+      // the sweep id. Labelling the final tick is the usual axis convention and avoids repeating
+      // the unit across every tick in a strip this short.
+      //
+      // This is the same critique that created this composite one level down - the exported image
+      // could not be located in frequency without outside context, and the ruler added to fix
+      // that inherited the identical dependency.
+      const label = fmtMHz(sweep.start_hz + span * frac) + (i === ticks - 1 ? " MHz" : "");
+      const w = ctx.measureText(label).width;
+      // Same edge handling as the on-screen axis: the end labels are pulled inside the bounds so
+      // neither is clipped by the image border.
+      const tx = i === 0 ? 0 : i === ticks - 1 ? out.width - w : x - w / 2;
+      ctx.fillText(label, Math.min(out.width - w, Math.max(0, tx)), drawnHeight + 4);
+    }
+    return out;
   }
 
   // Exports only the fields sdr_hub/add_sweep and sdr_hub/add_receiver actually accept (not
@@ -4294,6 +4771,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onAddSweep(ev) {
+    const errorToken = this._errorToken || 0;
     ev.preventDefault();
     // Captured once, synchronously, rather than reading `ev.target` again after the `await`
     // below - some environments null out an Event's `target` once its dispatch has finished,
@@ -4336,9 +4814,13 @@ class SdrHubPanel extends HTMLElement {
         gain: form.get("gain"),
         scroll_mode: wantsScroll,
       });
-      this._showError("");
+      // Every clear in this file releases only its own owner's message. An unconditional clear
+      // asserts something about a banner the operation may not have raised: starting a sweep
+      // successfully says nothing about whether a get_state failure has recovered, and hiding it
+      // would suggest the panel is healthy when it is not still receiving state.
+      this._clearErrorIfOwnedBy("sweepAction", errorToken);
     } catch (err) {
-      this._showError(`Could not start sweep: ${err.message || err}`);
+      this._showError(`Could not start sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
     // The add-on's own state_changed broadcast for a successfully-created sweep can arrive and
     // trigger a _loadState() (via _handleEvent) before this call's own add_sweep response
@@ -4351,11 +4833,12 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onRemoveSweep(sweepId) {
+    const errorToken = this._errorToken || 0;
     try {
       await this._callWS({ type: "sdr_hub/remove_sweep", sweep_id: sweepId });
-      this._showError("");
+      this._clearErrorIfOwnedBy("sweepAction", errorToken);
     } catch (err) {
-      this._showError(`Could not stop sweep: ${err.message || err}`);
+      this._showError(`Could not stop sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
     await this._loadState();
   }
@@ -4384,6 +4867,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _onAddReceiver(ev) {
+    const errorToken = this._errorToken || 0;
     ev.preventDefault();
     // See _onAddSweep's identical formEl capture above - same reasoning.
     const formEl = ev.target;
@@ -4409,19 +4893,20 @@ class SdrHubPanel extends HTMLElement {
         frequencies_mhz: form.get("frequencies_mhz"),
         hop_interval_s: form.get("hop_interval_s"),
       });
-      this._showError("");
+      this._clearErrorIfOwnedBy("receiverAction", errorToken);
     } catch (err) {
-      this._showError(`Could not start receiver: ${err.message || err}`);
+      this._showError(`Could not start receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
     await this._loadState();
   }
 
   async _onRemoveReceiver(receiverId) {
+    const errorToken = this._errorToken || 0;
     try {
       await this._callWS({ type: "sdr_hub/remove_receiver", receiver_id: receiverId });
-      this._showError("");
+      this._clearErrorIfOwnedBy("receiverAction", errorToken);
     } catch (err) {
-      this._showError(`Could not stop receiver: ${err.message || err}`);
+      this._showError(`Could not stop receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
     await this._loadState();
   }
