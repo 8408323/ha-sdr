@@ -44,7 +44,7 @@ def _sanitize_event(event: Any) -> Any:
     dropped = [
         field
         for field, value in device.items()
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and not _is_finite_number(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and not _is_serializable_number(value)
     ]
     if not dropped:
         return event
@@ -56,9 +56,26 @@ def _sanitize_event(event: Any) -> Any:
     return {**event, "device": {k: v for k, v in device.items() if k not in dropped}}
 
 
-def _is_finite_number(value: int | float) -> bool:
+# The range Home Assistant's JSON serializer accepts for an integer. Outside it the value is
+# rejected outright, whatever its magnitude as a float.
+_MIN_SERIALIZABLE_INT = -(2**63)
+_MAX_SERIALIZABLE_INT = 2**64 - 1
+
+
+def _is_serializable_number(value: int | float) -> bool:
+    """Whether the value survives being serialized, as the type it will actually be sent as.
+
+    Integers are range-checked rather than tested for float finiteness, because those are different
+    questions and only the first one is the one being asked: float(10**100) is 1e100, perfectly
+    finite, so a finiteness test passes and the *original* oversized integer is kept and forwarded -
+    and the serializer rejects it anyway. That failure is worse than no check at all, because the
+    sensor path would meanwhile accept the rounded float, leaving the two paths disagreeing about a
+    reading in exactly the way sanitizing here is meant to prevent.
+    """
+    if isinstance(value, int):
+        return _MIN_SERIALIZABLE_INT <= value <= _MAX_SERIALIZABLE_INT
     try:
-        return math.isfinite(float(value))
+        return math.isfinite(value)
     except (OverflowError, ValueError):
         return False
 

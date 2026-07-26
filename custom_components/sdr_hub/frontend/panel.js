@@ -2162,16 +2162,28 @@ class SdrHubPanel extends HTMLElement {
   _noteOutdatedAddon() {
     if (this._outdatedAddonNoticeShown) return;
     this._outdatedAddonNoticeShown = true;
-    // Owned, and deliberately the one owner with no clear path. Every other message describes an
-    // operation that can succeed next time; this describes a deployment that stays wrong until the
-    // add-on is updated, so nothing the panel does should retract it. An explicit owner is what
-    // keeps it out of the shared "general" slot, where an unrelated future call site could
-    // overwrite a notice the user still needs to act on.
+    // Owned so it cannot be overwritten from the shared "general" slot by an unrelated call site.
+    // Unlike every other owner it is not cleared by the operation that raised it - it describes the
+    // deployment, not an attempt - but it is emphatically not permanent: see
+    // _clearOutdatedAddonNotice for what retracts it.
     this._showError(
       "The SDR Hub add-on is out of date: decoded events arrive without a server-assigned id, " +
         "so the decoded log and low-battery alerts are disabled. Update the add-on to re-enable them.",
       { owner: "outdatedAddon" },
     );
+  }
+
+  _clearOutdatedAddonNotice() {
+    if (!this._outdatedAddonNoticeShown) return;
+    // The latch is reset alongside the message, not instead of it: leaving it set would suppress
+    // the notice if the add-on were later downgraded or rolled back in the same session, which is
+    // the same "reports a stale deployment" failure in the opposite direction.
+    this._outdatedAddonNoticeShown = false;
+    // Not token-guarded, unlike the operation owners. There is no concurrent second attempt to
+    // confuse this with - the condition is a property of the connected add-on, and a convergent
+    // event is proof about that add-on, so whatever raised the notice is answered by it.
+    this._errorMessages.delete("outdatedAddon");
+    this._renderErrors();
   }
 
   async _persistDecodedEvent(event) {
@@ -2186,6 +2198,12 @@ class SdrHubPanel extends HTMLElement {
       this._noteOutdatedAddon();
       return;
     }
+    // Reaching here IS the recovery signal: this event carries the server-assigned identity whose
+    // absence the notice reports, so the features it says are disabled are demonstrably working
+    // again. The add-on can be upgraded and restarted while the panel stays open, so treating the
+    // notice as permanent left it asserting that the decoded log and battery alerts were off while
+    // both were processing these very events.
+    this._clearOutdatedAddonNotice();
     // Legacy (non-convergent) entries from an older add-on are kept in the local view - they
     // only need excluding from *persistence*, and dropping them here would blank the visible
     // history the moment the add-on is upgraded mid-session.
@@ -4743,6 +4761,13 @@ class SdrHubPanel extends HTMLElement {
     const file = ev.target.files[0];
     ev.target.value = ""; // clears the input so re-selecting the same file later still fires "change"
     if (!file) return;
+    // Captured before the first await, not before the import loop. file.text() is itself an await,
+    // so a second import picked during it can parse, fail validation and display its error while
+    // this call is still reading - and a token taken afterwards would treat that newer error as
+    // pre-existing and let this import's success delete it, hiding that the user's most recently
+    // chosen file was invalid. "Before the loop" is not the same as "before the operation"; only
+    // the latter is what the token is for.
+    const errorToken = this._errorToken || 0;
     let config;
     try {
       config = JSON.parse(await file.text());
@@ -4769,9 +4794,6 @@ class SdrHubPanel extends HTMLElement {
     }
     const sweeps = config.sweeps;
     const receivers = config.receivers;
-    // See _onStopAllSweeps: this loop also awaits per entry, so a second import started while it
-    // runs can display a configImport failure that this one must not retract on success.
-    const errorToken = this._errorToken || 0;
     const errors = [];
     // Sequential (not Promise.all) so a busy/duplicate dongle rejection on one entry doesn't
     // race the add-on's per-dongle ownership check against another entry targeting the same
