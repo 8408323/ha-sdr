@@ -1774,7 +1774,7 @@ class SdrHubPanel extends HTMLElement {
       }
       this._unsub = unsub;
     } catch (err) {
-      this._showError(`Could not subscribe to live updates: ${err.message || err}`);
+      this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
     } finally {
       this._subscribing = false;
     }
@@ -1804,7 +1804,8 @@ class SdrHubPanel extends HTMLElement {
     // arrived. Only do this if the banner currently showing IS that load error (the flag
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
     // action error isn't wiped out just because this background refresh happened to succeed.
-    if (this._loadStateErrorShowing) this._showError("");
+    // The original one-owner version of this idea, now expressed with the shared mechanism.
+    this._clearErrorIfOwnedBy("loadState");
     // A different coordinator session means Home Assistant restarted, so the add-on event stream
     // was interrupted for *every* tab - not just this one's socket. The reconnect path otherwise
     // treats the loss as tab-local and adopts the shared battery map from a peer that could not
@@ -2019,12 +2020,15 @@ class SdrHubPanel extends HTMLElement {
   // without scrolling.
   _exportDecodedCsv() {
     if (this._decodedLog.length === 0) {
-      this._showError("Nothing to export - no devices have been decoded yet.");
+      this._showError("Nothing to export - no devices have been decoded yet.", { owner: "csvExport" });
       return;
     }
-    // Cleared on the success path, like the Auto contrast handler. Leaving it up meant the panel
-    // still claimed there was nothing to export while a file was downloading.
-    this._showError("");
+    // Releases only this export's own message. It was an unconditional clear, on the reasoning
+    // that a synchronous handler cannot be interleaved - true, and beside the point. Nothing has
+    // to race: the user can click Export while a get_state failure is already on screen, and the
+    // cached log still exports fine, so an unconditional clear hid a load failure that had not
+    // recovered. Ownership, not timing, is what makes a clear safe.
+    this._clearErrorIfOwnedBy("csvExport");
     const fixed = ["received_at", "name", "model", "id", "channel"];
     // Only the device fields the fixed columns already carry are dropped, derived from `fixed`
     // itself so the promise made in this method's comment stays true by construction.
@@ -2906,13 +2910,12 @@ class SdrHubPanel extends HTMLElement {
         const rows = Object.values(this._sweepRowHistory || {}).flat();
         const range = autoContrastRange(rows);
         if (!range) {
-          this._showError("No spectrum data yet - start a sweep and let a few rows arrive first.");
+          this._showError("No spectrum data yet - start a sweep and let a few rows arrive first.", { owner: "autoContrast" });
           return;
         }
-        // Clears the "no spectrum data yet" message this same button may have shown moments ago -
-        // otherwise the panel keeps asserting there is no data while visibly applying a range
-        // derived from it.
-        this._showError("");
+        // Releases only Auto's own message - see the CSV export's clear for why an unconditional
+        // one is wrong even in a synchronous handler.
+        this._clearErrorIfOwnedBy("autoContrast");
         this._dbMin = range.min;
         this._dbMax = range.max;
         dbMinInput.value = range.min;
@@ -4793,9 +4796,13 @@ class SdrHubPanel extends HTMLElement {
         gain: form.get("gain"),
         scroll_mode: wantsScroll,
       });
-      this._showError("");
+      // Every clear in this file releases only its own owner's message. An unconditional clear
+      // asserts something about a banner the operation may not have raised: starting a sweep
+      // successfully says nothing about whether a get_state failure has recovered, and hiding it
+      // would suggest the panel is healthy when it is not still receiving state.
+      this._clearErrorIfOwnedBy("sweepAction");
     } catch (err) {
-      this._showError(`Could not start sweep: ${err.message || err}`);
+      this._showError(`Could not start sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
     // The add-on's own state_changed broadcast for a successfully-created sweep can arrive and
     // trigger a _loadState() (via _handleEvent) before this call's own add_sweep response
@@ -4810,9 +4817,9 @@ class SdrHubPanel extends HTMLElement {
   async _onRemoveSweep(sweepId) {
     try {
       await this._callWS({ type: "sdr_hub/remove_sweep", sweep_id: sweepId });
-      this._showError("");
+      this._clearErrorIfOwnedBy("sweepAction");
     } catch (err) {
-      this._showError(`Could not stop sweep: ${err.message || err}`);
+      this._showError(`Could not stop sweep: ${err.message || err}`, { owner: "sweepAction" });
     }
     await this._loadState();
   }
@@ -4866,9 +4873,9 @@ class SdrHubPanel extends HTMLElement {
         frequencies_mhz: form.get("frequencies_mhz"),
         hop_interval_s: form.get("hop_interval_s"),
       });
-      this._showError("");
+      this._clearErrorIfOwnedBy("receiverAction");
     } catch (err) {
-      this._showError(`Could not start receiver: ${err.message || err}`);
+      this._showError(`Could not start receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
     await this._loadState();
   }
@@ -4876,9 +4883,9 @@ class SdrHubPanel extends HTMLElement {
   async _onRemoveReceiver(receiverId) {
     try {
       await this._callWS({ type: "sdr_hub/remove_receiver", receiver_id: receiverId });
-      this._showError("");
+      this._clearErrorIfOwnedBy("receiverAction");
     } catch (err) {
-      this._showError(`Could not stop receiver: ${err.message || err}`);
+      this._showError(`Could not stop receiver: ${err.message || err}`, { owner: "receiverAction" });
     }
     await this._loadState();
   }
