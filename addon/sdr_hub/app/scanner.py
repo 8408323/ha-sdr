@@ -79,10 +79,19 @@ class SweepRow:
     start_hz: float
     bin_hz: float
     power_db: list[float | None]  # None marks an unfilled gap (JSON null, not NaN)
+    # Where the measured spectrum actually ends. Not derivable from len(power_db) * bin_hz once
+    # downsampling is involved: the row is padded up to a multiple of the reduction factor first,
+    # so the emitted length can describe up to one output bin of frequency that was never measured
+    # - about 162 kHz at the top of a full-range sweep. Carried explicitly rather than inferred,
+    # since only this function knows how much padding it added.
+    stop_hz: float = 0.0
 
 
 def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], float]:
     """Converts a native-resolution row to JSON-safe output, downsampling if needed.
+
+    Returns the serialized row, its output bin width, and the span actually measured - which is the
+    *pre-padding* span, since padding adds bins that describe no measurement.
 
     A row wider than MAX_ROW_POINTS is reduced down block-by-block by taking the peak
     (nanmax, so a filled bin isn't dragged toward a neighboring gap) rather than delivered
@@ -99,6 +108,7 @@ def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], 
     bytes for no real information gain.
     """
     n = len(row)
+    measured_span_hz = n * bin_hz
     if n > MAX_ROW_POINTS:
         factor = math.ceil(n / MAX_ROW_POINTS)
         pad = (-n) % factor
@@ -115,7 +125,7 @@ def _serialize_row(row: np.ndarray, bin_hz: float) -> tuple[list[float | None], 
             row = np.nanmax(row.reshape(-1, factor), axis=1)
         bin_hz = bin_hz * factor
     power_db = [None if np.isnan(v) else round(float(v), 1) for v in row]
-    return power_db, bin_hz
+    return power_db, bin_hz, measured_span_hz
 
 
 class SoapySweeper:
@@ -311,8 +321,15 @@ class SoapySweeper:
                             )
                     center += sample_rate
                 if not self._stop_event.is_set():
-                    power_db, out_bin_hz = _serialize_row(row, bin_hz)
-                    self._on_row(SweepRow(start_hz=config.start_hz, bin_hz=out_bin_hz, power_db=power_db))
+                    power_db, out_bin_hz, measured_span_hz = _serialize_row(row, bin_hz)
+                    self._on_row(
+                        SweepRow(
+                            start_hz=config.start_hz,
+                            bin_hz=out_bin_hz,
+                            power_db=power_db,
+                            stop_hz=config.start_hz + measured_span_hz,
+                        )
+                    )
         except Exception as err:  # noqa: BLE001 - surface any runtime failure (e.g. dongle unplugged mid-sweep) to the caller
             _LOGGER.exception("sweep failed for dongle %s", config.dongle_serial)
             if self._on_error is not None:

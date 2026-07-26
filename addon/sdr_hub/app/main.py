@@ -230,6 +230,7 @@ async def lifespan(app: FastAPI):
             "sweep_id": sweep_id,
             "start_hz": row.start_hz,
             "bin_hz": row.bin_hz,
+            "stop_hz": row.stop_hz,
             "power_db": row.power_db,
         }
         snapshot = stats.snapshot()

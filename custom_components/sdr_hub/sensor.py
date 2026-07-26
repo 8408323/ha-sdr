@@ -121,6 +121,11 @@ FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None, SensorSta
 # easily remove. Reaching it is logged once so the behaviour is visible rather than mysterious.
 MAX_DECODED_ENTITIES = 200
 
+# Statuses after which a sweep produces no further rows. It stays listed so the user can see why it
+# stopped and remove it deliberately, which means "still listed" is not the same as "still measuring"
+# - and statistics from a sweep that has stopped measuring are stale by definition.
+TERMINAL_SWEEP_STATUSES = frozenset({"error", "stopped"})
+
 # Statistics the add-on computes per sweep, published so automations can act on band activity -
 # "notify me when 868 MHz gets busy" is a question about the band, not about any decoded device,
 # and nothing in the integration could answer it before. Not capped by MAX_DECODED_ENTITIES: that
@@ -149,6 +154,13 @@ def sweep_band_hz(event: dict[str, Any]) -> tuple[float, float] | None:
         return None
     if not power or bin_hz <= 0:
         return None
+    stop = event.get("stop_hz")
+    # The add-on's own figure when it sends one. len(power) * bin_hz overstates a downsampled row:
+    # it is padded up to a multiple of the reduction factor first, so the emitted length can cover
+    # up to one output bin that was never measured - about 162 kHz at the top of a full-range
+    # sweep, which is a wrong band in the device name and a wrong stop_hz attribute.
+    if isinstance(stop, (int, float)) and float(stop) > float(start):
+        return float(start), float(stop)
     return float(start), float(start) + len(power) * float(bin_hz)
 
 
@@ -249,6 +261,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             entity_id = registry.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
             if entity_id:
                 registry.async_remove(entity_id)
+        # The registry is scanned too, not just this session's dict. After a restart the dict starts
+        # empty while the registry still holds every statistic entity ever created, and a sweep that
+        # disappeared while the integration was down is never repopulated by a later row - so an
+        # in-memory-only sweep would leave those entries orphaned permanently. Removing the device
+        # does not remove them either: the two registries are separate.
+        prefix = f"{entry.entry_id}_sweep_"
+        for registered in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
+            if registered.domain != "sensor" or not registered.unique_id.startswith(prefix):
+                continue
+            remainder = registered.unique_id[len(prefix) :]
+            # unique id is "<entry>_sweep_<sweep uuid>_<field>", and only the field is known to
+            # contain no underscore-delimited ambiguity - so match the field suffix rather than
+            # splitting, since a sweep id is a UUID containing hyphens but the field names do not.
+            sweep_id = next(
+                (remainder[: -(len(field) + 1)] for field in SWEEP_STAT_FIELDS if remainder.endswith(f"_{field}")),
+                None,
+            )
+            if sweep_id is None or sweep_id in live_sweep_ids:
+                continue
+            registry.async_remove(registered.entity_id)
         device_registry = dr.async_get(hass)
         for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
             for domain, identifier in device.identifiers:
@@ -295,7 +327,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # the event's own id also cleans up anything missed while this listener was not attached.
         if event.get("type") in ("state_changed", "status"):
             live = {s.get("id") for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)}
-            retire_sweep_stats({sid for sid in live if isinstance(sid, str)})
+            live = {sid for sid in live if isinstance(sid, str)}
+            # A sweep that failed at runtime stays in list_sweeps() with status "error", so
+            # reconciling against that list alone would treat it as live forever - while the add-on
+            # has already discarded its accumulator and will emit no further rows, leaving the
+            # entities frozen at their final values until someone deletes the sweep by hand.
+            # Excluded explicitly, both from the event that reports the failure and from any sweep
+            # already sitting in a terminal state.
+            live -= {
+                s.get("id")
+                for s in (coordinator.data or {}).get("sweeps", [])
+                if isinstance(s, dict) and s.get("status") in TERMINAL_SWEEP_STATUSES
+            }
+            if event.get("type") == "status" and event.get("kind") == "sweep" and event.get("status") in TERMINAL_SWEEP_STATUSES:
+                live.discard(event.get("id"))
+            retire_sweep_stats(live)
             if event.get("type") == "status":
                 return
         if event.get("type") != "decoded_device":

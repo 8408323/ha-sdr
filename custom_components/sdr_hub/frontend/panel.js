@@ -2800,6 +2800,15 @@ class SdrHubPanel extends HTMLElement {
            actually win: an inline style beats any non-important stylesheet rule regardless of
            source order, and this padding was inline. */
         #sdr-hub-root { padding: 16px; }
+        /* Declared here, not inline, so the narrow-screen overrides below can actually win. Four
+           declarations in that block were dead for exactly this reason - an inline style outranks
+           any non-important rule regardless of specificity or source order - and three separate
+           review rounds each found one of them. Found the remaining two by walking every
+           declaration in the media query and checking it against inline styles on its targets,
+           rather than fixing the instances as they were reported. */
+        #sdr-hub-root h1 { font-size: 1.4rem; }
+        #sdr-hub-root h2 { font-size: 1.1rem; }
+        #sdr-hub-root .sdr-hub-form-row { align-items: end; }
 
         /* The panel had no media queries at all. It does not *overflow* on a phone - the existing
            flex-wrap already prevents that, measured at both 390px and 320px with these rules
@@ -2809,8 +2818,12 @@ class SdrHubPanel extends HTMLElement {
            their content. Stacking gives each field the full width and a predictable order. */
         @media (max-width: 700px) {
           #sdr-hub-root { padding: 8px; }
-          .sdr-hub-form-row { flex-direction: column; align-items: stretch; }
-          .sdr-hub-form-row > * { width: 100%; }
+          #sdr-hub-root .sdr-hub-form-row { flex-direction: column; align-items: stretch; }
+          /* border-box as well as width. BTN gives the submit buttons 16px of horizontal padding
+             and they are content-box by default, so width:100% alone rendered them 32px wider than
+             the form - overflowing the very edge this block exists to make uniform, while the
+             inputs beside them were already border-box and looked correct. */
+          .sdr-hub-form-row > * { width: 100%; box-sizing: border-box; }
           /* The controls themselves, not only the labels wrapping them. Stretching the direct
              children alone left every input at its inline width (80px, 100px, 140px, 180px...),
              which is what actually determines the ragged edge - so the change looked applied while
@@ -2819,7 +2832,6 @@ class SdrHubPanel extends HTMLElement {
           .sdr-hub-form-row input:not([type="checkbox"]):not([type="radio"]),
           .sdr-hub-form-row select {
             width: 100% !important;
-            box-sizing: border-box;
           }
           /* A checkbox has an intrinsic size and no content to fit, so stretching it produces a
              13px control inside a 262px hit area - the box floats at one end of a wide blank
@@ -2844,13 +2856,13 @@ class SdrHubPanel extends HTMLElement {
       <div id="sdr-hub-root" style="max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
           <div style="display:flex;align-items:center;gap:10px;">
-            <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+            <h1 style="margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
             <span id="sdr-hub-connection-status" role="status" style="font-size:.8rem;font-weight:600;"></span>
           </div>
           <button data-show-help style="${BTN_SECONDARY}">Help</button>
         </div>
         <div id="sdr-hub-help" style="${CARD};display:${helpDismissed ? "none" : "block"};">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Getting started</h2>
+          <h2 style="margin:0 0 8px;">Getting started</h2>
           <ul style="margin:0 0 12px;padding-left:20px;font-size:.9rem;line-height:1.6;">
             <li><strong>Dongles</strong> — attached SDR hardware and what's currently using each one.</li>
             <li><strong>Band coverage</strong> — an at-a-glance view of which frequencies are currently being watched.</li>
@@ -2865,17 +2877,17 @@ class SdrHubPanel extends HTMLElement {
         <div id="sdr-hub-battery-alert" role="alert" aria-live="assertive" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Dongles</h2>
+          <h2 style="margin:0 0 8px;">Dongles</h2>
           <div id="sdr-hub-dongles"></div>
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Band coverage</h2>
+          <h2 style="margin:0 0 8px;">Band coverage</h2>
           <div id="sdr-hub-coverage"></div>
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Wideband sweeps</h2>
+          <h2 style="margin:0 0 8px;">Wideband sweeps</h2>
           <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Colormap<select id="sdr-hub-colormap" style="${INPUT}">
               ${Object.entries(COLORMAPS)
@@ -2887,7 +2899,7 @@ class SdrHubPanel extends HTMLElement {
             <button id="sdr-hub-db-auto" type="button" title="Set the contrast range from the signal levels currently being received"
               style="${BTN_SECONDARY};align-self:end;">Auto</button>
           </div>
-          <form id="sdr-hub-add-sweep" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <form id="sdr-hub-add-sweep" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${SWEEP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -2910,8 +2922,8 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Receivers (rtl_433)</h2>
-          <form id="sdr-hub-add-receiver" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <h2 style="margin:0 0 8px;">Receivers (rtl_433)</h2>
+          <form id="sdr-hub-add-receiver" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -2930,7 +2942,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Decoded devices</h2>
+          <h2 style="margin:0 0 8px;">Decoded devices</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
             <button id="sdr-hub-decoded-time-toggle" type="button" title="Toggle between relative and absolute timestamps" style="${BTN_SECONDARY};white-space:nowrap;">${this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time"}</button>
@@ -2942,7 +2954,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Backup &amp; restore</h2>
+          <h2 style="margin:0 0 8px;">Backup &amp; restore</h2>
           <p style="margin:0 0 8px;font-size:.85rem;color:var(--secondary-text-color,#727272);">
             Export every active sweep and receiver as a JSON file, or import one to recreate them.
           </p>
@@ -2964,7 +2976,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Settings</h2>
+          <h2 style="margin:0 0 8px;">Settings</h2>
           <label style="${LABEL};display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px;">
             <input type="checkbox" id="sdr-hub-battery-sound-toggle" ${this._batterySoundEnabled ? "checked" : ""}>
             Play a sound when a device first reports low battery
@@ -3613,13 +3625,19 @@ class SdrHubPanel extends HTMLElement {
                not merely annoy, it makes the control unusable, since the announcement a keypress
                should produce is buried. A live region has to carry only what changed *because the
                user did something*. -->
-          <div data-sweep-announce="${esc(s.id)}" role="status" aria-live="polite" aria-atomic="true"
-            style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
-            clip-path:inset(50%);white-space:nowrap;"></div>
           <div data-sweep-occupancy="${esc(s.id)}"
             style="min-height:1.2em;font-size:.7rem;color:var(--secondary-text-color,#727272);
             margin-bottom:6px;"></div>
         </div>
+        <!-- Outside the trace wrapper on purpose. That wrapper takes display:none when the spectrum
+             trace is switched off, which removes everything inside it from the accessibility tree -
+             but the waterfall stays focusable and its key handler keeps writing here, so a screen
+             reader user in that supported preference state could operate the markers and hear
+             nothing at all. A live region must not sit inside something hidden for an unrelated
+             reason. -->
+        <div data-sweep-announce="${esc(s.id)}" role="status" aria-live="polite" aria-atomic="true"
+          style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+          clip-path:inset(50%);white-space:nowrap;"></div>
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
@@ -4702,11 +4720,17 @@ class SdrHubPanel extends HTMLElement {
     // Coarse step for PageUp/PageDown and Shift-arrow: 1% of the span crosses a 7 MHz sweep in a
     // hundred presses instead of six thousand, while a plain arrow still gives single-bin precision.
     const coarse = Math.max(1, Math.round(bins / 100));
-    const cursor = this._markerCursor?.[sweepId] ?? Math.floor(bins / 2);
     const setCursor = (bin) => {
       (this._markerCursor ??= {})[sweepId] = Math.max(0, Math.min(bins - 1, bin));
       this._renderMarkerCursor(sweepId);
     };
+    // Materialised, not just defaulted into a local. Enter as the very first key after focusing
+    // left the midpoint living only in that local, so the marker landed correctly while the
+    // announcement read "placed at cursor" with no frequency - and since the visible readout is
+    // deliberately no longer a live region, that was the only channel telling a screen reader user
+    // where their first marker went.
+    if (this._markerCursor?.[sweepId] == null) (this._markerCursor ??= {})[sweepId] = Math.floor(bins / 2);
+    const cursor = this._markerCursor[sweepId];
     switch (ev.key) {
       case "ArrowLeft":
         setCursor(cursor - (ev.shiftKey ? coarse : 1));
