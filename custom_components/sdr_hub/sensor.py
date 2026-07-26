@@ -21,7 +21,36 @@ _LOGGER = logging.getLogger(__name__)
 # Fields rtl_433 emits that describe the *message* rather than a reading. Excluded from entity
 # creation because they identify the device or the decode, and would otherwise each become a
 # meaningless numeric sensor - `id` in particular is a device identifier, not a measurement.
-NON_MEASUREMENT_FIELDS = frozenset({"id", "channel", "model", "time", "mic", "protocol", "raw_message"})
+#
+# Treating every unlisted number as a measurement is the wrong default for a decoder that also
+# reports how it decoded: `sequence_num` is a rolling transmission counter and `message_type` a
+# packet discriminator, so charting either says nothing about the environment, and both consume
+# entity-budget slots per physical device. Names are matched exactly, so a real reading that
+# happens to contain one of these words (`wind_dir_deg`) is unaffected.
+NON_MEASUREMENT_FIELDS = frozenset(
+    {
+        "id",
+        "channel",
+        "model",
+        "time",
+        "mic",
+        "protocol",
+        "raw_message",
+        # Per-message metadata emitted by the decoder rather than the sensor.
+        "message_type",
+        "sequence_num",
+        "subtype",
+        "num_rows",
+        "mod",
+        "crc",
+        "status",
+        "flags",
+        # Which frequency the receiver heard this on - a property of the tuner, not the device.
+        "freq",
+        "freq1",
+        "freq2",
+    }
+)
 
 # Flags rtl_433 emits as JSON 0/1 rather than true/false, so they arrive as int and an
 # isinstance(value, bool) guard does not catch them. Excluded by name: a battery indicator charted
@@ -66,7 +95,13 @@ FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None, SensorSta
     "pressure_kPa": (SensorDeviceClass.PRESSURE, "kPa", SensorStateClass.MEASUREMENT),
     "wind_avg_km_h": (SensorDeviceClass.WIND_SPEED, "km/h", SensorStateClass.MEASUREMENT),
     "wind_max_km_h": (SensorDeviceClass.WIND_SPEED, "km/h", SensorStateClass.MEASUREMENT),
-    "wind_dir_deg": (None, "°", SensorStateClass.MEASUREMENT),
+    # No state class: a compass bearing is circular, and MEASUREMENT tells HA to record arithmetic
+    # min/max/mean long-term statistics. Averaging 359 and 1 arithmetically gives 180 - due south
+    # for two readings that are both due north - so the recorded statistic would be not merely
+    # imprecise but pointing the opposite way, and any automation reading it inherits that. A
+    # correct mean here needs circular statistics (averaging the unit vectors), which is a
+    # different computation than the one MEASUREMENT requests.
+    "wind_dir_deg": (None, "°", None),
     "moisture": (SensorDeviceClass.MOISTURE, "%", SensorStateClass.MEASUREMENT),
     # dB, not dBm, and no SIGNAL_STRENGTH class - which implies calibrated absolute power.
     # rtl_433 reports these three from the same metadata block as receiver-relative levels, so
@@ -130,16 +165,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # load at all - the integration locked out of its own entities. Recreating an existing unique
     # id does not grow the registry, so it must not be charged against a limit on growth.
     registry = er.async_get(hass)
+    # Unique ids this session has handed to async_add_entities. The registry is not updated
+    # synchronously, so between scheduling an entity and it appearing there the registry undercounts
+    # by exactly this set - and handle_event can run again in that window when several decodes are
+    # already buffered. Counting the *union* rather than adding a per-payload tally is what makes
+    # the projection correct across payloads as well as within one: a set cannot double-count an
+    # id that is in both halves, which is the mistake an additive count made twice already.
+    pending: set[str] = set()
 
     def _is_new_registration(unique_id: str) -> bool:
         return registry.async_get_entity_id("sensor", DOMAIN, unique_id) is None
 
-    def _registered_decoded_count() -> int:
-        return sum(
-            1
+    def _projected_decoded_count() -> int:
+        registered = {
+            e.unique_id
             for e in er.async_entries_for_config_entry(registry, entry.entry_id)
             if e.domain == "sensor" and e.unique_id != f"{entry.entry_id}_status"
-        )
+        }
+        return len(registered | pending)
 
     @callback
     def handle_event(event: dict[str, Any]) -> None:
@@ -153,12 +196,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             return
         key = decoded_device_key(device)
         new_entities: list[SdrHubDecodedSensor] = []
-        # Slots claimed by *this* payload but not yet visible to the registry. async_add_entities
-        # runs once after the loop, so the registry count is identical on every iteration: a device
-        # reporting ten new fields at 199 registered entities would see "199 < 200" ten times and
-        # take the registry to 209. The ceiling is only a ceiling if a claim is charged when it is
-        # made rather than when it is committed.
-        reserved = 0
         for field, value in device.items():
             if field in NON_MEASUREMENT_FIELDS or field in FLAG_FIELDS:
                 continue
@@ -171,7 +208,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 continue
             unique_id = f"{entry.entry_id}_{key}_{field}"
             if _is_new_registration(unique_id):
-                if _registered_decoded_count() + reserved >= MAX_DECODED_ENTITIES:
+                # Claimed the moment it is accepted, not when async_add_entities runs after the
+                # loop - otherwise every field of this payload, and every payload already buffered
+                # behind it, reads the same count and each independently claims all remaining slots.
+                if _projected_decoded_count() >= MAX_DECODED_ENTITIES:
                     if not capped:
                         capped = True
                         _LOGGER.warning(
@@ -180,9 +220,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                             MAX_DECODED_ENTITIES,
                         )
                     continue
-                # Only a genuinely new unique id is reserved. Recreating one the registry already
-                # holds does not grow it, for the same reason it is not charged against the cap.
-                reserved += 1
+                pending.add(unique_id)
             entity = SdrHubDecodedSensor(entry, device, field, reading)
             known[(key, field)] = entity
             new_entities.append(entity)

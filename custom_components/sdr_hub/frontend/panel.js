@@ -2162,9 +2162,15 @@ class SdrHubPanel extends HTMLElement {
   _noteOutdatedAddon() {
     if (this._outdatedAddonNoticeShown) return;
     this._outdatedAddonNoticeShown = true;
+    // Owned, and deliberately the one owner with no clear path. Every other message describes an
+    // operation that can succeed next time; this describes a deployment that stays wrong until the
+    // add-on is updated, so nothing the panel does should retract it. An explicit owner is what
+    // keeps it out of the shared "general" slot, where an unrelated future call site could
+    // overwrite a notice the user still needs to act on.
     this._showError(
       "The SDR Hub add-on is out of date: decoded events arrive without a server-assigned id, " +
         "so the decoded log and low-battery alerts are disabled. Update the add-on to re-enable them.",
+      { owner: "outdatedAddon" },
     );
   }
 
@@ -2748,6 +2754,14 @@ class SdrHubPanel extends HTMLElement {
         </div>
       </div>
     `;
+
+    // The markup above recreates #sdr-hub-error empty, but _errorMessages still holds whatever is
+    // currently wrong - so without this a rebuild silently erases a live, still-relevant failure,
+    // and nothing would redraw it until the *next* error operation happened to occur. Restoring it
+    // here rather than at each _renderShell() call site is deliberate: the map is state that
+    // outlives the DOM, exactly like the decoded log and battery alerts, and a rebuild added later
+    // would otherwise have to remember to repaint it.
+    this._renderErrors();
 
     this.querySelector("#sdr-hub-decoded-filter").addEventListener("input", (ev) => {
       this._decodedFilter = ev.target.value.trim().toLowerCase();
@@ -4755,6 +4769,9 @@ class SdrHubPanel extends HTMLElement {
     }
     const sweeps = config.sweeps;
     const receivers = config.receivers;
+    // See _onStopAllSweeps: this loop also awaits per entry, so a second import started while it
+    // runs can display a configImport failure that this one must not retract on success.
+    const errorToken = this._errorToken || 0;
     const errors = [];
     // Sequential (not Promise.all) so a busy/duplicate dongle rejection on one entry doesn't
     // race the add-on's per-dongle ownership check against another entry targeting the same
@@ -4804,7 +4821,11 @@ class SdrHubPanel extends HTMLElement {
         errors.push(`Receiver ${r.label || r.dongle_serial}: ${err.message || err}`);
       }
     }
-    this._showError(errors.length ? `Imported with ${errors.length} issue(s): ${errors.join("; ")}` : "", { owner: "configImport" });
+    if (errors.length) {
+      this._showError(`Imported with ${errors.length} issue(s): ${errors.join("; ")}`, { owner: "configImport" });
+    } else {
+      this._clearErrorIfOwnedBy("configImport", errorToken);
+    }
     await this._loadState();
   }
 
@@ -4892,6 +4913,12 @@ class SdrHubPanel extends HTMLElement {
   // failure's message even though that sweep is still running. Errors are accumulated instead
   // and reported together once the whole loop finishes.
   async _onStopAllSweeps() {
+    // Captured before the first removal. Sharing sweepAction with the individual handler is right -
+    // a successful "stop all" does supersede an earlier single-stop failure - but this loop awaits
+    // each removal in turn, so a *later* single-sweep failure can be displayed while it is still
+    // running. Clearing unconditionally on success would retract that newer, still-true message;
+    // the token confines this operation to superseding what it could actually have seen.
+    const errorToken = this._errorToken || 0;
     const errors = [];
     for (const id of this._state.sweeps.map((s) => s.id)) {
       try {
@@ -4901,10 +4928,8 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    // Same owner as the individual stop handler: a successful "stop all" genuinely does supersede
-    // an earlier single-stop failure, and sharing the slot is what expresses that. Landing in
-    // "general" instead left the older sweepAction failure on screen after everything had stopped.
-    this._showError(errors.length ? `Could not stop all sweeps: ${errors.join("; ")}` : "", { owner: "sweepAction" });
+    if (errors.length) this._showError(`Could not stop all sweeps: ${errors.join("; ")}`, { owner: "sweepAction" });
+    else this._clearErrorIfOwnedBy("sweepAction", errorToken);
   }
 
   async _onAddReceiver(ev) {
@@ -4955,6 +4980,7 @@ class SdrHubPanel extends HTMLElement {
   // See _onStopAllSweeps above - same snapshot-ids-then-sequentially-remove reasoning, and same
   // reason for accumulating errors instead of delegating to _onRemoveReceiver.
   async _onStopAllReceivers() {
+    const errorToken = this._errorToken || 0;
     const errors = [];
     for (const id of this._state.receivers.map((r) => r.id)) {
       try {
@@ -4964,7 +4990,8 @@ class SdrHubPanel extends HTMLElement {
       }
       await this._loadState();
     }
-    this._showError(errors.length ? `Could not stop all receivers: ${errors.join("; ")}` : "", { owner: "receiverAction" });
+    if (errors.length) this._showError(`Could not stop all receivers: ${errors.join("; ")}`, { owner: "receiverAction" });
+    else this._clearErrorIfOwnedBy("receiverAction", errorToken);
   }
 }
 
