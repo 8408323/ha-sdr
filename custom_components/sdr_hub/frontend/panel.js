@@ -1234,6 +1234,11 @@ const OCCUPANCY_MIN_DELTA_DB = PEAK_MIN_DELTA_DB;
 // Statuses after which a sweep emits no further rows. Mirrors the integration's own set: a sweep
 // stays listed after erroring so the user can see why, so "listed" is not "measuring".
 const TERMINAL_SWEEP_STATUSES = new Set(["error", "stopped"]);
+
+// Mirrors the add-on's NOISE_FLOOR_QUANTILE. The local fallback exists for an add-on that does not
+// publish statistics, so it has to compute the same quantity the same way - a fallback that answers
+// a different question than the thing it stands in for is worse than no fallback.
+const NOISE_FLOOR_QUANTILE = 0.25;
 // "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
 // fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
 // few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
@@ -1465,6 +1470,9 @@ class SdrHubPanel extends HTMLElement {
       // shared storage instead, which is exactly what a still-connected peer has been keeping
       // up to date, and don't touch the generation.
       if (wasDisconnected) {
+        // This tab's own socket dropped, so it may have missed rows even though the coordinator's
+        // connection to the add-on never faltered. Same boundary, same conclusion.
+        this._invalidateServedStats();
         // The decoded log is re-read too. While this tab's socket was down a still-connected
         // peer could have persisted events it never saw, and nothing else would pull them in:
         // peer notifications are one-shot, so if decoding then goes quiet the log stays missing
@@ -2127,6 +2135,14 @@ class SdrHubPanel extends HTMLElement {
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
       await this._invalidateBatteryState(event.gap_id ?? null);
+      // The served statistics are dropped for the same reason the battery map is: rows may have
+      // been missed, and the loss is upstream of every tab. A snapshot from before the gap is not a
+      // current measurement, and rendering it as one can persist for an entire wide-sweep pass -
+      // or indefinitely if the sweep stalls. The HA entities already stay unavailable across this
+      // boundary via stream_epoch; the panel has to draw the same line or the two disagree. Local
+      // trace state is kept: those rows genuinely were received, and the waterfall above still
+      // shows them.
+      this._invalidateServedStats();
       this._loadState();
     }
   }
@@ -5066,6 +5082,13 @@ class SdrHubPanel extends HTMLElement {
   // strong carriers has a mean pulled up by exactly the bins that are not noise, which would then
   // hide those carriers by raising the threshold they are measured against. The median is
   // unaffected by a minority of loud bins, which is the property wanted here.
+  // Drops every served snapshot, so the readout falls back to locally-accumulated figures until a
+  // fresh row arrives. Not a clear of the local trace: those rows were really received.
+  _invalidateServedStats() {
+    for (const id of Object.keys(this._sweepStats)) delete this._sweepStats[id];
+    for (const id of Object.keys(this._traceState)) this._renderOccupancy(id);
+  }
+
   _renderOccupancy(sweepId) {
     const el = this.querySelector(`[data-sweep-occupancy="${CSS.escape(sweepId)}"]`);
     if (!el) return;
@@ -5089,7 +5112,7 @@ class SdrHubPanel extends HTMLElement {
       el.textContent =
         `Noise floor ~${served.noise_floor_db.toFixed(1)} dB \u00b7 ` +
         `${served.occupancy_pct.toFixed(1)}% of the band occupied ` +
-        `(peak \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${served.bins_measured} bins measured`;
+        `(average \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${served.bins_measured} bins measured`;
       return;
     }
     // Local fallback, for an add-on predating the stats field. Kept rather than blanking the line:
@@ -5109,23 +5132,19 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     averages.sort((a, b) => a - b);
-    const floor = averages[Math.floor(averages.length / 2)];
-    let occupied = 0;
-    let measured = 0;
-    for (let i = 0; i < state.bins; i++) {
-      const pk = state.peak[i];
-      if (!Number.isFinite(pk)) continue;
-      measured++;
-      if (pk >= floor + OCCUPANCY_MIN_DELTA_DB) occupied++;
-    }
-    if (!measured) {
-      el.textContent = "";
-      return;
-    }
+    // Both corrections that were made to the add-on's estimator, applied here too: a low quantile
+    // rather than the median, which is a carrier level once carriers are the majority; and averages
+    // compared against averages rather than peak-hold against an average-derived floor, which
+    // drifts upward without bound as a session lengthens. This fallback stands in for the add-on's
+    // figure, so computing a different quantity would make the two disagree exactly when a user is
+    // least able to tell which they are looking at.
+    const floor = averages[Math.min(averages.length - 1, Math.floor(averages.length * NOISE_FLOOR_QUANTILE))];
+    const occupied = averages.filter((v) => v >= floor + OCCUPANCY_MIN_DELTA_DB).length;
+    const measured = averages.length;
     const pct = (100 * occupied) / measured;
     el.textContent =
       `Noise floor ~${floor.toFixed(1)} dB \u00b7 ${pct.toFixed(1)}% of the band occupied ` +
-      `(peak \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${measured} bins measured`;
+      `(average \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${measured} bins measured`;
   }
 
   // ---- Spectrum CSV --------------------------------------------------------------------------
