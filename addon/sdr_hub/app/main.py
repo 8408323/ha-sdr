@@ -264,6 +264,12 @@ async def lifespan(app: FastAPI):
         if stats is None:
             return False
         stats.reset()
+        # Announced on the stream rather than left for the next row to carry. A wide sweep can be
+        # most of a minute mid-pass, and a sweep that errors immediately afterwards never emits
+        # another row at all - so consumers would go on showing pre-reset figures, and the HA
+        # entities would keep publishing them as current, long after the accumulator was cleared.
+        # Ordered with the rows because it goes through the same broadcaster.
+        broadcaster.broadcast({"type": "stats_reset", "sweep_id": sweep_id, "generation": stats.generation})
         return True
 
     def on_device(receiver_id: str, device: dict) -> None:

@@ -101,6 +101,10 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # arrive at all, so anything relying on polling health alone would keep publishing readings
         # that stopped being measured.
         self.stream_connected = False
+        # Incremented on each successful (re)connection of the add-on event stream. Consumers that
+        # cache a value delivered over the stream can compare it and treat anything from an earlier
+        # connection as stale, since a gap may have hidden any number of updates.
+        self.stream_epoch = 0
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
         self._suppress_broadcast_count = 0
@@ -208,6 +212,7 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # polling interval. Availability should not return before the state behind it
                     # is true.
                     await self.async_refresh()
+                    self.stream_epoch += 1
                     self._set_stream_connected(True)
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:

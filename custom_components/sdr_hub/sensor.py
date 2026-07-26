@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -135,7 +136,11 @@ TERMINAL_SWEEP_STATUSES = frozenset({"error", "stopped"})
 # time: a database growing at hundreds of rows a second for as long as the sweep runs. Nothing
 # consuming a noise floor or a band-occupancy percentage needs sub-second resolution, so the raw
 # rows keep flowing to the panel at full rate while the entities settle to an automation cadence.
-MIN_STAT_WRITE_INTERVAL = timedelta(seconds=5)
+# Seconds, measured on a monotonic clock. Wall time can move backwards - NTP correcting a drifted
+# host, a VM resuming from a snapshot, someone fixing the timezone - and a backwards jump makes the
+# elapsed comparison negative, which reads as "not long enough" and freezes every statistic write
+# for as long as the jump, while rows keep arriving.
+MIN_STAT_WRITE_INTERVAL_S = 5.0
 
 # Statistics the add-on computes per sweep, published so automations can act on band activity -
 # "notify me when 868 MHz gets busy" is a question about the band, not about any decoded device,
@@ -332,12 +337,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # publishing it as available republishes a stale reading exactly when the identity work makes
     # the entity easiest to reuse.
     value_source: dict[str, str] = {}
+    # Bumped whenever the event stream reconnects. A WebSocket-only outage leaves the add-on and the
+    # sweep running, so the snapshot afterwards finds the same sweep and value_source still names
+    # it - and availability would return the moment the stream came back, republishing the
+    # pre-outage peak and occupancy as current before a single post-gap row had arrived. The value
+    # an entity holds belongs to the connection that delivered it, so a new connection makes it
+    # stale until replaced.
+    value_epoch: dict[str, int] = {}
     # Last stats generation seen per key, so a reset can bypass the write throttle exactly once.
     last_generation: dict[str, int] = {}
 
     @callback
     def is_measuring(key: str) -> bool:
         if key not in live_keys_cache:
+            return False
+        if value_epoch.get(key) != coordinator.stream_epoch:
             return False
         producing = live_sweep_for_key.get(key)
         return producing is not None and value_source.get(key) == producing
@@ -376,7 +390,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # comparing generations alone would leave the entity showing "unavailable" until a later
         # row happened to fall outside the interval.
         generation = stats.get("generation")
-        replaced = value_source.get(key) != sweep_id
+        replaced = value_source.get(key) != sweep_id or value_epoch.get(key) != coordinator.stream_epoch
+        value_epoch[key] = coordinator.stream_epoch
         forced = replaced or (generation is not None and last_generation.get(key) != generation)
         value_source[key] = sweep_id
         if generation is not None:
@@ -401,6 +416,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         nonlocal capped
         if event.get("type") == "sweep_row":
             handle_sweep_stats(event)
+            return
+        if event.get("type") == "stats_reset":
+            # The accumulator behind these entities has been cleared, so what they hold is no longer
+            # a measurement of anything. Dropping the value source makes them unavailable until the
+            # next row, rather than publishing a pre-reset figure that a wide sweep might leave on
+            # screen for most of a minute - or forever, if the sweep errors straight afterwards.
+            reset_key = sweep_stat_key(
+                next(
+                    (
+                        s
+                        for s in (coordinator.data or {}).get("sweeps", [])
+                        if isinstance(s, dict) and s.get("id") == event.get("sweep_id")
+                    ),
+                    None,
+                )
+            )
+            if reset_key:
+                value_source.pop(reset_key, None)
+                for (key, _field), entity in sweep_stat_entities.items():
+                    if key == reset_key:
+                        entity.async_write_ha_state_if_added()
             return
         # Both paths a sweep can end by, because neither covers the other: a DELETE emits no status
         # event and is only visible as a state change, while an errored sweep never reaches the
@@ -589,7 +625,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         self._coordinator = coordinator
         self._stat_key = stat_key
         self._is_measuring = is_measuring
-        self._last_written: datetime | None = None
+        self._last_written: float | None = None
         name, unit = SWEEP_STAT_FIELDS[field]
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
@@ -637,8 +673,8 @@ class SdrHubSweepStatSensor(SensorEntity):
         # write state, and attempting it raises rather than being ignored.
         if self.hass is None:
             return
-        now = datetime.now(timezone.utc)
-        if not force and self._last_written is not None and now - self._last_written < MIN_STAT_WRITE_INTERVAL:
+        now = time.monotonic()
+        if not force and self._last_written is not None and now - self._last_written < MIN_STAT_WRITE_INTERVAL_S:
             return
         self._last_written = now
         self.async_write_ha_state()

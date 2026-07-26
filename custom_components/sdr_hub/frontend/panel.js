@@ -2095,6 +2095,18 @@ class SdrHubPanel extends HTMLElement {
       if (this._favoriteDevices.has(favKey)) this._flashDeviceKey = favKey;
       this._persistDecodedEvent(event);
       if (Object.hasOwn(decodedDevice, "battery_ok")) this._updateBatteryState(event);
+    } else if (event.type === "stats_reset") {
+      // The add-on announcing that it cleared an accumulator. Applied immediately rather than
+      // waiting for the next row to carry the new generation: a wide sweep can be most of a minute
+      // mid-pass, and one that errors right after a reset never sends another row at all. Recording
+      // the generation here also means the row that eventually arrives is not treated as a second
+      // boundary and does not clear again.
+      if (event.stats_reset !== false) {
+        this._statsGen[event.sweep_id] = event.generation;
+        delete this._sweepStats[event.sweep_id];
+        this._clearTraceState(event.sweep_id);
+        this._renderOccupancy(event.sweep_id);
+      }
     } else if (event.type === "status" || event.type === "state_changed") {
       // A receiver/sweep died, or something else changed the add-on's state from outside
       // this panel (an automation service call, another open panel) - reload the
@@ -2889,6 +2901,18 @@ class SdrHubPanel extends HTMLElement {
              than special-cased afterwards, since the same is true of radios. */
           #sdr-hub-root h1 { font-size: 1.2rem; }
           #sdr-hub-root h2 { font-size: 1rem; }
+          /* The sweep card header is a range/serial line beside a non-wrapping group of Save image,
+             Copy as YAML and Stop. Stacking the forms alone left the widest thing on the card
+             untouched.
+
+             The symptom is not page overflow - measured at 320px with these rules disabled, nothing
+             overflows and the page does not scroll horizontally. It is that flexbox resolves the
+             conflict by crushing whatever can shrink: the title collapses to 35px, so the card no
+             longer says which sweep it belongs to, and the three buttons squeeze to ~67px each with
+             their labels wrapped onto two lines. With the rules, the title gets 262px and the
+             buttons take their natural widths across two rows. */
+          .sdr-hub-card-header { flex-direction: column; align-items: stretch; gap: 6px; }
+          .sdr-hub-card-actions { flex-wrap: wrap; white-space: normal; }
         }
         /* Every text container that sits beside something flexible. Applied at all widths: a
            2000-character device name overflows a desktop card too, just less often. */
@@ -3651,10 +3675,10 @@ class SdrHubPanel extends HTMLElement {
         const searchText = `${s.label || ""} ${s.dongle_serial} ${fmtMHz(s.start_hz)} ${fmtMHz(s.stop_hz)}`.toLowerCase();
         return `
       <div data-sweep-row="${esc(s.id)}" data-search="${esc(searchText)}" style="margin-bottom:16px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-          <span>${titleHtml} on ${esc(s.dongle_serial)}
+        <div class="sdr-hub-card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <span class="sdr-hub-shrinkable">${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
-          <span style="display:flex;gap:8px;">
+          <span class="sdr-hub-card-actions" style="display:flex;gap:8px;">
             <button data-save-sweep-png="${esc(s.id)}" title="Save the current waterfall as a PNG image" style="${BTN_SECONDARY}">Save image</button>
             <button data-copy-sweep-yaml="${esc(s.id)}" title="Copy as an sdr_hub.add_sweep automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
             <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
