@@ -549,6 +549,13 @@ const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 // integer has no such limit.
 const DECODED_LOG_GEN_KEY = "sdr_hub_decoded_log_gen";
 const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
+const SPECTRUM_TRACE_KEY = "sdr_hub_spectrum_trace";
+
+// Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
+// how the band behaves over time but compresses power into colour, which is poor at exactly the
+// judgement this plot exists for - how far a signal stands above the noise floor, and whether an
+// intermittent transmitter appeared at all while you were not watching.
+const TRACE_HEIGHT_PX = 96;
 // Canonical, cross-tab-shared map of currently-low-battery devices (batteryStateKey -> {model,
 // id, channel}). Convergent state: every tab observes the same battery_ok transitions from its
 // own subscription and derives an identical map, so concurrent writers store the same value and
@@ -969,6 +976,25 @@ function compareDecodedEvents(a, b) {
 // cross-tab convergence - there's no shared identity to dedup on - so it's kept for *this* tab's
 // live display but deliberately never persisted (see _persistDecodedEvent), rather than being
 // persisted under a fabricated client-side id that would duplicate across tabs.
+// Home Assistant registers the sdr_hub/* WebSocket commands while setting up the config entry,
+// which finishes some time *after* the frontend's own socket is back. A panel that queries in that
+// window is told the command does not exist - which is true at that instant and false a moment
+// later, so it describes a race, not a fault. Latching it left the panel permanently dead after
+// every HA restart, showing a message ("Unknown command") that reads like a version mismatch or a
+// broken install, while the waterfall silently stopped advancing.
+const INTEGRATION_NOT_READY_CODES = new Set(["unknown_command", "not_loaded"]);
+// Escalating, and finite: if the integration genuinely is not installed the message must eventually
+// be shown rather than retried forever behind a "starting" notice that would never resolve.
+const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
+
+function isIntegrationNotReady(err) {
+  if (err && INTEGRATION_NOT_READY_CODES.has(err.code)) return true;
+  // Fallback for transports that surface only a message. Matched loosely on purpose: the code is
+  // the reliable signal and this is a backstop, so a false positive costs one extra retry.
+  const message = String((err && err.message) || err || "").toLowerCase();
+  return message.includes("unknown command") || message.includes("sdr hub is not loaded");
+}
+
 function isConvergentEvent(e) {
   return !!e && typeof e.event_id === "string" && Number.isFinite(eventOrder(e));
 }
@@ -996,6 +1022,24 @@ function loadBatterySoundEnabled() {
 function saveBatterySoundEnabled(enabled) {
   try {
     localStorage.setItem(BATTERY_SOUND_ALERT_KEY, enabled ? "true" : "false");
+  } catch {
+    // See saveColormap above.
+  }
+}
+
+function loadSpectrumTraceEnabled() {
+  try {
+    // Defaults on. It is the piece that makes a waterfall readable as measurement rather than
+    // decoration, and a user who does not want it can turn it off once.
+    return localStorage.getItem(SPECTRUM_TRACE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveSpectrumTraceEnabled(enabled) {
+  try {
+    localStorage.setItem(SPECTRUM_TRACE_KEY, enabled ? "true" : "false");
   } catch {
     // See saveColormap above.
   }
@@ -1285,6 +1329,13 @@ class SdrHubPanel extends HTMLElement {
     // gesture-initiated Web Audio. Reset to false in disconnectedCallback (which also closes
     // _audioCtx) so a detach/reattach re-arms it - the closed context needs a fresh gesture too.
     this._audioUnlockWired = false;
+    this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
+    // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
+    // persisted or shared. Peak-hold answers "what has this dongle heard since I started watching",
+    // which is a property of one observation session at one antenna - restoring a peak from a
+    // previous session, or adopting one from another tab that may have been watching a different
+    // sweep configuration, would assert a signal that this session never actually observed.
+    this._traceState = {};
     // Whether the cross-tab storage listener (see _wireStorageSync - reconciles this tab's
     // in-memory state when another open SDR Hub tab either resets preferences or updates the
     // decoded log) is currently attached - same re-arm-on-reattach reasoning as _audioUnlockWired
@@ -1738,6 +1789,10 @@ class SdrHubPanel extends HTMLElement {
       this._hass.connection.removeEventListener("disconnected", this._onConnDisconnected);
       this._connListenersWired = false;
     }
+    // A pending retry holds a timer referencing this element. Its own isConnected guard would make
+    // the callback a no-op, but the timer would still be alive and the attempt budget still spent -
+    // so a reattach would start from a partly-used counter. Cancelling restores both.
+    this._cancelIntegrationRetry();
     if (this._audioCtx) {
       this._audioCtx.close();
       this._audioCtx = null;
@@ -1801,10 +1856,45 @@ class SdrHubPanel extends HTMLElement {
       // one; this was the gap.
       this._clearErrorIfOwnedBy("subscribe", errorToken);
     } catch (err) {
-      this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
+      // Same race as _loadState, and the more damaging half of it: a subscribe that fails here
+      // leaves _unsub null, so no sweep rows or decodes ever arrive and the waterfall simply stops
+      // advancing - indistinguishable from a quiet band.
+      if (isIntegrationNotReady(err) && this._scheduleIntegrationRetry()) {
+        this._showError("SDR Hub is still starting up - reconnecting...", { owner: "subscribe" });
+      } else {
+        this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
+      }
     } finally {
       this._subscribing = false;
     }
+  }
+
+  // Retries both entry points together, because they fail together: they are the same two calls
+  // made on attach, against the same not-yet-registered commands.
+  _scheduleIntegrationRetry() {
+    if (this._integrationRetryTimer) return true; // one already pending - do not stack them
+    const attempt = this._integrationRetryAttempt || 0;
+    if (attempt >= INTEGRATION_RETRY_DELAYS_MS.length) return false; // exhausted - let the caller report
+    this._integrationRetryAttempt = attempt + 1;
+    this._integrationRetryTimer = setTimeout(() => {
+      this._integrationRetryTimer = null;
+      // Detached while waiting: retrying would resurrect a panel nobody is looking at, and
+      // _subscribe's own isConnected guard would cancel the subscription immediately anyway.
+      if (!this.isConnected) return;
+      this._loadState();
+      this._subscribe();
+    }, INTEGRATION_RETRY_DELAYS_MS[attempt]);
+    return true;
+  }
+
+  _cancelIntegrationRetry() {
+    if (this._integrationRetryTimer) {
+      clearTimeout(this._integrationRetryTimer);
+      this._integrationRetryTimer = null;
+    }
+    // Reset so a *later* restart in the same session gets the full budget again, rather than
+    // inheriting an exhausted counter and failing immediately the second time.
+    this._integrationRetryAttempt = 0;
   }
 
   async _loadState(forceRebuildSweeps = false) {
@@ -1823,9 +1913,18 @@ class SdrHubPanel extends HTMLElement {
       // too, an older call that fails *after* a newer call already succeeded would still show
       // this error, even though the latest state is already rendered correctly.
       if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
+      // Still starting up: schedule a retry instead of latching. The notice deliberately says what
+      // is actually happening rather than echoing "Unknown command", which describes an internal
+      // dispatch result and reads to a user like a broken install.
+      if (isIntegrationNotReady(err) && this._scheduleIntegrationRetry()) {
+        this._showError("SDR Hub is still starting up - reconnecting...", { isLoadError: true });
+        return;
+      }
       this._showError(`Could not load SDR Hub state: ${err.message || err}`, { isLoadError: true });
       return;
     }
+    // Reaching here means the commands are registered, so any retry in flight has done its job.
+    this._cancelIntegrationRetry();
     if (requestId !== this._loadStateRequestId) return; // superseded by a newer call
     // Recovered from a prior load failure - clear its banner now that fresh state actually
     // arrived. Only do this if the banner currently showing IS that load error (the flag
@@ -2766,6 +2865,10 @@ class SdrHubPanel extends HTMLElement {
             <input type="checkbox" id="sdr-hub-battery-sound-toggle" ${this._batterySoundEnabled ? "checked" : ""}>
             Play a sound when a device first reports low battery
           </label>
+          <label style="${LABEL};display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px;">
+            <input type="checkbox" id="sdr-hub-spectrum-trace-toggle" ${this._spectrumTraceEnabled ? "checked" : ""}>
+            Show the spectrum trace (current / peak hold / average) above each waterfall
+          </label>
           <div>
             <button id="sdr-hub-reset-prefs" type="button" title="Clears all locally-saved preferences (colormap, contrast, favorites, decoded log, etc.) and reloads" style="${BTN_DANGER}">Reset all preferences</button>
           </div>
@@ -2846,6 +2949,21 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
     this._wireCopyButton(this.querySelector("#sdr-hub-copy-all-yaml"), () => this._allConfigYaml());
+    this.querySelector("#sdr-hub-spectrum-trace-toggle").addEventListener("change", (ev) => {
+      this._spectrumTraceEnabled = ev.target.checked;
+      saveSpectrumTraceEnabled(this._spectrumTraceEnabled);
+      // Toggled by showing/hiding rather than rebuilding the shell: a rebuild would discard every
+      // waterfall bitmap and replay all retained rows, which is a lot of work to reveal a plot
+      // whose data is already accumulated. The accumulated state is deliberately kept while
+      // hidden, so re-enabling shows the peak hold that built up meanwhile rather than starting
+      // from whatever arrives next.
+      for (const wrap of this.querySelectorAll("[data-sweep-trace-wrap]")) {
+        wrap.style.display = this._spectrumTraceEnabled ? "" : "none";
+      }
+      if (this._spectrumTraceEnabled) {
+        for (const id of Object.keys(this._traceState)) this._drawTrace(id);
+      }
+    });
     this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
       this._batterySoundEnabled = ev.target.checked;
       saveBatterySoundEnabled(this._batterySoundEnabled);
@@ -3351,6 +3469,23 @@ class SdrHubPanel extends HTMLElement {
           <input type="checkbox" data-scroll-toggle="${esc(s.id)}" ${scroll ? "checked" : ""}>
           Keep full history (scrollable) — only affects rows from now on
         </label>
+        <div data-sweep-trace-wrap="${esc(s.id)}" style="${this._spectrumTraceEnabled ? "" : "display:none;"}">
+          <canvas data-sweep-trace="${esc(s.id)}" width="${rowWidth}" height="${TRACE_HEIGHT_PX}"
+            role="img" aria-label="Spectrum trace: current sweep, peak hold and average power against frequency"
+            style="width:100%;height:${TRACE_HEIGHT_PX}px;display:block;border-radius:8px;
+            background:var(--card-background-color,#fff);"></canvas>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:.7rem;
+            color:var(--secondary-text-color,#727272);margin:2px 0 6px;">
+            <span style="display:flex;align-items:center;gap:4px;">
+              <span style="width:14px;height:2px;background:#1e88e5;display:inline-block;"></span>current</span>
+            <span style="display:flex;align-items:center;gap:4px;">
+              <span style="width:14px;height:2px;background:#e53935;display:inline-block;"></span>peak hold</span>
+            <span style="display:flex;align-items:center;gap:4px;">
+              <span style="width:14px;height:2px;background:#8e8e8e;display:inline-block;"></span>average</span>
+            <button type="button" data-sweep-trace-reset="${esc(s.id)}"
+              style="${BTN};padding:1px 6px;font-size:.7rem;">Reset peak hold</button>
+          </div>
+        </div>
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
@@ -3405,6 +3540,13 @@ class SdrHubPanel extends HTMLElement {
           this._renderSweeps(true); // force: rebuilds this sweep's canvas at the new size and replays below
         });
       }
+      const traceReset = el.querySelector(`[data-sweep-trace-reset="${CSS.escape(s.id)}"]`);
+      if (traceReset) {
+        // Rebuilds from retained history rather than blanking: those rows are still on screen in
+        // the waterfall above, so a peak-hold that ignored them would contradict what is visible.
+        // "Reset" means "forget what scrolled away", not "forget what I can still see".
+        traceReset.addEventListener("click", () => this._rebuildTraceFromHistory(s.id));
+      }
       this._wireCanvasHover(s.id);
       this._wireResizeHandle(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
@@ -3416,12 +3558,21 @@ class SdrHubPanel extends HTMLElement {
       // O(n) full-canvas copies for a single rebuild (see _repaintLiveHistory).
       this._scrollDrawIndex[s.id] = 0;
       const rows = this._sweepRowHistory[s.id];
+      // Cleared before the replay below, not after. Scroll mode replays through _appendRow, which
+      // accumulates the trace - so without this a rebuild (a contrast change, a resize, a mode
+      // toggle) would add every retained row into the running sum a second time and pull the
+      // average toward the replayed history. The state is rebuilt from the same rows either way,
+      // so it is reconstructed rather than lost.
+      delete this._traceState[s.id];
       if (rows) {
         if (this._scrollMode[s.id]) {
           for (let i = rows.length - 1; i >= 0; i--) this._appendRow(s.id, rows[i]);
         } else {
           const canvas = el.querySelector(`[data-sweep-canvas="${CSS.escape(s.id)}"]`);
           if (canvas) this._repaintLiveHistory(canvas, s.id);
+          // Live mode deliberately bypasses _appendRow for its bulk repaint, so the trace has to be
+          // rebuilt explicitly here or it would stay empty until the next row arrived.
+          this._rebuildTraceFromHistory(s.id);
         }
       }
       this._renderTimeAxis(s.id);
@@ -4266,11 +4417,123 @@ class SdrHubPanel extends HTMLElement {
     if (!canvas) return;
     const peak = this._findPeak(row);
     this._renderPeakReadout(sweepId, peak);
+    this._updateTrace(sweepId, row);
+    this._drawTrace(sweepId);
     if (this._scrollMode[sweepId]) {
       this._drawScrollRow(canvas, sweepId, row, peak);
     } else {
       this._drawLiveRow(canvas, row, peak);
     }
+  }
+
+  // Accumulates the three traces. Nulls are skipped rather than treated as a value: a dropped hop
+  // (see the add-on's overflow handling) or the blanked DC spike is *missing data*, and folding it
+  // into an average as a number would pull the mean toward whatever that number happened to be,
+  // while folding it into a peak-hold would either overwrite a real peak or be silently ignored
+  // depending on comparison order. Per-bin counts are kept for the same reason - averaging by the
+  // number of rows would divide a bin's sum by rows that never contributed to it.
+  _updateTrace(sweepId, row) {
+    const power = row.power_db;
+    if (!power || !power.length) return;
+    let state = this._traceState[sweepId];
+    // A changed bin count means the sweep was reconfigured (range or sample rate), so bin i is no
+    // longer the same frequency it was. Carrying the old arrays over would place historic peaks at
+    // wrong frequencies, which is worse than losing them - so start again.
+    if (!state || state.bins !== power.length) {
+      state = this._traceState[sweepId] = {
+        bins: power.length,
+        peak: new Float32Array(power.length).fill(NaN),
+        sum: new Float64Array(power.length),
+        counts: new Uint32Array(power.length),
+        latest: null,
+      };
+    }
+    state.latest = power;
+    for (let i = 0; i < power.length; i++) {
+      const v = power[i];
+      if (v === null || !Number.isFinite(v)) continue;
+      if (Number.isNaN(state.peak[i]) || v > state.peak[i]) state.peak[i] = v;
+      state.sum[i] += v;
+      state.counts[i] += 1;
+    }
+  }
+
+  _rebuildTraceFromHistory(sweepId) {
+    delete this._traceState[sweepId];
+    const rows = this._sweepRowHistory[sweepId];
+    // Oldest first, so `latest` ends up holding the newest row - _sweepRowHistory is newest-first.
+    if (rows) for (let i = rows.length - 1; i >= 0; i--) this._updateTrace(sweepId, rows[i]);
+    this._drawTrace(sweepId);
+  }
+
+  _drawTrace(sweepId) {
+    if (!this._spectrumTraceEnabled) return;
+    const canvas = this.querySelector(`[data-sweep-trace="${CSS.escape(sweepId)}"]`);
+    const state = this._traceState[sweepId];
+    if (!canvas || !state || !state.latest) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    // The shell sizes this from the *first retained row*, which is 1 when the card is built before
+    // any row has arrived - so a sweep created while the panel is open renders its trace one pixel
+    // wide until the next rebuild. The waterfall canvas beside it corrects itself on every row for
+    // the same reason; matching that here keeps the two the same width, which the bin-to-x mapping
+    // below relies on to stay aligned with it. Assigning width also clears the bitmap, so this is
+    // only done when it actually differs.
+    if (canvas.width !== state.bins) canvas.width = state.bins;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Shares the waterfall's contrast range so the two read as one instrument: a bin at the top of
+    // this plot is the same power as a bin at the top of the colour scale beside it.
+    const lo = Math.min(this._dbMin, this._dbMax);
+    const hi = Math.max(this._dbMin, this._dbMax);
+    const span = hi - lo || 1;
+    const yFor = (db) => h - 1 - ((Math.max(lo, Math.min(hi, db)) - lo) / span) * (h - 1);
+
+    // Horizontal gridlines at 25/50/75% of the range, for judging depth at a glance.
+    ctx.strokeStyle = "rgba(128,128,128,0.22)";
+    ctx.lineWidth = 1;
+    for (const frac of [0.25, 0.5, 0.75]) {
+      const y = Math.round(h - 1 - frac * (h - 1)) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(w, y);
+      ctx.stroke();
+    }
+
+    const bins = state.bins;
+    // One canvas pixel per bin only when they happen to match; otherwise map bin -> x so the trace
+    // stays aligned with the waterfall above, which is drawn at the same width.
+    const xFor = (i) => (bins === w ? i : (i / (bins - 1 || 1)) * (w - 1));
+
+    const stroke = (valueAt, color, width) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      let drawing = false;
+      for (let i = 0; i < bins; i++) {
+        const v = valueAt(i);
+        // A gap must break the line, not be bridged: drawing straight through missing bins would
+        // invent a plausible-looking signal level across a range nothing was measured in.
+        if (v === null || v === undefined || !Number.isFinite(v)) {
+          drawing = false;
+          continue;
+        }
+        const x = xFor(i);
+        const y = yFor(v);
+        if (drawing) ctx.lineTo(x, y);
+        else {
+          ctx.moveTo(x, y);
+          drawing = true;
+        }
+      }
+      ctx.stroke();
+    };
+
+    stroke((i) => (state.counts[i] ? state.sum[i] / state.counts[i] : NaN), "#8e8e8e", 1);
+    stroke((i) => state.peak[i], "#e53935", 1);
+    stroke((i) => state.latest[i], "#1e88e5", 1.5);
   }
 
   // Finds this row's strongest bin, if it stands out enough from the row's own noise floor to

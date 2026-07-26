@@ -17,8 +17,9 @@ from constants import (
     MAX_CONSECUTIVE_READ_ERRORS,
     MAX_NATIVE_BINS,
     MAX_ROW_POINTS,
+    OVERFLOW_READ_RETRIES,
 )
-from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
+from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_OVERFLOW, SOAPY_SDR_RX
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -242,6 +243,28 @@ class SoapySweeper:
                 while (center - half_span) < config.stop_hz and not self._stop_event.is_set():
                     sdr.setFrequency(SOAPY_SDR_RX, 0, center)
                     sr = sdr.readStream(rx, [buf], FFT_SIZE, timeoutUs=2_000_000)
+                    # An overflow reports that the driver's buffers filled and were discarded, which
+                    # is what the failing read itself drains - so retrying reads fresh samples for
+                    # this same center rather than repeating a doomed call. Retried only for
+                    # OVERFLOW: a timeout or stream error says nothing was there to read, and
+                    # re-reading would just spend the timeout again.
+                    overflow_retries = 0
+                    while (
+                        sr.ret == SOAPY_SDR_OVERFLOW
+                        and overflow_retries < OVERFLOW_READ_RETRIES
+                        and not self._stop_event.is_set()
+                    ):
+                        overflow_retries += 1
+                        sr = sdr.readStream(rx, [buf], FFT_SIZE, timeoutUs=2_000_000)
+                    if overflow_retries and sr.ret > 0:
+                        # Expected and recovered, so not a warning - the pre-retry code logged one
+                        # of these every few seconds for a condition it was documenting as normal.
+                        _LOGGER.debug(
+                            "recovered from overflow at %.3f MHz after %d retr%s",
+                            center / 1e6,
+                            overflow_retries,
+                            "y" if overflow_retries == 1 else "ies",
+                        )
                     if sr.ret > 0:
                         consecutive_errors = 0
                         # A partial read still needs to produce an FFT_SIZE-bin spectrum so
