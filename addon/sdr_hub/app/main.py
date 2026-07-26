@@ -244,6 +244,17 @@ async def lifespan(app: FastAPI):
     def forget_sweep_stats(sweep_id: str) -> None:
         sweep_stats.pop(sweep_id, None)
 
+    def reset_sweep_stats(sweep_id: str) -> None:
+        """Clears the accumulator in place, so the next row starts a fresh session for this sweep.
+
+        Dropped rather than reset-in-place would work equally well here - on_row recreates it - but
+        an explicit reset keeps the intent legible and cannot race with a row arriving between the
+        pop and the recreate.
+        """
+        stats = sweep_stats.get(sweep_id)
+        if stats is not None:
+            stats.reset()
+
     def on_device(receiver_id: str, device: dict) -> None:
         # event_id/seq/received_at are assigned here, once, on the server - deliberately NOT left
         # to each client. Every open panel tab holds its own independent WebSocket subscription
@@ -280,6 +291,7 @@ async def lifespan(app: FastAPI):
         broadcaster.broadcast({"type": "status", "kind": kind, "id": entity_id, "status": status, "message": message})
 
     app.state.forget_sweep_stats = forget_sweep_stats
+    app.state.reset_sweep_stats = reset_sweep_stats
     app.state.manager = DeviceManager(loop=loop, on_row=on_row, on_device=on_device, on_status=on_status)
 
     _LOGGER.info("sdr_hub add-on ready")

@@ -170,6 +170,26 @@ def format_band(band: tuple[float, float] | None) -> str | None:
     return f"{band[0] / 1e6:.3f}-{band[1] / 1e6:.3f} MHz"
 
 
+def sweep_stat_key(band: tuple[float, float] | None, dongle_serial: str | None) -> str | None:
+    """Stable identity for one band measured by one dongle.
+
+    Keyed on what is being measured rather than on the sweep instance measuring it. A sweep id is a
+    fresh UUID every time, so stopping and restarting the same sweep produced a *new* entity while
+    the old one still held the slug - Home Assistant then appended `_2`, and every automation
+    referencing the original stopped receiving measurements. For entities whose whole purpose is
+    automation, an identity that changes on restart is not an identity.
+
+    The dongle serial is the discriminator for concurrent identical sweeps, and it is the honest
+    one: two sweeps covering the same range on different hardware are genuinely different
+    measurements, while the same range on the same dongle cannot happen at all - the add-on allows
+    one owner per dongle. Rounded to whole Hz so a float that re-serialises a fraction differently
+    cannot silently mint a second identity for the same band.
+    """
+    if band is None:
+        return None
+    return f"{round(band[0])}_{round(band[1])}_{dongle_serial or 'unknown'}"
+
+
 def decoded_device_key(device: dict[str, Any]) -> str:
     """Identity of one physical sensor: model, id and channel.
 
@@ -243,51 +263,73 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         }
         return len(registered | {uid for uid in pending if _is_decoded_unique_id(uid)})
 
+    # Keyed by the stable band+dongle identity, not the sweep id - see sweep_stat_key.
     sweep_stat_entities: dict[tuple[str, str], SdrHubSweepStatSensor] = {}
 
     @callback
-    def retire_sweep_stats(live_sweep_ids: set[str]) -> None:
-        """Removes statistic entities for sweeps that no longer exist.
+    def live_stat_keys() -> set[str]:
+        """Stable keys for every sweep currently measuring something."""
+        keys: set[str] = set()
+        for sweep in (coordinator.data or {}).get("sweeps", []):
+            if not isinstance(sweep, dict) or sweep.get("status") in TERMINAL_SWEEP_STATUSES:
+                continue
+            start, stop = sweep.get("start_hz"), sweep.get("stop_hz")
+            if not isinstance(start, (int, float)) or not isinstance(stop, (int, float)):
+                continue
+            # The *configured* range here, where the row carries the measured one. They can differ
+            # by a rounded bin, so the live set is built from whatever the entity was actually
+            # created with rather than recomputed - see stat_key_for_sweep.
+            key = stat_key_for_sweep.get(sweep.get("id"))
+            if key:
+                keys.add(key)
+        return keys
+
+    # Remembers which stable key each live sweep id produced, so retirement compares like with like
+    # rather than recomputing a band from the configured range and missing by a bin.
+    stat_key_for_sweep: dict[str, str] = {}
+
+    @callback
+    def retire_sweep_stats() -> None:
+        """Removes statistic entities for bands nothing is measuring any more.
 
         A stale occupancy reading is worse than a missing one: it looks current, and an automation
         acting on "868 MHz is busy" cannot tell that the sweep measuring it stopped an hour ago.
         The entity and its device are removed from the registry too, not merely dropped from the
         dict - otherwise every create/delete cycle leaves a permanent device behind.
         """
-        for (sweep_id, field), entity in list(sweep_stat_entities.items()):
-            if sweep_id in live_sweep_ids:
+        live_keys = live_stat_keys()
+        for (key, field), entity in list(sweep_stat_entities.items()):
+            if key in live_keys:
                 continue
-            del sweep_stat_entities[(sweep_id, field)]
+            del sweep_stat_entities[(key, field)]
             entity_id = registry.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
             if entity_id:
                 registry.async_remove(entity_id)
         # The registry is scanned too, not just this session's dict. After a restart the dict starts
-        # empty while the registry still holds every statistic entity ever created, and a sweep that
-        # disappeared while the integration was down is never repopulated by a later row - so an
-        # in-memory-only sweep would leave those entries orphaned permanently. Removing the device
-        # does not remove them either: the two registries are separate.
+        # empty while the registry still holds every statistic entity ever created, and a band that
+        # stopped being measured while the integration was down is never repopulated by a later row
+        # - so those entries would be orphaned permanently. Removing the device does not remove them
+        # either: the two registries are separate.
         prefix = f"{entry.entry_id}_sweep_"
         for registered in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
             if registered.domain != "sensor" or not registered.unique_id.startswith(prefix):
                 continue
             remainder = registered.unique_id[len(prefix) :]
-            # unique id is "<entry>_sweep_<sweep uuid>_<field>", and only the field is known to
-            # contain no underscore-delimited ambiguity - so match the field suffix rather than
-            # splitting, since a sweep id is a UUID containing hyphens but the field names do not.
-            sweep_id = next(
+            # unique id is "<entry>_sweep_<key>_<field>". Matched by field suffix rather than split
+            # on "_", because the key itself contains underscores and a dongle serial may too.
+            key = next(
                 (remainder[: -(len(field) + 1)] for field in SWEEP_STAT_FIELDS if remainder.endswith(f"_{field}")),
                 None,
             )
-            if sweep_id is None or sweep_id in live_sweep_ids:
+            if key is None or key in live_keys:
                 continue
             registry.async_remove(registered.entity_id)
         device_registry = dr.async_get(hass)
         for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
             for domain, identifier in device.identifiers:
-                prefix = f"{entry.entry_id}_sweep_"
                 if domain != DOMAIN or not identifier.startswith(prefix):
                     continue
-                if identifier[len(prefix) :] not in live_sweep_ids:
+                if identifier[len(prefix) :] not in live_keys:
                     device_registry.async_remove_device(device.id)
                 break
 
@@ -300,17 +342,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if not isinstance(sweep_id, str) or not isinstance(stats, dict):
             return
         band = sweep_band_hz(event)
+        serial = next(
+            (
+                s.get("dongle_serial")
+                for s in (coordinator.data or {}).get("sweeps", [])
+                if isinstance(s, dict) and s.get("id") == sweep_id
+            ),
+            None,
+        )
+        key = sweep_stat_key(band, serial)
+        if key is None:
+            return
+        stat_key_for_sweep[sweep_id] = key
         new_stat_entities: list[SdrHubSweepStatSensor] = []
         for field in SWEEP_STAT_FIELDS:
             value = finite_reading(stats.get(field))
             if value is None:
                 continue
-            existing = sweep_stat_entities.get((sweep_id, field))
+            existing = sweep_stat_entities.get((key, field))
             if existing is not None:
                 existing.update_reading(value, band)
                 continue
-            entity = SdrHubSweepStatSensor(entry, coordinator, sweep_id, field, value, band)
-            sweep_stat_entities[(sweep_id, field)] = entity
+            entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band)
+            sweep_stat_entities[(key, field)] = entity
             new_stat_entities.append(entity)
         if new_stat_entities:
             async_add_entities(new_stat_entities)
@@ -326,22 +380,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # DELETE route. Reconciling against the coordinator's live sweep list rather than acting on
         # the event's own id also cleans up anything missed while this listener was not attached.
         if event.get("type") in ("state_changed", "status"):
-            live = {s.get("id") for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)}
-            live = {sid for sid in live if isinstance(sid, str)}
-            # A sweep that failed at runtime stays in list_sweeps() with status "error", so
-            # reconciling against that list alone would treat it as live forever - while the add-on
-            # has already discarded its accumulator and will emit no further rows, leaving the
-            # entities frozen at their final values until someone deletes the sweep by hand.
-            # Excluded explicitly, both from the event that reports the failure and from any sweep
-            # already sitting in a terminal state.
-            live -= {
-                s.get("id")
-                for s in (coordinator.data or {}).get("sweeps", [])
-                if isinstance(s, dict) and s.get("status") in TERMINAL_SWEEP_STATUSES
-            }
+            # Keys are rebuilt from what each live sweep actually produced, so a sweep that ended -
+            # by DELETE, which emits no status event, or by erroring, which never reaches the DELETE
+            # route - drops out of the live set and its statistics are retired.
+            for gone in [sid for sid in stat_key_for_sweep if sid not in {
+                s.get("id") for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)
+            }]:
+                stat_key_for_sweep.pop(gone, None)
             if event.get("type") == "status" and event.get("kind") == "sweep" and event.get("status") in TERMINAL_SWEEP_STATUSES:
-                live.discard(event.get("id"))
-            retire_sweep_stats(live)
+                stat_key_for_sweep.pop(event.get("id"), None)
+            retire_sweep_stats()
             if event.get("type") == "status":
                 return
         if event.get("type") != "decoded_device":
@@ -485,7 +533,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         self,
         entry: ConfigEntry,
         coordinator: SdrHubCoordinator,
-        sweep_id: str,
+        stat_key: str,
         field: str,
         value: float,
         band: tuple[float, float] | None,
@@ -495,7 +543,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         self._attr_name = name
         self._attr_native_unit_of_measurement = unit
         self._attr_native_value = value
-        self._attr_unique_id = f"{entry.entry_id}_sweep_{sweep_id}_{field}"
+        self._attr_unique_id = f"{entry.entry_id}_sweep_{stat_key}_{field}"
         self._attr_icon = "mdi:chart-bell-curve-cumulative"
         self._band = band
         # Named by the band, falling back to the id only when the geometry is unavailable. The id is
@@ -505,8 +553,8 @@ class SdrHubSweepStatSensor(SensorEntity):
         # unguessable from HA's device list.
         band_label = format_band(band)
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_sweep_{sweep_id}")},
-            name=f"SDR Hub sweep {band_label}" if band_label else f"SDR Hub sweep {sweep_id[:8]}",
+            identifiers={(DOMAIN, f"{entry.entry_id}_sweep_{stat_key}")},
+            name=f"SDR Hub sweep {band_label}" if band_label else f"SDR Hub sweep {stat_key}",
             manufacturer="ha-sdr (unofficial)",
             model="Spectrum sweep",
             via_device=(DOMAIN, entry.entry_id),
@@ -546,7 +594,10 @@ class SdrHubSweepStatSensor(SensorEntity):
         the entity gives it nothing to distinguish that from a quiet, steady band. Unavailable is
         the honest state, and it is what every other integration's consumers already know to check.
         """
-        return self._coordinator.last_update_success
+        # Both halves, because they fail independently. The REST poll can keep succeeding while
+        # the event stream is down - the add-on still answers /sweeps while its WebSocket is gone -
+        # and it is the stream that carries every value these entities publish.
+        return self._coordinator.last_update_success and self._coordinator.stream_connected
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

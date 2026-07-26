@@ -3609,8 +3609,10 @@ class SdrHubPanel extends HTMLElement {
           Keep full history (scrollable) — only affects rows from now on
         </label>
         <div data-sweep-trace-wrap="${esc(s.id)}" style="${this._spectrumTraceEnabled ? "" : "display:none;"}">
+          <!-- role and label are applied by _wireMarkerPlacement, which is what makes this
+               operable - declaring role="img" here would advertise a static graphic for something
+               that accepts arrow keys, and would then be overwritten anyway. -->
           <canvas data-sweep-trace="${esc(s.id)}" width="${rowWidth}" height="${TRACE_HEIGHT_PX}"
-            role="img" aria-label="Spectrum trace: current sweep, peak hold and average power against frequency"
             style="width:100%;height:${TRACE_HEIGHT_PX}px;display:block;border-radius:8px;
             background:var(--card-background-color,#fff);"></canvas>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:.7rem;
@@ -3722,7 +3724,26 @@ class SdrHubPanel extends HTMLElement {
         // Rebuilds from retained history rather than blanking: those rows are still on screen in
         // the waterfall above, so a peak-hold that ignored them would contradict what is visible.
         // "Reset" means "forget what scrolled away", not "forget what I can still see".
-        traceReset.addEventListener("click", () => this._rebuildTraceFromHistory(s.id));
+        // Resets the add-on's accumulator as well as the local trace. They are two views of one
+        // peak hold - the red trace and the occupancy readout directly beneath it - so resetting
+        // only the local copy left them disagreeing about the same band, and left the published
+        // entities still counting a carrier the user had explicitly asked to forget.
+        traceReset.addEventListener("click", async () => {
+          const errorToken = this._errorToken || 0;
+          this._rebuildTraceFromHistory(s.id);
+          try {
+            await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
+            // Cleared locally so the readout falls back to the local figure until the next row
+            // arrives with the add-on's fresh one, rather than showing the pre-reset value.
+            delete this._sweepStats[s.id];
+            this._renderOccupancy(s.id);
+            this._clearErrorIfOwnedBy("statsReset", errorToken);
+          } catch (err) {
+            // An older add-on has no such endpoint. Say so rather than leaving the two views
+            // silently inconsistent, which is the defect this call exists to remove.
+            this._showError(`Peak hold reset locally only: ${err.message || err}`, { owner: "statsReset" });
+          }
+        });
       }
       el.querySelector(`[data-sweep-trace-csv="${CSS.escape(s.id)}"]`)
         ?.addEventListener("click", () => this._exportSpectrumCsv(s.id));
@@ -4714,6 +4735,23 @@ class SdrHubPanel extends HTMLElement {
       // one genuinely interactive part of this panel unusable by keyboard - and unlike the icon
       // buttons, there was no equivalent control to fall back on.
       canvas.setAttribute("tabindex", "0");
+      // A focus stop has to say what it is and what it does. Both canvases were reachable by Tab
+      // while one had no name or role at all and the other announced itself as a static image, so
+      // a screen reader user arriving here was told either nothing or something false - and the
+      // live region only speaks *after* a key is pressed, which means the keys had to be guessed
+      // first. role="application" is the honest choice for a graphic operated by arrow keys: it
+      // tells assistive technology to pass keystrokes through rather than consume them for its own
+      // navigation, which is exactly the arrangement this control needs.
+      canvas.setAttribute("role", "application");
+      canvas.setAttribute("aria-roledescription", "spectrum marker plot");
+      const sweep = (this._state.sweeps || []).find((x) => x.id === sweepId);
+      const bandLabel = sweep ? `${fmtMHz(sweep.start_hz)} to ${fmtMHz(sweep.stop_hz)} megahertz` : "spectrum";
+      const kind = canvas.hasAttribute("data-sweep-trace") ? "Spectrum trace" : "Waterfall";
+      canvas.setAttribute(
+        "aria-label",
+        `${kind}, ${bandLabel}. Arrow keys move the marker cursor, ` +
+          `shift or page keys move faster, Enter places a marker, Escape clears.`,
+      );
       canvas.addEventListener("keydown", (ev) => this._onMarkerKey(sweepId, ev));
       canvas.addEventListener("click", (ev) => {
         const rect = canvas.getBoundingClientRect();
@@ -4828,12 +4866,17 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     const line = (bin, color, dashed, label) => {
-      const pct = (bin / (bins - 1 || 1)) * 100;
+      // Clamped just inside the right edge. At the final bin pct is exactly 100%, which puts a
+      // zero-width element and its left border past the overlay and straight into overflow:hidden -
+      // so End, or a click on the far right, appeared to do nothing at all. With the trace hidden
+      // this overlay is the only cursor there is, which makes an invisible last bin a dead control
+      // rather than a cosmetic gap.
+      const pct = Math.min((bin / (bins - 1 || 1)) * 100, 99.9);
       return (
         `<div style="position:absolute;top:0;bottom:0;left:${pct}%;width:0;` +
         `border-left:1px ${dashed ? "dashed" : "solid"} ${color};">` +
         (label
-          ? `<span style="position:absolute;top:0;left:2px;font-size:10px;color:${color};` +
+          ? `<span style="position:absolute;top:0;${pct > 90 ? "right:2px" : "left:2px"};font-size:10px;color:${color};` +
             `background:var(--card-background-color,#fff);padding:0 2px;border-radius:2px;">${esc(label)}</span>`
           : "") +
         `</div>`

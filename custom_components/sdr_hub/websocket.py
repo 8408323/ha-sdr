@@ -202,6 +202,23 @@ async def ws_remove_sweep(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"])
 
 
+@websocket_api.websocket_command({vol.Required("type"): "sdr_hub/reset_sweep_stats", vol.Required("sweep_id"): str})
+@websocket_api.async_response
+async def ws_reset_sweep_stats(hass: HomeAssistant, connection, msg) -> None:
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    try:
+        await coordinator.api.async_reset_sweep_stats(msg["sweep_id"])
+    except SdrHubApiError as err:
+        connection.send_error(msg["id"], "reset_sweep_stats_failed", err.detail)
+        return
+    # No async_refresh: this changes no sweep the snapshot describes, only the accumulator behind
+    # the statistics, and the next row carries the reset values on the stream anyway.
+    connection.send_result(msg["id"])
+
+
 def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_state)
     websocket_api.async_register_command(hass, ws_subscribe)
@@ -209,3 +226,4 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_remove_receiver)
     websocket_api.async_register_command(hass, ws_add_sweep)
     websocket_api.async_register_command(hass, ws_remove_sweep)
+    websocket_api.async_register_command(hass, ws_reset_sweep_stats)

@@ -77,6 +77,18 @@ async def create_sweep(cfg: SweepCreate, request: Request) -> Sweep:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
 
+@router.post("/sweeps/{sweep_id}/reset_stats", status_code=204, dependencies=[Depends(verify_token)])
+async def reset_sweep_stats(sweep_id: str, request: Request) -> None:
+    """Discards a sweep's accumulated statistics without disturbing the sweep itself.
+
+    The peak hold, the running mean and the occupancy derived from them are one accumulator, so
+    "reset peak hold" has to reach it. Resetting only the panel's local copy left the plot and the
+    occupancy readout beside it disagreeing about the same band - and left the published entities,
+    which an automation reads, still counting a carrier the user had explicitly forgotten.
+    """
+    request.app.state.reset_sweep_stats(sweep_id)
+
+
 @router.delete("/sweeps/{sweep_id}", status_code=204, dependencies=[Depends(verify_token)])
 async def delete_sweep(sweep_id: str, request: Request) -> None:
     try:

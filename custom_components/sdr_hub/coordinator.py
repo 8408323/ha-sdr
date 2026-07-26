@@ -95,6 +95,12 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # even though no peer could have stayed connected either, so a recovery transmitted during
         # the restart could leave a low-battery banner asserted indefinitely.
         self.session_id = uuid.uuid4().hex
+        # Whether the add-on's event stream is currently up. Distinct from last_update_success,
+        # which reflects the REST poll: the two fail independently, and a stream-only outage is the
+        # one that matters most to push entities - the REST snapshot keeps succeeding while no rows
+        # arrive at all, so anything relying on polling health alone would keep publishing readings
+        # that stopped being measured.
+        self.stream_connected = False
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
         self._suppress_broadcast_count = 0
@@ -194,6 +200,7 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # them converge on handling it exactly once.
                         self._dispatch({"type": "stream_reconnected", "gap_id": uuid.uuid4().hex})
                     first_connection = False
+                    self._set_stream_connected(True)
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -202,8 +209,21 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise
             except Exception:  # noqa: BLE001 - reconnect on any transport failure, not just expected ones
                 _LOGGER.warning("sdr_hub WS connection lost, reconnecting in %ss", _RECONNECT_DELAY_S)
+            # Reached on a clean end of the async-for as well as on an exception, so a stream that
+            # simply closes is reported as down rather than silently leaving the last value published.
+            self._set_stream_connected(False)
             if not self._stopping:
                 await asyncio.sleep(_RECONNECT_DELAY_S)
+
+    @callback
+    def _set_stream_connected(self, connected: bool) -> None:
+        if self.stream_connected == connected:
+            return
+        self.stream_connected = connected
+        # Entities that derive availability from this only re-evaluate it when something writes
+        # their state, and a push entity's writes are exactly what stops during an outage - so the
+        # change has to be announced rather than left to be noticed.
+        self.async_update_listeners()
 
     def _dispatch(self, event: dict[str, Any]) -> None:
         for listener in list(self._event_listeners):
