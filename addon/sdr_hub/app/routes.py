@@ -86,7 +86,12 @@ async def reset_sweep_stats(sweep_id: str, request: Request) -> None:
     occupancy readout beside it disagreeing about the same band - and left the published entities,
     which an automation reads, still counting a carrier the user had explicitly forgotten.
     """
-    request.app.state.reset_sweep_stats(sweep_id)
+    if not request.app.state.reset_sweep_stats(sweep_id):
+        # 404 rather than a silent 204. A sweep that has errored had its accumulator discarded
+        # already and will emit no further rows, so there is no boundary for the panel to observe -
+        # and the panel deliberately waits for that boundary before clearing. Reporting success for
+        # a reset that cannot happen left the button doing nothing at all, with nothing to say so.
+        raise HTTPException(status_code=404, detail=f"No live statistics for sweep {sweep_id}")
 
 
 @router.delete("/sweeps/{sweep_id}", status_code=204, dependencies=[Depends(verify_token)])

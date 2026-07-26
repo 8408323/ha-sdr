@@ -1013,6 +1013,15 @@ const MARKER_KEYS = new Set([
 // be shown rather than retried forever behind a "starting" notice that would never resolve.
 const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
 
+// Whether a rejection means "this build does not have that command" rather than "the command was
+// refused or failed". Only the first justifies acting locally instead: the others leave real server
+// state in place that a local change would contradict.
+function isUnsupportedCommand(err) {
+  if (err && err.code === "unknown_command") return true;
+  const message = String((err && err.message) || err || "").toLowerCase();
+  return message.includes("unknown command");
+}
+
 function isIntegrationNotReady(err) {
   if (err && INTEGRATION_NOT_READY_CODES.has(err.code)) return true;
   // Fallback for transports that surface only a message. Matched loosely on purpose: the code is
@@ -3775,13 +3784,19 @@ class SdrHubPanel extends HTMLElement {
             await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
             this._clearErrorIfOwnedBy("statsReset", errorToken);
           } catch (err) {
-            // An add-on too old to have the endpoint publishes no statistics either, so there is no
-            // served view to fall out of step with - the inconsistency this command exists to
-            // prevent cannot arise, and the mixed-version case is already supported by the local
-            // fallback in _renderOccupancy. Clearing locally therefore keeps the button working
-            // rather than leaving it inert, which is what refusing outright had made it.
-            this._clearTraceState(s.id);
-            this._showError(`Reset applied locally only: ${err.message || err}`, { owner: "statsReset" });
+            // Only the add-on-too-old case falls back to a local clear. An add-on without the
+            // endpoint publishes no statistics either, so there is no served view to diverge from -
+            // but that reasoning holds for *that* rejection alone. Every other failure means the
+            // server accumulator, the served occupancy and the entities all still hold their old
+            // values, so clearing locally would manufacture the disagreement this command exists to
+            // prevent: a non-admin denied by require_admin, or a transient error from a healthy
+            // add-on, would silently desync their panel from everyone else's.
+            if (isUnsupportedCommand(err)) {
+              this._clearTraceState(s.id);
+              this._showError(`Reset applied locally only: ${err.message || err}`, { owner: "statsReset" });
+            } else {
+              this._showError(`Could not reset peak hold: ${err.message || err}`, { owner: "statsReset" });
+            }
             return;
           }
           // Deliberately nothing local here. The clear happens when the add-on's next row carries

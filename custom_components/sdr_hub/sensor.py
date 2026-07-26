@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -292,50 +293,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     @callback
     def retire_sweep_stats(just_ended: set[str] | None = None) -> None:
-        """Removes statistic entities for bands nothing is measuring any more.
+        """Marks statistics unavailable when their band stops being measured.
 
-        A stale occupancy reading is worse than a missing one: it looks current, and an automation
-        acting on "868 MHz is busy" cannot tell that the sweep measuring it stopped an hour ago.
-        The entity and its device are removed from the registry too, not merely dropped from the
-        dict - otherwise every create/delete cycle leaves a permanent device behind.
+        Nothing is removed from either registry any more. Two separate P1s came from deleting
+        registry records on retirement: the device record, whose internal id automations target and
+        which HA re-mints on recreation, and then the entity records, which carry the user's renamed
+        entity id and every customisation applied to it. Both were destroyed by a routine sweep
+        stop, and both broke automations silently while every identity the code controls stayed
+        stable - which is the tell that deletion was the wrong mechanism, not that its details were
+        wrong.
+
+        What the retirement was ever for is that a stopped sweep must not keep publishing a reading
+        as though it were current. Unavailable says exactly that, and says it without discarding
+        anything the user owns. A band never measured again leaves three unavailable entities the
+        user can delete deliberately, which is a cost they can see and undo.
         """
-        live_keys = live_stat_keys() - (just_ended or set())
-        for (key, field), entity in list(sweep_stat_entities.items()):
-            if key in live_keys:
-                continue
-            del sweep_stat_entities[(key, field)]
-            entity_id = registry.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
-            if entity_id:
-                registry.async_remove(entity_id)
-        # The registry is scanned too, not just this session's dict. After a restart the dict starts
-        # empty while the registry still holds every statistic entity ever created, and a band that
-        # stopped being measured while the integration was down is never repopulated by a later row
-        # - so those entries would be orphaned permanently. Removing the device does not remove them
-        # either: the two registries are separate.
-        prefix = f"{entry.entry_id}_sweep_"
-        for registered in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
-            if registered.domain != "sensor" or not registered.unique_id.startswith(prefix):
-                continue
-            remainder = registered.unique_id[len(prefix) :]
-            # unique id is "<entry>_sweep_<key>_<field>". Matched by field suffix rather than split
-            # on "_", because the key itself contains underscores and a dongle serial may too.
-            key = next(
-                (remainder[: -(len(field) + 1)] for field in SWEEP_STAT_FIELDS if remainder.endswith(f"_{field}")),
-                None,
-            )
-            if key is None or key in live_keys:
-                continue
-            registry.async_remove(registered.entity_id)
-        # The device record is deliberately kept. Its identity is stable across a sweep restart by
-        # design - that is the whole point of keying on the configuration - but Home Assistant mints
-        # a *new* internal device id when a removed device is recreated from the same DeviceInfo,
-        # and automations target that internal id. Deleting it on ordinary retirement therefore
-        # undid the stability it was introduced to provide: the unique ids matched, the entity ids
-        # matched, and every device-targeted automation silently stopped firing.
-        #
-        # A device left behind with no entities is visible and removable in the UI, which is a far
-        # smaller cost than an automation that fails without saying so. Its entities are still
-        # retired above, so nothing stale is published either way.
+        nonlocal live_keys_cache
+        live_keys_cache = live_stat_keys() - (just_ended or set())
+        for entity in sweep_stat_entities.values():
+            entity.async_write_ha_state_if_added()
+
+    # The set of keys currently being measured, recomputed on every reconciliation and read by each
+    # entity's availability. Held here rather than recomputed per entity so one snapshot decides
+    # them all consistently.
+    live_keys_cache: set[str] = set()
+
+    @callback
+    def is_measuring(key: str) -> bool:
+        return key in live_keys_cache
 
     @callback
     def handle_sweep_stats(event: dict[str, Any]) -> None:
@@ -364,7 +349,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if existing is not None:
                 existing.update_reading(value, band)
                 continue
-            entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band)
+            entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band, is_measuring)
             sweep_stat_entities[(key, field)] = entity
             new_stat_entities.append(entity)
         if new_stat_entities:
@@ -552,8 +537,11 @@ class SdrHubSweepStatSensor(SensorEntity):
         field: str,
         value: float,
         band: tuple[float, float] | None,
+        is_measuring: Callable[[str], bool],
     ) -> None:
         self._coordinator = coordinator
+        self._stat_key = stat_key
+        self._is_measuring = is_measuring
         self._last_written: datetime | None = None
         name, unit = SWEEP_STAT_FIELDS[field]
         self._attr_name = name
@@ -575,6 +563,12 @@ class SdrHubSweepStatSensor(SensorEntity):
             model="Spectrum sweep",
             via_device=(DOMAIN, entry.entry_id),
         )
+
+    @callback
+    def async_write_ha_state_if_added(self) -> None:
+        """Re-evaluates availability, for entities that may not be added to hass yet."""
+        if self.hass is not None:
+            self.async_write_ha_state()
 
     @callback
     def update_reading(self, value: float, band: tuple[float, float] | None = None) -> None:
@@ -618,10 +612,16 @@ class SdrHubSweepStatSensor(SensorEntity):
         the entity gives it nothing to distinguish that from a quiet, steady band. Unavailable is
         the honest state, and it is what every other integration's consumers already know to check.
         """
-        # Both halves, because they fail independently. The REST poll can keep succeeding while
-        # the event stream is down - the add-on still answers /sweeps while its WebSocket is gone -
-        # and it is the stream that carries every value these entities publish.
-        return self._coordinator.last_update_success and self._coordinator.stream_connected
+        # Three conditions, because each can fail without the others. The REST poll can keep
+        # succeeding while the event stream is down - the add-on still answers /sweeps while its
+        # WebSocket is gone - and both can be healthy while the sweep that produced this reading has
+        # stopped. The last is what replaced deleting the entity: it says "this is not being
+        # measured" without destroying the user's renamed entity id along with it.
+        return (
+            self._coordinator.last_update_success
+            and self._coordinator.stream_connected
+            and self._is_measuring(self._stat_key)
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

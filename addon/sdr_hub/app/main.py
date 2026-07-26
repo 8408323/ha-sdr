@@ -244,7 +244,7 @@ async def lifespan(app: FastAPI):
     def forget_sweep_stats(sweep_id: str) -> None:
         sweep_stats.pop(sweep_id, None)
 
-    def reset_sweep_stats(sweep_id: str) -> None:
+    def reset_sweep_stats(sweep_id: str) -> bool:
         """Clears the accumulator in place, so the next row starts a fresh session for this sweep.
 
         Dropped rather than reset-in-place would work equally well here - on_row recreates it - but
@@ -252,8 +252,10 @@ async def lifespan(app: FastAPI):
         pop and the recreate.
         """
         stats = sweep_stats.get(sweep_id)
-        if stats is not None:
-            stats.reset()
+        if stats is None:
+            return False
+        stats.reset()
+        return True
 
     def on_device(receiver_id: str, device: dict) -> None:
         # event_id/seq/received_at are assigned here, once, on the server - deliberately NOT left
