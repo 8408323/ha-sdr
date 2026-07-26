@@ -221,6 +221,15 @@ async def lifespan(app: FastAPI):
     sweep_stats: dict[str, SweepStats] = {}
 
     def on_row(sweep_id: str, row: SweepRow) -> None:
+        # A capture thread can have queued this callback through call_soon_threadsafe before the
+        # sweep was deleted, so it runs after delete_sweep has already forgotten the accumulator.
+        # Recreating it here would resurrect state nothing will ever reach again - normal deletion
+        # emits no later status event - leaking one set of per-bin arrays per delete, and would
+        # broadcast a row for a sweep the panel has already removed, repopulating its history after
+        # the deletion refresh. The manager is the authority on what still exists.
+        manager = getattr(app.state, "manager", None)
+        if manager is not None and not any(s.id == sweep_id for s in manager.list_sweeps()):
+            return
         stats = sweep_stats.get(sweep_id)
         if stats is None:
             stats = sweep_stats[sweep_id] = SweepStats()

@@ -1017,15 +1017,15 @@ const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
 // refused or failed". Only the first justifies acting locally instead: the others leave real server
 // state in place that a local change would contradict.
 function isUnsupportedCommand(err) {
-  // Two distinct mixed-version shapes, because the integration and the add-on update
-  // independently. "unknown_command" is Home Assistant refusing a command this *integration* does
-  // not register; "unsupported_by_addon" is the integration reporting that the *add-on* has no
-  // such endpoint. Only checking the first missed the case the local fallback was reinstated for -
-  // an integration upgraded ahead of its add-on - since the browser-facing command exists there
-  // and HA answers happily.
-  if (err && (err.code === "unknown_command" || err.code === "unsupported_by_addon")) return true;
-  const message = String((err && err.message) || err || "").toLowerCase();
-  return message.includes("unknown command");
+  // Only the integration's own report that the *add-on* lacks the endpoint. "unknown_command" is
+  // deliberately excluded: this same file already classifies it as integration-not-ready, because
+  // it is what Home Assistant answers during the window after a restart when the frontend socket
+  // is back but the config entry has not registered its commands yet. Treating it as a permanent
+  // version mismatch would clear the panel's trace during an ordinary restart while a perfectly
+  // current add-on still held and was about to republish the accumulator - inventing the
+  // disagreement this whole path exists to avoid, from a condition that resolves itself in
+  // seconds.
+  return !!err && err.code === "unsupported_by_addon";
 }
 
 function isIntegrationNotReady(err) {
@@ -3800,8 +3800,15 @@ class SdrHubPanel extends HTMLElement {
             if (isUnsupportedCommand(err)) {
               this._clearTraceState(s.id);
               this._showError(`Reset applied locally only: ${err.message || err}`, { owner: "statsReset" });
+            } else if (isIntegrationNotReady(err)) {
+              // Transient: the integration is still starting up, so nothing was reset anywhere and
+              // the same click will work in a moment. Says so rather than reporting a failure the
+              // user cannot act on, and leaves local state alone.
+              this._showError("SDR Hub is still starting up - try the reset again in a moment.", {
+                owner: "statsReset",
+              });
             } else {
-              this._showError(`Could not reset peak hold: ${err.message || err}`, { owner: "statsReset" });
+              this._showError(`Could not reset statistics: ${err.message || err}`, { owner: "statsReset" });
             }
             return;
           }

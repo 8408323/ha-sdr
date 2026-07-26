@@ -363,14 +363,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # The configured band, matching the key. Labelling a device with the measured range while
         # filing it under the configured one would show two different bands for one thing.
         band = sweep_configured_band(sweep)
-        value_source[key] = sweep_id
-        # A new generation means the add-on reset its accumulator, so the values in this row are
-        # discontinuous with the previous ones. The throttle exists to smooth a fast stream of
-        # similar readings; holding back the first row after a reset would leave the entity showing
-        # the pre-reset figure for up to the throttle interval, right when a user has just asked
-        # for it to be cleared and is looking at it.
+        # Prefers the driver+serial the add-on identifies hardware by; falls back to whichever half
+        # is present, since some supported devices report no serial at all.
+        dongle_label = " ".join(
+            part for part in (sweep.get("dongle_driver"), sweep.get("dongle_serial")) if part
+        ) or None
+        # Two kinds of discontinuity, and either must reach Home Assistant at once rather than
+        # waiting out the throttle. A new generation means the add-on reset its accumulator - the
+        # user asked for a clear and is looking at the figure. A change of *producing sweep* means
+        # a replacement sweep took over this band: its first row is what makes the entity available
+        # again, and a fresh accumulator reports generation 0 exactly as the old one did, so
+        # comparing generations alone would leave the entity showing "unavailable" until a later
+        # row happened to fall outside the interval.
         generation = stats.get("generation")
-        forced = generation is not None and last_generation.get(key) != generation
+        replaced = value_source.get(key) != sweep_id
+        forced = replaced or (generation is not None and last_generation.get(key) != generation)
+        value_source[key] = sweep_id
         if generation is not None:
             last_generation[key] = generation
         new_stat_entities: list[SdrHubSweepStatSensor] = []
@@ -382,7 +390,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if existing is not None:
                 existing.update_reading(value, band, force=forced)
                 continue
-            entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band, is_measuring)
+            entity = SdrHubSweepStatSensor(entry, coordinator, key, field, value, band, is_measuring, dongle_label)
             sweep_stat_entities[(key, field)] = entity
             new_stat_entities.append(entity)
         if new_stat_entities:
@@ -410,17 +418,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 and event.get("kind") == "sweep"
                 and event.get("status") in TERMINAL_SWEEP_STATUSES
             ):
-                key = sweep_stat_key(
-                    next(
-                        (
-                            s
-                            for s in (coordinator.data or {}).get("sweeps", [])
-                            if isinstance(s, dict) and s.get("id") == event.get("id")
-                        ),
-                        None,
-                    )
+                sweeps = [s for s in (coordinator.data or {}).get("sweeps", []) if isinstance(s, dict)]
+                ended_id = event.get("id")
+                key = sweep_stat_key(next((s for s in sweeps if s.get("id") == ended_id), None))
+                # Only if no *other* live sweep already owns this key. A status message can be
+                # delayed in the add-on's queue while a replacement sweep for the same band is
+                # created and its REST refresh reconciles the key as live - subtracting the key
+                # unconditionally would then mark the replacement's already-current entities
+                # unavailable, and nothing would restore them until an unrelated state refresh.
+                # The event says a sweep ended, not that the band stopped being measured.
+                taken_over = any(
+                    s.get("id") != ended_id
+                    and s.get("status") not in TERMINAL_SWEEP_STATUSES
+                    and sweep_stat_key(s) == key
+                    for s in sweeps
                 )
-                if key:
+                if key and not taken_over:
                     ended.add(key)
             retire_sweep_stats(ended)
             if event.get("type") == "status":
@@ -571,6 +584,7 @@ class SdrHubSweepStatSensor(SensorEntity):
         value: float,
         band: tuple[float, float] | None,
         is_measuring: Callable[[str], bool],
+        dongle: str | None,
     ) -> None:
         self._coordinator = coordinator
         self._stat_key = stat_key
@@ -589,9 +603,17 @@ class SdrHubSweepStatSensor(SensorEntity):
         # 868 MHz" is exactly what someone writing that automation needs, and the UUID prefix is
         # unguessable from HA's device list.
         band_label = format_band(band)
+        # The dongle is part of the name, not only of the key. Two dongles sweeping the same band
+        # concurrently is a supported configuration, and the key keeps their statistics correctly
+        # separate - but a band-only name gave both devices identical labels, so the UI offered two
+        # indistinguishable sets of "Noise floor", "Peak" and "Band occupancy" with nothing to
+        # choose between them except an opaque entity-id suffix. An identity that is correct
+        # internally and invisible in the interface does not help the person picking a sensor.
+        self._dongle = dongle
+        dongle_label = f" on {dongle}" if dongle else ""
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{entry.entry_id}_sweep_{stat_key}")},
-            name=f"SDR Hub sweep {band_label}" if band_label else f"SDR Hub sweep {stat_key}",
+            name=f"SDR Hub sweep {band_label}{dongle_label}" if band_label else f"SDR Hub sweep {stat_key}",
             manufacturer="ha-sdr (unofficial)",
             model="Spectrum sweep",
             via_device=(DOMAIN, entry.entry_id),
@@ -660,6 +682,9 @@ class SdrHubSweepStatSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         # Machine-readable alongside the human-readable device name: a template picking the right
         # occupancy sensor needs numbers to compare, not a formatted label to parse.
-        if self._band is None:
-            return {}
-        return {"start_hz": self._band[0], "stop_hz": self._band[1], "band": format_band(self._band)}
+        attrs: dict[str, Any] = {}
+        if self._band is not None:
+            attrs |= {"start_hz": self._band[0], "stop_hz": self._band[1], "band": format_band(self._band)}
+        if self._dongle:
+            attrs["dongle"] = self._dongle
+        return attrs
