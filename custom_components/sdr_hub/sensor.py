@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -291,7 +291,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         return keys
 
     @callback
-    def retire_sweep_stats() -> None:
+    def retire_sweep_stats(just_ended: set[str] | None = None) -> None:
         """Removes statistic entities for bands nothing is measuring any more.
 
         A stale occupancy reading is worse than a missing one: it looks current, and an automation
@@ -299,7 +299,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         The entity and its device are removed from the registry too, not merely dropped from the
         dict - otherwise every create/delete cycle leaves a permanent device behind.
         """
-        live_keys = live_stat_keys()
+        live_keys = live_stat_keys() - (just_ended or set())
         for (key, field), entity in list(sweep_stat_entities.items()):
             if key in live_keys:
                 continue
@@ -326,14 +326,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             if key is None or key in live_keys:
                 continue
             registry.async_remove(registered.entity_id)
-        device_registry = dr.async_get(hass)
-        for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
-            for domain, identifier in device.identifiers:
-                if domain != DOMAIN or not identifier.startswith(prefix):
-                    continue
-                if identifier[len(prefix) :] not in live_keys:
-                    device_registry.async_remove_device(device.id)
-                break
+        # The device record is deliberately kept. Its identity is stable across a sweep restart by
+        # design - that is the whole point of keying on the configuration - but Home Assistant mints
+        # a *new* internal device id when a removed device is recreated from the same DeviceInfo,
+        # and automations target that internal id. Deleting it on ordinary retirement therefore
+        # undid the stability it was introduced to provide: the unique ids matched, the entity ids
+        # matched, and every device-targeted automation silently stopped firing.
+        #
+        # A device left behind with no entities is visible and removable in the UI, which is a far
+        # smaller cost than an automation that fails without saying so. Its entities are still
+        # retired above, so nothing stale is published either way.
 
     @callback
     def handle_sweep_stats(event: dict[str, Any]) -> None:
@@ -379,11 +381,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         # DELETE route. Reconciling against the coordinator's live sweep list rather than acting on
         # the event's own id also cleans up anything missed while this listener was not attached.
         if event.get("type") in ("state_changed", "status"):
-            # Reconciled purely from the coordinator snapshot, with nothing remembered between
-            # events. A sweep that ended is either absent from it or carries a terminal status, and
-            # live_stat_keys handles both - so a restart, where nothing has been remembered yet,
-            # reconciles correctly instead of retiring every running sweep's entities.
-            retire_sweep_stats()
+            # The snapshot is the base, but a raw status event arrives *without* it having been
+            # updated: DeviceManager reports an unexpected failure straight to subscribers, so
+            # coordinator.data still carries the sweep's pre-error status and reconciling from it
+            # alone would keep all three entities publishing until a later poll. The event names
+            # the sweep that just stopped, so it is used directly rather than waited for.
+            ended: set[str] = set()
+            if (
+                event.get("type") == "status"
+                and event.get("kind") == "sweep"
+                and event.get("status") in TERMINAL_SWEEP_STATUSES
+            ):
+                key = sweep_stat_key(
+                    next(
+                        (
+                            s
+                            for s in (coordinator.data or {}).get("sweeps", [])
+                            if isinstance(s, dict) and s.get("id") == event.get("id")
+                        ),
+                        None,
+                    )
+                )
+                if key:
+                    ended.add(key)
+            retire_sweep_stats(ended)
             if event.get("type") == "status":
                 return
         if event.get("type") != "decoded_device":

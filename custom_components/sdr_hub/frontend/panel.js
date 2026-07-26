@@ -3527,7 +3527,15 @@ class SdrHubPanel extends HTMLElement {
       (this._state.sweeps || []).filter((s) => !TERMINAL_SWEEP_STATUSES.has(s.status)).map((s) => s.id),
     );
     for (const id of Object.keys(this._sweepStats)) {
-      if (!measuringIds.has(id)) delete this._sweepStats[id];
+      if (!measuringIds.has(id)) {
+        delete this._sweepStats[id];
+        // Re-rendered here, not left to the normal render path. A sweep going terminal changes its
+        // status but not the set of sweep ids, so the memoised early return below patches only the
+        // status label - and with no further rows arriving, the already-drawn occupancy figure
+        // would stay on screen indefinitely, looking exactly as current as a live one. Deleting the
+        // backing value is not the same as removing what was drawn from it.
+        this._renderOccupancy(id);
+      }
     }
     for (const id of Object.keys(this._statsGen)) {
       if (!activeIds.has(id)) delete this._statsGen[id];
@@ -3767,10 +3775,13 @@ class SdrHubPanel extends HTMLElement {
             await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
             this._clearErrorIfOwnedBy("statsReset", errorToken);
           } catch (err) {
-            // An older add-on has no such endpoint, so nothing was reset anywhere. Say so rather
-            // than clearing locally and leaving the two views inconsistent - which is the defect
-            // this call exists to remove.
-            this._showError(`Could not reset peak hold: ${err.message || err}`, { owner: "statsReset" });
+            // An add-on too old to have the endpoint publishes no statistics either, so there is no
+            // served view to fall out of step with - the inconsistency this command exists to
+            // prevent cannot arise, and the mixed-version case is already supported by the local
+            // fallback in _renderOccupancy. Clearing locally therefore keeps the button working
+            // rather than leaving it inert, which is what refusing outright had made it.
+            this._clearTraceState(s.id);
+            this._showError(`Reset applied locally only: ${err.message || err}`, { owner: "statsReset" });
             return;
           }
           // Deliberately nothing local here. The clear happens when the add-on's next row carries
