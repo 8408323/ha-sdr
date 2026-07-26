@@ -95,6 +95,16 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # even though no peer could have stayed connected either, so a recovery transmitted during
         # the restart could leave a low-battery banner asserted indefinitely.
         self.session_id = uuid.uuid4().hex
+        # Whether the add-on's event stream is currently up. Distinct from last_update_success,
+        # which reflects the REST poll: the two fail independently, and a stream-only outage is the
+        # one that matters most to push entities - the REST snapshot keeps succeeding while no rows
+        # arrive at all, so anything relying on polling health alone would keep publishing readings
+        # that stopped being measured.
+        self.stream_connected = False
+        # Incremented on each successful (re)connection of the add-on event stream. Consumers that
+        # cache a value delivered over the stream can compare it and treat anything from an earlier
+        # connection as stale, since a gap may have hidden any number of updates.
+        self.stream_epoch = 0
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._stopping = False
         self._suppress_broadcast_count = 0
@@ -194,16 +204,59 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # them converge on handling it exactly once.
                         self._dispatch({"type": "stream_reconnected", "gap_id": uuid.uuid4().hex})
                     first_connection = False
+                    # The snapshot is refreshed *before* the stream is reported up. Opening the
+                    # WebSocket succeeds the moment a restarted add-on is listening, while
+                    # coordinator.data still describes the process that died - so marking the
+                    # stream connected first re-enabled the statistic entities against sweeps that
+                    # no longer exist, republishing their last readings as current for up to a
+                    # polling interval. Availability should not return before the state behind it
+                    # is true.
+                    await self.async_refresh()
+                    self._advance_stream_epoch()
+                    self._set_stream_connected(True)
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            self._dispatch(_sanitize_event(msg.json()))
+                            event = _sanitize_event(msg.json())
+                            # A stream_gap means the add-on's per-client queue overflowed and
+                            # discarded an unsent message - the socket never closed, so the
+                            # reconnect path below never runs and nothing else marks what was
+                            # already delivered as stale. It is the same loss of continuity as a
+                            # reconnect and has to advance the same boundary, or a consumer that
+                            # missed a reset or a terminal update keeps publishing what it last saw.
+                            if isinstance(event, dict) and event.get("type") == "stream_gap":
+                                self._advance_stream_epoch()
+                            self._dispatch(event)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - reconnect on any transport failure, not just expected ones
                 _LOGGER.warning("sdr_hub WS connection lost, reconnecting in %ss", _RECONNECT_DELAY_S)
+            # Reached on a clean end of the async-for as well as on an exception, so a stream that
+            # simply closes is reported as down rather than silently leaving the last value published.
+            self._set_stream_connected(False)
             if not self._stopping:
                 await asyncio.sleep(_RECONNECT_DELAY_S)
+
+    @callback
+    def _advance_stream_epoch(self) -> None:
+        """Marks everything delivered so far as belonging to a closed epoch.
+
+        Announced immediately rather than left for the next update: a push entity only re-evaluates
+        availability when something writes its state, and a gap is precisely a period in which
+        nothing did.
+        """
+        self.stream_epoch += 1
+        self.async_update_listeners()
+
+    @callback
+    def _set_stream_connected(self, connected: bool) -> None:
+        if self.stream_connected == connected:
+            return
+        self.stream_connected = connected
+        # Entities that derive availability from this only re-evaluate it when something writes
+        # their state, and a push entity's writes are exactly what stops during an outage - so the
+        # change has to be announced rather than left to be noticed.
+        self.async_update_listeners()
 
     def _dispatch(self, event: dict[str, Any]) -> None:
         for listener in list(self._event_listeners):

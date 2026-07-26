@@ -202,6 +202,34 @@ async def ws_remove_sweep(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"])
 
 
+# require_admin, like every other command that mutates add-on state. The panel's reset used to be
+# local to one tab; now it clears an accumulator shared by every viewer and moves the HA sensor
+# values automations consume, so a dashboard viewer must not be able to alter measurements for
+# everyone. Widening what a command does without revisiting who may call it is how an authorization
+# boundary silently moves.
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "sdr_hub/reset_sweep_stats", vol.Required("sweep_id"): str})
+@websocket_api.async_response
+async def ws_reset_sweep_stats(hass: HomeAssistant, connection, msg) -> None:
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    try:
+        await coordinator.api.async_reset_sweep_stats(msg["sweep_id"])
+    except SdrHubApiError as err:
+        # A 404 here means the add-on has no such route - the integration has been upgraded ahead
+        # of it. That is the one failure the panel may answer by clearing locally, and it needs a
+        # code of its own: the browser-facing command exists, so HA never reports "unknown command"
+        # and the panel could not otherwise tell this apart from a refusal or a real error.
+        code = "unsupported_by_addon" if err.status == 404 else "reset_sweep_stats_failed"
+        connection.send_error(msg["id"], code, err.detail)
+        return
+    # No async_refresh: this changes no sweep the snapshot describes, only the accumulator behind
+    # the statistics, and the next row carries the reset values on the stream anyway.
+    connection.send_result(msg["id"])
+
+
 def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_state)
     websocket_api.async_register_command(hass, ws_subscribe)
@@ -209,3 +237,4 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_remove_receiver)
     websocket_api.async_register_command(hass, ws_add_sweep)
     websocket_api.async_register_command(hass, ws_remove_sweep)
+    websocket_api.async_register_command(hass, ws_reset_sweep_stats)

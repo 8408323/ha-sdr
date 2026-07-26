@@ -65,6 +65,9 @@ class SdrHubApiClient:
     async def async_remove_sweep(self, sweep_id: str) -> None:
         await self._request("DELETE", f"/sweeps/{sweep_id}")
 
+    async def async_reset_sweep_stats(self, sweep_id: str) -> None:
+        await self._request("POST", f"/sweeps/{sweep_id}/reset_stats")
+
     async def _request(self, method: str, path: str, *, json: dict | None = None, auth: bool = True) -> Any:
         headers = self._headers if auth else None
         async with self._session.request(method, f"{self._base_url}{path}", json=json, headers=headers) as resp:

@@ -77,10 +77,34 @@ async def create_sweep(cfg: SweepCreate, request: Request) -> Sweep:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
 
+@router.post("/sweeps/{sweep_id}/reset_stats", status_code=204, dependencies=[Depends(verify_token)])
+async def reset_sweep_stats(sweep_id: str, request: Request) -> None:
+    """Discards a sweep's accumulated statistics without disturbing the sweep itself.
+
+    The peak hold, the running mean and the occupancy derived from them are one accumulator, so
+    "reset peak hold" has to reach it. Resetting only the panel's local copy left the plot and the
+    occupancy readout beside it disagreeing about the same band - and left the published entities,
+    which an automation reads, still counting a carrier the user had explicitly forgotten.
+    """
+    if not request.app.state.reset_sweep_stats(sweep_id):
+        # 404 rather than a silent 204. A sweep that has errored had its accumulator discarded
+        # already and will emit no further rows, so there is no boundary for the panel to observe -
+        # and the panel deliberately waits for that boundary before clearing. Reporting success for
+        # a reset that cannot happen left the button doing nothing at all, with nothing to say so.
+        # 409, not 404. A 404 from this route must mean one thing only - "this add-on has no such
+        # endpoint" - so an integration talking to an older add-on can recognise the mixed-version
+        # case without parsing error text. "The sweep has no live accumulator" is a conflict with
+        # current state, which is what 409 says.
+        raise HTTPException(status_code=409, detail=f"No live statistics for sweep {sweep_id}")
+
+
 @router.delete("/sweeps/{sweep_id}", status_code=204, dependencies=[Depends(verify_token)])
 async def delete_sweep(sweep_id: str, request: Request) -> None:
     try:
         await request.app.state.manager.remove_sweep(sweep_id)
+        # Only after the removal actually succeeded - a SweepStopTimeoutError below leaves the sweep
+        # and its dongle claim in place, so its statistics are still live and must not be discarded.
+        request.app.state.forget_sweep_stats(sweep_id)
     except SweepStopTimeoutError as err:
         # The sweeper thread didn't exit in time and may still hold the dongle open;
         # the sweep/claim are deliberately left in place by DeviceManager, so surface

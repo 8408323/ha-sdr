@@ -39,6 +39,30 @@ MAX_CONSECUTIVE_READ_ERRORS: int = 10
 # quiet band rather than as missing data.
 OVERFLOW_READ_RETRIES: int = 2
 
+# A bin counts as "occupied" when its session peak stands this far above the estimated noise floor.
+# Matches the panel's per-row peak-callout threshold: two different answers to "is this a real
+# signal" would let two readouts disagree about the same bin.
+OCCUPANCY_MIN_DELTA_DB: float = 6.0
+
+# Which quantile of the per-bin averages is taken as the noise floor.
+#
+# The median is only the noise floor while noise is the majority of the band. Once persistent
+# carriers occupy half the bins the median *is* a carrier level, and adding the threshold to it then
+# classifies those carriers as unoccupied - reporting 0% on precisely the busy band this statistic
+# exists to detect. A quantile below the occupied population avoids that, at the cost of sitting
+# below the true floor on a quiet band and calling some noise occupied. The two errors pull in
+# opposite directions, so the value is a measured compromise rather than a preference:
+#
+#   band 60% occupied      median -> 0.0% (wrong)   q=0.25 -> 60.0%   q=0.10 -> 60.0%
+#   quiet, one row, s=2dB  median -> 0.1%           q=0.25 -> 0.9%    q=0.10 -> 4.6%
+#   quiet, 200 rows        median -> 0.0%           q=0.25 -> 0.0%    q=0.10 -> 0.0%
+#
+# 0.25 takes almost all of the busy-band correction for a fraction of the quiet-band cost, and
+# holds until carriers exceed 75% of the band. The last row is what actually ships: these are
+# averages over every row of the session, so per-bin spread falls as sqrt(N) and the single-row
+# figures above are a worst case seen only in the first moments of a sweep.
+NOISE_FLOOR_QUANTILE: float = 0.25
+
 # rtl_433 receiver defaults (ReceiverCreate / ReceiverConfig).
 DEFAULT_HOP_INTERVAL_S: int = 10
 

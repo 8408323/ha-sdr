@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from models import EntityKind, EntityStatus
 from routes import router
 from scanner import SweepRow
+from sweep_stats import SweepStats
 
 _LOGGER = logging.getLogger("sdr_hub")
 
@@ -215,16 +216,61 @@ async def lifespan(app: FastAPI):
     # pushed to an executor, since that is the part that would block the loop.
     event_seq = itertools.count(resolve_seq_seed())
 
+    # One accumulator per sweep id. Dropped when the sweep is, so a restarted sweep starts a fresh
+    # session rather than inheriting statistics gathered at a frequency range it no longer covers.
+    sweep_stats: dict[str, SweepStats] = {}
+
     def on_row(sweep_id: str, row: SweepRow) -> None:
-        broadcaster.broadcast(
-            {
-                "type": "sweep_row",
-                "sweep_id": sweep_id,
-                "start_hz": row.start_hz,
-                "bin_hz": row.bin_hz,
-                "power_db": row.power_db,
-            }
-        )
+        # A capture thread can have queued this callback through call_soon_threadsafe before the
+        # sweep was deleted, so it runs after delete_sweep has already forgotten the accumulator.
+        # Recreating it here would resurrect state nothing will ever reach again - normal deletion
+        # emits no later status event - leaking one set of per-bin arrays per delete, and would
+        # broadcast a row for a sweep the panel has already removed, repopulating its history after
+        # the deletion refresh. The manager is the authority on what still exists.
+        manager = getattr(app.state, "manager", None)
+        if manager is not None and not any(s.id == sweep_id for s in manager.list_sweeps()):
+            return
+        stats = sweep_stats.get(sweep_id)
+        if stats is None:
+            stats = sweep_stats[sweep_id] = SweepStats()
+        stats.update(row.power_db)
+        payload = {
+            "type": "sweep_row",
+            "sweep_id": sweep_id,
+            "start_hz": row.start_hz,
+            "bin_hz": row.bin_hz,
+            "stop_hz": row.stop_hz,
+            "power_db": row.power_db,
+        }
+        snapshot = stats.snapshot()
+        # Omitted rather than sent as nulls when nothing measurable has arrived. A consumer can then
+        # distinguish "no statistics yet" from "a statistic whose value is zero", which for a dB
+        # figure is a real and very loud reading.
+        if snapshot is not None:
+            payload["stats"] = snapshot
+        broadcaster.broadcast(payload)
+
+    def forget_sweep_stats(sweep_id: str) -> None:
+        sweep_stats.pop(sweep_id, None)
+
+    def reset_sweep_stats(sweep_id: str) -> bool:
+        """Clears the accumulator in place, so the next row starts a fresh session for this sweep.
+
+        Dropped rather than reset-in-place would work equally well here - on_row recreates it - but
+        an explicit reset keeps the intent legible and cannot race with a row arriving between the
+        pop and the recreate.
+        """
+        stats = sweep_stats.get(sweep_id)
+        if stats is None:
+            return False
+        stats.reset()
+        # Announced on the stream rather than left for the next row to carry. A wide sweep can be
+        # most of a minute mid-pass, and a sweep that errors immediately afterwards never emits
+        # another row at all - so consumers would go on showing pre-reset figures, and the HA
+        # entities would keep publishing them as current, long after the accumulator was cleared.
+        # Ordered with the rows because it goes through the same broadcaster.
+        broadcaster.broadcast({"type": "stats_reset", "sweep_id": sweep_id, "generation": stats.generation})
+        return True
 
     def on_device(receiver_id: str, device: dict) -> None:
         # event_id/seq/received_at are assigned here, once, on the server - deliberately NOT left
@@ -254,8 +300,15 @@ async def lifespan(app: FastAPI):
         )
 
     def on_status(kind: EntityKind, entity_id: str, status: EntityStatus, message: str | None) -> None:
+        # A sweep that stopped or died is finished with its accumulator. Dropping it here covers
+        # every ending, not just an explicit DELETE - an errored sweep never reaches that route, and
+        # its statistics would otherwise be inherited by a later sweep reusing the id.
+        if kind == EntityKind.SWEEP and status in (EntityStatus.STOPPED, EntityStatus.ERROR):
+            forget_sweep_stats(entity_id)
         broadcaster.broadcast({"type": "status", "kind": kind, "id": entity_id, "status": status, "message": message})
 
+    app.state.forget_sweep_stats = forget_sweep_stats
+    app.state.reset_sweep_stats = reset_sweep_stats
     app.state.manager = DeviceManager(loop=loop, on_row=on_row, on_device=on_device, on_status=on_status)
 
     _LOGGER.info("sdr_hub add-on ready")

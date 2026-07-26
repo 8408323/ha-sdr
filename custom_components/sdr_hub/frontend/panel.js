@@ -995,9 +995,38 @@ function compareDecodedEvents(a, b) {
 // every HA restart, showing a message ("Unknown command") that reads like a version mismatch or a
 // broken install, while the waterfall silently stopped advancing.
 const INTEGRATION_NOT_READY_CODES = new Set(["unknown_command", "not_loaded"]);
+
+// Keys the marker control claims. Checked before any state is touched, so navigating past a plot
+// with Tab cannot leave a cursor behind on it.
+const MARKER_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "PageDown",
+  "PageUp",
+  "Home",
+  "End",
+  "Enter",
+  " ",
+  "Escape",
+]);
 // Escalating, and finite: if the integration genuinely is not installed the message must eventually
 // be shown rather than retried forever behind a "starting" notice that would never resolve.
 const INTEGRATION_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400, 10000];
+
+// Whether a rejection means "this build does not have that command" rather than "the command was
+// refused or failed". Only the first justifies acting locally instead: the others leave real server
+// state in place that a local change would contradict.
+function isUnsupportedCommand(err) {
+  // Only the integration's own report that the *add-on* lacks the endpoint. "unknown_command" is
+  // deliberately excluded: this same file already classifies it as integration-not-ready, because
+  // it is what Home Assistant answers during the window after a restart when the frontend socket
+  // is back but the config entry has not registered its commands yet. Treating it as a permanent
+  // version mismatch would clear the panel's trace during an ordinary restart while a perfectly
+  // current add-on still held and was about to republish the accumulator - inventing the
+  // disagreement this whole path exists to avoid, from a condition that resolves itself in
+  // seconds.
+  return !!err && err.code === "unsupported_by_addon";
+}
 
 function isIntegrationNotReady(err) {
   if (err && INTEGRATION_NOT_READY_CODES.has(err.code)) return true;
@@ -1201,6 +1230,15 @@ const PEAK_MIN_DELTA_DB = 6;
 // floor. Deliberately the same 6 dB the per-row peak readout already requires: two thresholds for
 // "is this a real signal" would let the two readouts disagree about the same bin.
 const OCCUPANCY_MIN_DELTA_DB = PEAK_MIN_DELTA_DB;
+
+// Statuses after which a sweep emits no further rows. Mirrors the integration's own set: a sweep
+// stays listed after erroring so the user can see why, so "listed" is not "measuring".
+const TERMINAL_SWEEP_STATUSES = new Set(["error", "stopped"]);
+
+// Mirrors the add-on's NOISE_FLOOR_QUANTILE. The local fallback exists for an add-on that does not
+// publish statistics, so it has to compute the same quantity the same way - a fallback that answers
+// a different question than the thing it stands in for is worse than no fallback.
+const NOISE_FLOOR_QUANTILE = 0.25;
 // "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
 // fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
 // few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
@@ -1351,6 +1389,12 @@ class SdrHubPanel extends HTMLElement {
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
     this._markers = {};
+    // Last stats generation seen per sweep - see the reset boundary in _handleEvent.
+    this._statsGen = {};
+    // Sweeps whose readout is suspended because continuity was lost - see _invalidateServedStats.
+    this._statsStale = {};
+    // Latest per-sweep statistics as computed by the add-on, keyed by sweep id.
+    this._sweepStats = {};
     // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
     // persisted or shared. Peak-hold answers "what has this dongle heard since I started watching",
     // which is a property of one observation session at one antenna - restoring a peak from a
@@ -1428,6 +1472,9 @@ class SdrHubPanel extends HTMLElement {
       // shared storage instead, which is exactly what a still-connected peer has been keeping
       // up to date, and don't touch the generation.
       if (wasDisconnected) {
+        // This tab's own socket dropped, so it may have missed rows even though the coordinator's
+        // connection to the add-on never faltered. Same boundary, same conclusion.
+        this._invalidateServedStats();
         // The decoded log is re-read too. While this tab's socket was down a still-connected
         // peer could have persisted events it never saw, and nothing else would pull them in:
         // peer notifications are one-shot, so if decoding then goes quiet the log stays missing
@@ -1758,6 +1805,13 @@ class SdrHubPanel extends HTMLElement {
     this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]));
     this._renderBatteryAlerts();
     if (!this._unsub && !this._subscribing) {
+      // Before resubscribing, not after. A detach drops the subscription while keeping this
+      // instance's state, so every row emitted while the panel was elsewhere in the UI was missed -
+      // and the Home Assistant socket never dropped, so none of the connection-level boundaries
+      // fired. Navigating away and back is the most ordinary way to lose rows and was the one path
+      // that established no boundary at all. Ordered ahead of _subscribe so a row arriving on the
+      // new subscription is not discarded by an invalidation belonging to the gap before it.
+      this._invalidateServedStats();
       this._loadState();
       this._subscribe();
     }
@@ -2010,6 +2064,27 @@ class SdrHubPanel extends HTMLElement {
   async _handleEvent(event) {
     if (event.type === "sweep_row") {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
+      // Absent on an older add-on, and absent until a sweep has produced something measurable -
+      // both are "no server figure", which the readout distinguishes from a value of zero.
+      // This row was measured after whatever boundary suspended the readout, so it is evidence the
+      // stream is delivering again - whether or not the add-on attaches statistics to it.
+      delete this._statsStale[event.sweep_id];
+      if (event.stats) {
+        // A new generation means the add-on reset its accumulator, and this row is the first that
+        // belongs after the boundary. The local trace is cleared *here*, before this row is
+        // accumulated, so both sides start from exactly the same row - peak, sum and counts
+        // together, matching what SweepStats.reset clears rather than only the peak.
+        const gen = event.stats.generation;
+        if (gen != null && this._statsGen[event.sweep_id] !== gen) {
+          const known = this._statsGen[event.sweep_id] !== undefined;
+          this._statsGen[event.sweep_id] = gen;
+          // Not on first sight of a sweep: an unknown generation is simply the first row, not a
+          // reset, and clearing then would discard a session this tab had already accumulated
+          // before the add-on's snapshot first arrived.
+          if (known) this._clearTraceState(event.sweep_id);
+        }
+        this._sweepStats[event.sweep_id] = event.stats;
+      }
       const rows = (this._sweepRowHistory[event.sweep_id] ??= []);
       rows.unshift(event);
       // Switching a sweep to "keep full history" only stops future rows being discarded -
@@ -2040,6 +2115,18 @@ class SdrHubPanel extends HTMLElement {
       if (this._favoriteDevices.has(favKey)) this._flashDeviceKey = favKey;
       this._persistDecodedEvent(event);
       if (Object.hasOwn(decodedDevice, "battery_ok")) this._updateBatteryState(event);
+    } else if (event.type === "stats_reset") {
+      // The add-on announcing that it cleared an accumulator. Applied immediately rather than
+      // waiting for the next row to carry the new generation: a wide sweep can be most of a minute
+      // mid-pass, and one that errors right after a reset never sends another row at all. Recording
+      // the generation here also means the row that eventually arrives is not treated as a second
+      // boundary and does not clear again.
+      if (event.stats_reset !== false) {
+        this._statsGen[event.sweep_id] = event.generation;
+        delete this._sweepStats[event.sweep_id];
+        this._clearTraceState(event.sweep_id);
+        this._renderOccupancy(event.sweep_id);
+      }
     } else if (event.type === "status" || event.type === "state_changed") {
       // A receiver/sweep died, or something else changed the add-on's state from outside
       // this panel (an automation service call, another open panel) - reload the
@@ -2059,6 +2146,20 @@ class SdrHubPanel extends HTMLElement {
       // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
+      // Before the await, deliberately. Subscription callbacks do not serialise their promises, so
+      // a sweep_row can be handled while this handler is suspended on the IndexedDB transaction -
+      // and invalidating afterwards would delete that *fresh* snapshot, leaving the panel on its
+      // pre-gap fallback until yet another row arrived. The boundary belongs at the instant the gap
+      // is observed, which is here, not after unrelated asynchronous work.
+      //
+      // The served statistics are dropped for the same reason the battery map is: rows may have
+      // been missed, and the loss is upstream of every tab. A snapshot from before the gap is not a
+      // current measurement, and rendering it as one can persist for an entire wide-sweep pass -
+      // or indefinitely if the sweep stalls. The HA entities already stay unavailable across this
+      // boundary via stream_epoch; the panel has to draw the same line or the two disagree. Local
+      // trace state is kept: those rows genuinely were received, and the waterfall above still
+      // shows them.
+      this._invalidateServedStats();
       await this._invalidateBatteryState(event.gap_id ?? null);
       this._loadState();
     }
@@ -2790,17 +2891,86 @@ class SdrHubPanel extends HTMLElement {
           0% { background-color: rgba(245,166,35,.6); }
           100% { background-color: rgba(245,166,35,.1); }
         }
+
+        /* Declared here rather than inline on the element, so the narrow-screen override below can
+           actually win: an inline style beats any non-important stylesheet rule regardless of
+           source order, and this padding was inline. */
+        #sdr-hub-root { padding: 16px; }
+        /* Declared here, not inline, so the narrow-screen overrides below can actually win. Four
+           declarations in that block were dead for exactly this reason - an inline style outranks
+           any non-important rule regardless of specificity or source order - and three separate
+           review rounds each found one of them. Found the remaining two by walking every
+           declaration in the media query and checking it against inline styles on its targets,
+           rather than fixing the instances as they were reported. */
+        #sdr-hub-root h1 { font-size: 1.4rem; }
+        #sdr-hub-root h2 { font-size: 1.1rem; }
+        #sdr-hub-root .sdr-hub-form-row { align-items: end; }
+
+        /* The panel had no media queries at all. It does not *overflow* on a phone - the existing
+           flex-wrap already prevents that, measured at both 390px and 320px with these rules
+           disabled - so this is a legibility change, not an overflow fix. What wrapping produces
+           is ragged: a row of desktop-width inputs breaks into arbitrary groups, so the frequency
+           and gain fields end up different widths on different lines with no relationship to
+           their content. Stacking gives each field the full width and a predictable order. */
+        @media (max-width: 700px) {
+          #sdr-hub-root { padding: 8px; }
+          #sdr-hub-root .sdr-hub-form-row { flex-direction: column; align-items: stretch; }
+          /* border-box as well as width. BTN gives the submit buttons 16px of horizontal padding
+             and they are content-box by default, so width:100% alone rendered them 32px wider than
+             the form - overflowing the very edge this block exists to make uniform, while the
+             inputs beside them were already border-box and looked correct. */
+          .sdr-hub-form-row > * { width: 100%; box-sizing: border-box; }
+          /* The controls themselves, not only the labels wrapping them. Stretching the direct
+             children alone left every input at its inline width (80px, 100px, 140px, 180px...),
+             which is what actually determines the ragged edge - so the change looked applied while
+             changing nothing a user sees. !important because those widths are inline, and an
+             inline style otherwise wins regardless of specificity or source order. */
+          .sdr-hub-form-row input:not([type="checkbox"]):not([type="radio"]),
+          .sdr-hub-form-row select {
+            width: 100% !important;
+          }
+          /* A checkbox has an intrinsic size and no content to fit, so stretching it produces a
+             13px control inside a 262px hit area - the box floats at one end of a wide blank
+             stripe, which reads as a rendering fault rather than a wider target. Excluded rather
+             than special-cased afterwards, since the same is true of radios. */
+          #sdr-hub-root h1 { font-size: 1.2rem; }
+          #sdr-hub-root h2 { font-size: 1rem; }
+          /* The sweep card header is a range/serial line beside a non-wrapping group of Save image,
+             Copy as YAML and Stop. Stacking the forms alone left the widest thing on the card
+             untouched.
+
+             The symptom is not page overflow - measured at 320px with these rules disabled, nothing
+             overflows and the page does not scroll horizontally. It is that flexbox resolves the
+             conflict by crushing whatever can shrink: the title collapses to 35px, so the card no
+             longer says which sweep it belongs to, and the three buttons squeeze to ~67px each with
+             their labels wrapped onto two lines. With the rules, the title gets 262px and the
+             buttons take their natural widths across two rows. */
+          .sdr-hub-card-header { flex-direction: column; align-items: stretch; gap: 6px; }
+          .sdr-hub-card-actions { flex-wrap: wrap; white-space: normal; }
+        }
+        /* Every text container that sits beside something flexible. Applied at all widths: a
+           2000-character device name overflows a desktop card too, just less often. */
+        #sdr-hub-root .sdr-hub-shrinkable { min-width: 0; overflow-wrap: anywhere; }
+
+
+        /* A visible focus ring on the plots, which are now keyboard-operable. Without it a
+           keyboard user can move markers with no indication of which plot has focus - the browser
+           default outline is suppressed on canvas in some HA themes. */
+        #sdr-hub-root canvas:focus-visible {
+          outline: 2px solid var(--primary-color, #03a9f4);
+          outline-offset: 2px;
+        }
       </style>
-      <div id="sdr-hub-root" style="padding:16px;max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
+      <div id="sdr-hub-root" style="max-width:960px;margin:0 auto;font-family:var(--paper-font-body1_-_font-family, Roboto, sans-serif);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
           <div style="display:flex;align-items:center;gap:10px;">
-            <h1 style="font-size:1.4rem;margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
+            <h1 style="margin:0;color:var(--primary-text-color,#212121);">SDR Hub</h1>
             <span id="sdr-hub-connection-status" role="status" style="font-size:.8rem;font-weight:600;"></span>
           </div>
           <button data-show-help style="${BTN_SECONDARY}">Help</button>
         </div>
         <div id="sdr-hub-help" style="${CARD};display:${helpDismissed ? "none" : "block"};">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Getting started</h2>
+          <h2 style="margin:0 0 8px;">Getting started</h2>
           <ul style="margin:0 0 12px;padding-left:20px;font-size:.9rem;line-height:1.6;">
             <li><strong>Dongles</strong> — attached SDR hardware and what's currently using each one.</li>
             <li><strong>Band coverage</strong> — an at-a-glance view of which frequencies are currently being watched.</li>
@@ -2815,17 +2985,17 @@ class SdrHubPanel extends HTMLElement {
         <div id="sdr-hub-battery-alert" role="alert" aria-live="assertive" style="display:none;background:rgba(219,68,55,.08);border:1px solid var(--error-color,#db4437);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:.9rem;color:var(--primary-text-color,#212121);"></div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Dongles</h2>
+          <h2 style="margin:0 0 8px;">Dongles</h2>
           <div id="sdr-hub-dongles"></div>
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Band coverage</h2>
+          <h2 style="margin:0 0 8px;">Band coverage</h2>
           <div id="sdr-hub-coverage"></div>
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Wideband sweeps</h2>
+          <h2 style="margin:0 0 8px;">Wideband sweeps</h2>
           <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
             <label style="${LABEL}">Colormap<select id="sdr-hub-colormap" style="${INPUT}">
               ${Object.entries(COLORMAPS)
@@ -2837,7 +3007,7 @@ class SdrHubPanel extends HTMLElement {
             <button id="sdr-hub-db-auto" type="button" title="Set the contrast range from the signal levels currently being received"
               style="${BTN_SECONDARY};align-self:end;">Auto</button>
           </div>
-          <form id="sdr-hub-add-sweep" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <form id="sdr-hub-add-sweep" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${SWEEP_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -2860,8 +3030,8 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Receivers (rtl_433)</h2>
-          <form id="sdr-hub-add-receiver" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:12px;">
+          <h2 style="margin:0 0 8px;">Receivers (rtl_433)</h2>
+          <form id="sdr-hub-add-receiver" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
             <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
               <option value="">Custom</option>
               ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
@@ -2880,7 +3050,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Decoded devices</h2>
+          <h2 style="margin:0 0 8px;">Decoded devices</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
             <button id="sdr-hub-decoded-time-toggle" type="button" title="Toggle between relative and absolute timestamps" style="${BTN_SECONDARY};white-space:nowrap;">${this._decodedTimeMode === "absolute" ? "Absolute time" : "Relative time"}</button>
@@ -2892,7 +3062,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Backup &amp; restore</h2>
+          <h2 style="margin:0 0 8px;">Backup &amp; restore</h2>
           <p style="margin:0 0 8px;font-size:.85rem;color:var(--secondary-text-color,#727272);">
             Export every active sweep and receiver as a JSON file, or import one to recreate them.
           </p>
@@ -2914,7 +3084,7 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
-          <h2 style="margin:0 0 8px;font-size:1.1rem;">Settings</h2>
+          <h2 style="margin:0 0 8px;">Settings</h2>
           <label style="${LABEL};display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px;">
             <input type="checkbox" id="sdr-hub-battery-sound-toggle" ${this._batterySoundEnabled ? "checked" : ""}>
             Play a sound when a device first reports low battery
@@ -3420,6 +3590,40 @@ class SdrHubPanel extends HTMLElement {
     for (const id of Object.keys(this._markers)) {
       if (!activeIds.has(id)) delete this._markers[id];
     }
+    // Terminal sweeps are dropped here even though they stay in the snapshot. An errored sweep is
+    // kept listed so the user can see why it stopped - which is right - but it emits no further
+    // rows, so its served noise floor and occupancy would sit frozen on screen looking current.
+    // The entity path already treats terminal statistics as stale and removes them; the panel has
+    // to agree, or the same band reads as measured in one place and gone in the other. The
+    // waterfall history is deliberately kept: those rows were really received.
+    const measuringIds = new Set(
+      (this._state.sweeps || []).filter((s) => !TERMINAL_SWEEP_STATUSES.has(s.status)).map((s) => s.id),
+    );
+    for (const id of Object.keys(this._sweepStats)) {
+      if (!measuringIds.has(id)) delete this._sweepStats[id];
+    }
+    // Re-rendered here, not left to the normal render path. A sweep going terminal changes its
+    // status but not the set of sweep ids, so the memoised early return below patches only the
+    // status label - and with no further rows arriving, the already-drawn occupancy figure would
+    // stay on screen indefinitely, looking exactly as current as a live one.
+    //
+    // Driven by the sweep list rather than by the served-statistics keys, because a sweep can be
+    // terminal with no served entry at all: an add-on too old to publish them, or one a previous
+    // stream invalidation already removed. Keying the re-render on the value being deleted meant
+    // the case with nothing to delete - where the *locally* computed figure is what stays on
+    // screen - was the one case never re-rendered.
+    for (const sweep of this._state.sweeps || []) {
+      if (TERMINAL_SWEEP_STATUSES.has(sweep.status)) this._renderOccupancy(sweep.id);
+    }
+    for (const id of Object.keys(this._statsGen)) {
+      if (!activeIds.has(id)) delete this._statsGen[id];
+    }
+    for (const id of Object.keys(this._statsStale)) {
+      if (!activeIds.has(id)) delete this._statsStale[id];
+    }
+    for (const id of Object.keys(this._markerCursor || {})) {
+      if (!activeIds.has(id)) delete this._markerCursor[id];
+    }
     // The resize observers are a fifth per-sweep resource and are released here with the other
     // four, above both early returns below. They were previously pruned further down, past the
     // empty-list return - so stopping the *last* sweep skipped the cleanup entirely and left an
@@ -3513,10 +3717,10 @@ class SdrHubPanel extends HTMLElement {
         const searchText = `${s.label || ""} ${s.dongle_serial} ${fmtMHz(s.start_hz)} ${fmtMHz(s.stop_hz)}`.toLowerCase();
         return `
       <div data-sweep-row="${esc(s.id)}" data-search="${esc(searchText)}" style="margin-bottom:16px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-          <span>${titleHtml} on ${esc(s.dongle_serial)}
+        <div class="sdr-hub-card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <span class="sdr-hub-shrinkable">${titleHtml} on ${esc(s.dongle_serial)}
             <span data-sweep-status="${esc(s.id)}" style="color:var(--error-color,#db4437);">${s.status === "error" ? " (error)" : ""}</span></span>
-          <span style="display:flex;gap:8px;">
+          <span class="sdr-hub-card-actions" style="display:flex;gap:8px;">
             <button data-save-sweep-png="${esc(s.id)}" title="Save the current waterfall as a PNG image" style="${BTN_SECONDARY}">Save image</button>
             <button data-copy-sweep-yaml="${esc(s.id)}" title="Copy as an sdr_hub.add_sweep automation action" style="${BTN_SECONDARY}">Copy as YAML</button>
             <button data-remove-sweep="${esc(s.id)}" style="${BTN_DANGER}">Stop</button>
@@ -3527,8 +3731,10 @@ class SdrHubPanel extends HTMLElement {
           Keep full history (scrollable) — only affects rows from now on
         </label>
         <div data-sweep-trace-wrap="${esc(s.id)}" style="${this._spectrumTraceEnabled ? "" : "display:none;"}">
+          <!-- role and label are applied by _wireMarkerPlacement, which is what makes this
+               operable - declaring role="img" here would advertise a static graphic for something
+               that accepts arrow keys, and would then be overwritten anyway. -->
           <canvas data-sweep-trace="${esc(s.id)}" width="${rowWidth}" height="${TRACE_HEIGHT_PX}"
-            role="img" aria-label="Spectrum trace: current sweep, peak hold and average power against frequency"
             style="width:100%;height:${TRACE_HEIGHT_PX}px;display:block;border-radius:8px;
             background:var(--card-background-color,#fff);"></canvas>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:.7rem;
@@ -3540,26 +3746,53 @@ class SdrHubPanel extends HTMLElement {
             <span style="display:flex;align-items:center;gap:4px;">
               <span style="width:14px;height:2px;background:#8e8e8e;display:inline-block;"></span>average</span>
             <button type="button" data-sweep-trace-reset="${esc(s.id)}"
-              style="${BTN};padding:1px 6px;font-size:.7rem;">Reset peak hold</button>
+              style="${BTN};padding:1px 6px;font-size:.7rem;">Reset statistics</button>
             <button type="button" data-sweep-trace-csv="${esc(s.id)}"
               style="${BTN};padding:1px 6px;font-size:.7rem;">Export spectrum CSV</button>
             <button type="button" data-sweep-markers-clear="${esc(s.id)}"
               style="${BTN_SECONDARY};padding:1px 6px;font-size:.7rem;">Clear markers</button>
             <span style="opacity:.75;">click the plot to place up to two markers</span>
           </div>
-          <div data-sweep-markers="${esc(s.id)}" role="status" aria-live="polite"
-            style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
-            color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
+
+          <!-- Announcements are a separate, visually hidden region written only when a key moves
+               the cursor. The visible readout above quotes the live power at the cursor, which
+               changes several times a second as rows arrive, so making *it* the live region queued
+               a fresh announcement continuously even while the user pressed nothing - which does
+               not merely annoy, it makes the control unusable, since the announcement a keypress
+               should produce is buried. A live region has to carry only what changed *because the
+               user did something*. -->
           <div data-sweep-occupancy="${esc(s.id)}"
             style="min-height:1.2em;font-size:.7rem;color:var(--secondary-text-color,#727272);
             margin-bottom:6px;"></div>
         </div>
+        <!-- Outside the trace wrapper on purpose. That wrapper takes display:none when the spectrum
+             trace is switched off, which removes everything inside it from the accessibility tree -
+             but the waterfall stays focusable and its key handler keeps writing here, so a screen
+             reader user in that supported preference state could operate the markers and hear
+             nothing at all. A live region must not sit inside something hidden for an unrelated
+             reason. -->
+        <div data-sweep-announce="${esc(s.id)}" role="status" aria-live="polite" aria-atomic="true"
+          style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+          clip-path:inset(50%);white-space:nowrap;"></div>
+        <!-- Outside the trace wrapper for the same reason the announcement is: markers are a
+             property of the sweep, not of the trace, and they can be placed on the waterfall with
+             the trace switched off. Leaving the readout inside meant a sighted keyboard user in
+             that state saw a cursor move with no frequency anywhere on screen. -->
+        <div data-sweep-markers="${esc(s.id)}"
+          style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
+          color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
           <div style="position:relative;">
             <canvas data-sweep-canvas="${esc(s.id)}" width="${rowWidth}" height="${canvasHeight}"
               style="width:100%;height:${canvasHeight}px;image-rendering:pixelated;display:block;"></canvas>
             <div data-sweep-axis="${esc(s.id)}" style="position:absolute;inset:0;pointer-events:none;"></div>
+            <!-- Markers are drawn as overlay elements rather than onto the waterfall bitmap: that
+                 bitmap is scrolled a row at a time and is what "Save PNG" exports, so painting into
+                 it would both smear the lines downward with the history and put them in the saved
+                 image. An overlay also survives every repaint for free. -->
+            <div data-sweep-marker-overlay="${esc(s.id)}" aria-hidden="true"
+              style="position:absolute;inset:0;pointer-events:none;overflow:hidden;"></div>
           </div>
         </div>
         <div data-sweep-resize="${esc(s.id)}" title="Drag to resize" role="separator" aria-label="Resize waterfall height"
@@ -3613,7 +3846,44 @@ class SdrHubPanel extends HTMLElement {
         // Rebuilds from retained history rather than blanking: those rows are still on screen in
         // the waterfall above, so a peak-hold that ignored them would contradict what is visible.
         // "Reset" means "forget what scrolled away", not "forget what I can still see".
-        traceReset.addEventListener("click", () => this._rebuildTraceFromHistory(s.id));
+        // Resets the add-on's accumulator as well as the local trace. They are two views of one
+        // peak hold - the red trace and the occupancy readout directly beneath it - so resetting
+        // only the local copy left them disagreeing about the same band, and left the published
+        // entities still counting a carrier the user had explicitly asked to forget.
+        traceReset.addEventListener("click", async () => {
+          const errorToken = this._errorToken || 0;
+          try {
+            await this._callWS({ type: "sdr_hub/reset_sweep_stats", sweep_id: s.id });
+            this._clearErrorIfOwnedBy("statsReset", errorToken);
+          } catch (err) {
+            // Only the add-on-too-old case falls back to a local clear. An add-on without the
+            // endpoint publishes no statistics either, so there is no served view to diverge from -
+            // but that reasoning holds for *that* rejection alone. Every other failure means the
+            // server accumulator, the served occupancy and the entities all still hold their old
+            // values, so clearing locally would manufacture the disagreement this command exists to
+            // prevent: a non-admin denied by require_admin, or a transient error from a healthy
+            // add-on, would silently desync their panel from everyone else's.
+            if (isUnsupportedCommand(err)) {
+              this._clearTraceState(s.id);
+              this._showError(`Reset applied locally only: ${err.message || err}`, { owner: "statsReset" });
+            } else if (isIntegrationNotReady(err)) {
+              // Transient: the integration is still starting up, so nothing was reset anywhere and
+              // the same click will work in a moment. Says so rather than reporting a failure the
+              // user cannot act on, and leaves local state alone.
+              this._showError("SDR Hub is still starting up - try the reset again in a moment.", {
+                owner: "statsReset",
+              });
+            } else {
+              this._showError(`Could not reset statistics: ${err.message || err}`, { owner: "statsReset" });
+            }
+            return;
+          }
+          // Deliberately nothing local here. The clear happens when the add-on's next row carries
+          // a new stats generation, so the boundary is placed by the side that owns the
+          // accumulator. Clearing on the click instead meant a row already in flight was counted
+          // by one view and not the other, and a transient in that row stayed on the trace forever
+          // while the entities never saw it.
+        });
       }
       el.querySelector(`[data-sweep-trace-csv="${CSS.escape(s.id)}"]`)
         ?.addEventListener("click", () => this._exportSpectrumCsv(s.id));
@@ -4021,7 +4291,7 @@ class SdrHubPanel extends HTMLElement {
         return `
           <div style="padding:6px 0;border-bottom:1px solid var(--divider-color,#e0e0e0);${cardStyle}">
             <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">
-              <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <span class="sdr-hub-shrinkable" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <button data-pin-device="${esc(favKey)}" title="${fav ? "Remove from favorites" : "Add to favorites"}"
                   aria-label="${fav ? "Remove" : "Add"} ${esc(deviceAccessibleName(d, this._deviceAliases))} ${fav ? "from" : "to"} favorites"
                   aria-pressed="${fav}"
@@ -4601,6 +4871,28 @@ class SdrHubPanel extends HTMLElement {
       // lives on the element so a fresh one is wired while an existing one is not re-wired.
       canvas._markerWired = true;
       canvas.style.cursor = "crosshair";
+      // Reachable and operable without a pointer. Placing a marker was click-only, which made the
+      // one genuinely interactive part of this panel unusable by keyboard - and unlike the icon
+      // buttons, there was no equivalent control to fall back on.
+      canvas.setAttribute("tabindex", "0");
+      // A focus stop has to say what it is and what it does. Both canvases were reachable by Tab
+      // while one had no name or role at all and the other announced itself as a static image, so
+      // a screen reader user arriving here was told either nothing or something false - and the
+      // live region only speaks *after* a key is pressed, which means the keys had to be guessed
+      // first. role="application" is the honest choice for a graphic operated by arrow keys: it
+      // tells assistive technology to pass keystrokes through rather than consume them for its own
+      // navigation, which is exactly the arrangement this control needs.
+      canvas.setAttribute("role", "application");
+      canvas.setAttribute("aria-roledescription", "spectrum marker plot");
+      const sweep = (this._state.sweeps || []).find((x) => x.id === sweepId);
+      const bandLabel = sweep ? `${fmtMHz(sweep.start_hz)} to ${fmtMHz(sweep.stop_hz)} megahertz` : "spectrum";
+      const kind = canvas.hasAttribute("data-sweep-trace") ? "Spectrum trace" : "Waterfall";
+      canvas.setAttribute(
+        "aria-label",
+        `${kind}, ${bandLabel}. Arrow keys move the marker cursor, ` +
+          `shift or page keys move faster, Enter places a marker, Escape clears.`,
+      );
+      canvas.addEventListener("keydown", (ev) => this._onMarkerKey(sweepId, ev));
       canvas.addEventListener("click", (ev) => {
         const rect = canvas.getBoundingClientRect();
         if (!rect.width) return;
@@ -4620,6 +4912,142 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
+  // Keyboard equivalent of clicking the plot. Enter/Space places a marker at the cursor, arrows
+  // move it, Escape clears. The cursor starts mid-band rather than at bin 0: an edge is the least
+  // useful place to begin, and with 5973 bins arrowing in from one would be unusable.
+  _onMarkerKey(sweepId, ev) {
+    const state = this._traceState[sweepId];
+    if (!state || !state.bins) return;
+    const bins = state.bins;
+    const list = (this._markers[sweepId] ??= []);
+    // Coarse step for PageUp/PageDown and Shift-arrow: 1% of the span crosses a 7 MHz sweep in a
+    // hundred presses instead of six thousand, while a plain arrow still gives single-bin precision.
+    const coarse = Math.max(1, Math.round(bins / 100));
+    const setCursor = (bin) => {
+      (this._markerCursor ??= {})[sweepId] = Math.max(0, Math.min(bins - 1, bin));
+      this._renderMarkerCursor(sweepId);
+    };
+    // Handled keys are decided before any state is touched. Materialising the cursor first meant
+    // Tab - the ordinary way to leave a canvas - created a midpoint cursor that the next row then
+    // drew, leaving a marker-like indicator on a plot the user had only navigated past. The switch
+    // below already returns for unhandled keys; the mutation simply happened above it.
+    if (!MARKER_KEYS.has(ev.key)) return;
+    // Materialised, not just defaulted into a local. Enter as the very first key after focusing
+    // left the midpoint living only in that local, so the marker landed correctly while the
+    // announcement read "placed at cursor" with no frequency - and since the visible readout is
+    // deliberately no longer a live region, that was the only channel telling a screen reader user
+    // where their first marker went.
+    if (this._markerCursor?.[sweepId] == null) (this._markerCursor ??= {})[sweepId] = Math.floor(bins / 2);
+    const cursor = this._markerCursor[sweepId];
+    switch (ev.key) {
+      case "ArrowLeft":
+        setCursor(cursor - (ev.shiftKey ? coarse : 1));
+        break;
+      case "ArrowRight":
+        setCursor(cursor + (ev.shiftKey ? coarse : 1));
+        break;
+      case "PageDown":
+        setCursor(cursor - coarse);
+        break;
+      case "PageUp":
+        setCursor(cursor + coarse);
+        break;
+      case "Home":
+        setCursor(0);
+        break;
+      case "End":
+        setCursor(bins - 1);
+        break;
+      case "Enter":
+      case " ":
+        list.push(this._markerCursor?.[sweepId] ?? cursor);
+        while (list.length > 2) list.shift();
+        this._renderMarkers(sweepId);
+        this._drawTrace(sweepId);
+        break;
+      case "Escape":
+        delete this._markers[sweepId];
+        if (this._markerCursor) delete this._markerCursor[sweepId];
+        this._renderMarkers(sweepId);
+        this._drawTrace(sweepId);
+        break;
+      default:
+        return; // not ours - leave it to the browser rather than swallowing it
+    }
+    // Only for keys actually handled above, so Tab still moves focus and a screen reader's own
+    // navigation keys are not captured.
+    ev.preventDefault();
+    const bin = this._markerCursor?.[sweepId];
+    if (ev.key === "Escape") {
+      this._announceMarker(sweepId, "Markers cleared");
+    } else if (ev.key === "Enter" || ev.key === " ") {
+      const hz = bin == null ? null : this._markerFrequencyHz(sweepId, bin);
+      this._announceMarker(
+        sweepId,
+        `Marker ${String.fromCharCode(64 + list.length)} placed at ${hz == null ? "cursor" : `${fmtMHz(hz)} megahertz`}`,
+      );
+    } else if (bin != null) {
+      const hz = this._markerFrequencyHz(sweepId, bin);
+      this._announceMarker(sweepId, hz == null ? `Bin ${bin}` : `${fmtMHz(hz)} megahertz`);
+    }
+  }
+
+  // The cursor is announced rather than only drawn: a keyboard user moving it needs to know which
+  // frequency they are on, and the plot itself conveys nothing to a screen reader.
+  // The waterfall's own marker/cursor lines. Kept in step with the trace's, and drawn regardless of
+  // whether the trace is visible - the waterfall is focusable and accepts the same keys either way.
+  _renderMarkerOverlay(sweepId) {
+    const overlay = this.querySelector(`[data-sweep-marker-overlay="${CSS.escape(sweepId)}"]`);
+    if (!overlay) return;
+    const state = this._traceState[sweepId];
+    const bins = state?.bins;
+    if (!bins) {
+      overlay.innerHTML = "";
+      return;
+    }
+    const line = (bin, color, dashed, label) => {
+      // Clamped just inside the right edge. At the final bin pct is exactly 100%, which puts a
+      // zero-width element and its left border past the overlay and straight into overflow:hidden -
+      // so End, or a click on the far right, appeared to do nothing at all. With the trace hidden
+      // this overlay is the only cursor there is, which makes an invisible last bin a dead control
+      // rather than a cosmetic gap.
+      const pct = Math.min((bin / (bins - 1 || 1)) * 100, 99.9);
+      return (
+        `<div style="position:absolute;top:0;bottom:0;left:${pct}%;width:0;` +
+        `border-left:1px ${dashed ? "dashed" : "solid"} ${color};">` +
+        (label
+          ? `<span style="position:absolute;top:0;${pct > 90 ? "right:2px" : "left:2px"};font-size:10px;color:${color};` +
+            `background:var(--card-background-color,#fff);padding:0 2px;border-radius:2px;">${esc(label)}</span>`
+          : "") +
+        `</div>`
+      );
+    };
+    const parts = [];
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) parts.push(line(cursorBin, "#00897b", true, null));
+    (this._markers[sweepId] || []).forEach((bin, i) => {
+      parts.push(line(bin, "#00897b", false, String.fromCharCode(65 + i)));
+    });
+    overlay.innerHTML = parts.join("");
+  }
+
+  _renderMarkerCursor(sweepId) {
+    // Routed through _renderMarkers rather than writing the readout directly. Rows arrive several
+    // times a second and each one re-renders that element, so a cursor announcement written here
+    // would be erased within a few hundred milliseconds - exactly while a keyboard user is reading
+    // it. One renderer owning the element is what keeps it on screen.
+    this._renderMarkers(sweepId);
+    this._drawTrace(sweepId);
+  }
+
+  // Written only from the keydown handler, so the live region speaks once per keypress rather than
+  // once per row. Deliberately omits the power level: it changes continuously, so including it
+  // would mean two presses of the same key produce different announcements for the same position.
+  _announceMarker(sweepId, text) {
+    const el = this.querySelector(`[data-sweep-announce="${CSS.escape(sweepId)}"]`);
+    if (el) el.textContent = text;
+  }
+
   _markerFrequencyHz(sweepId, bin) {
     const row = (this._sweepRowHistory[sweepId] || [])[0];
     if (!row) return null;
@@ -4631,7 +5059,10 @@ class SdrHubPanel extends HTMLElement {
     if (!el) return;
     const list = this._markers[sweepId] || [];
     const state = this._traceState[sweepId];
-    if (!list.length || !state) {
+    // The cursor counts as something to show: bailing on an empty marker list would blank the
+    // readout for a keyboard user who has moved the cursor but not yet placed anything - which is
+    // precisely when they most need to know where they are.
+    if (!state || (!list.length && this._markerCursor?.[sweepId] == null)) {
       el.textContent = "";
       return;
     }
@@ -4645,6 +5076,16 @@ class SdrHubPanel extends HTMLElement {
       return parts.join(" ");
     };
     const texts = list.map((bin, i) => describe(bin, String.fromCharCode(65 + i)));
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) {
+      const hz = this._markerFrequencyHz(sweepId, cursorBin);
+      const cur = state.latest ? state.latest[cursorBin] : null;
+      texts.unshift(
+        `Cursor ${hz == null ? "?" : fmtMHz(hz)} MHz` +
+          (Number.isFinite(cur) ? ` ${cur.toFixed(1)} dB` : "") +
+          " (Enter places, Esc clears)",
+      );
+    }
     if (list.length === 2) {
       const [a, b] = list;
       const fa = this._markerFrequencyHz(sweepId, a);
@@ -4667,9 +5108,59 @@ class SdrHubPanel extends HTMLElement {
   // strong carriers has a mean pulled up by exactly the bins that are not noise, which would then
   // hide those carriers by raising the threshold they are measured against. The median is
   // unaffected by a minority of loud bins, which is the property wanted here.
+  // Drops every served snapshot and suspends the readout until a post-boundary row arrives.
+  //
+  // Falling back to the local figure was wrong for the same reason the served snapshot was: the
+  // local accumulator is built from the rows this tab received, so after a gap it describes the
+  // same incomplete picture. Dropping one and rendering the other changed which stale number was
+  // shown, not whether one was - and left the panel presenting a numeric occupancy while the HA
+  // entities were deliberately unavailable, indefinitely if the sweep then stalled.
+  //
+  // The fallback itself is still right for an add-on that never publishes statistics; what it
+  // cannot do is stand in for a snapshot that was invalidated because rows were missed. So it is
+  // suspended rather than removed, and the next row - which is post-boundary evidence whether or
+  // not it carries served figures - restores it.
+  _invalidateServedStats() {
+    for (const id of Object.keys(this._sweepStats)) delete this._sweepStats[id];
+    for (const id of Object.keys(this._traceState)) {
+      this._statsStale[id] = true;
+      this._renderOccupancy(id);
+    }
+  }
+
   _renderOccupancy(sweepId) {
     const el = this.querySelector(`[data-sweep-occupancy="${CSS.escape(sweepId)}"]`);
     if (!el) return;
+    // A sweep that has stopped measuring gets no figure at all - not the served one, which is gone,
+    // and not the local fallback either. Dropping only the served value left the readout quietly
+    // switching to a locally-computed number for a dead sweep, which looks exactly as current as
+    // the real thing: the same defect one layer down. The waterfall above keeps its history,
+    // because those rows genuinely were received.
+    const sweep = (this._state.sweeps || []).find((x) => x.id === sweepId);
+    if (sweep && TERMINAL_SWEEP_STATUSES.has(sweep.status)) {
+      el.textContent = "";
+      return;
+    }
+    // Nothing measured since continuity was lost, so there is no figure that is honestly current.
+    if (this._statsStale[sweepId]) {
+      el.textContent = "";
+      return;
+    }
+    // The add-on's figures win when present. It computes the same statistics over the same rows,
+    // but on the side that owns them: one accumulator shared by every tab, unaffected by a reload,
+    // and the same numbers Home Assistant publishes as entities. Two tabs quoting different
+    // occupancy for one dongle - or the panel disagreeing with the sensor an automation fires on -
+    // is a worse failure than the local computation is a feature.
+    const served = this._sweepStats[sweepId];
+    if (served) {
+      el.textContent =
+        `Noise floor ~${served.noise_floor_db.toFixed(1)} dB \u00b7 ` +
+        `${served.occupancy_pct.toFixed(1)}% of the band occupied ` +
+        `(average \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${served.bins_measured} bins measured`;
+      return;
+    }
+    // Local fallback, for an add-on predating the stats field. Kept rather than blanking the line:
+    // an older add-on still produces spectra, and the panel can still describe them.
     const state = this._traceState[sweepId];
     if (!state) {
       el.textContent = "";
@@ -4685,23 +5176,19 @@ class SdrHubPanel extends HTMLElement {
       return;
     }
     averages.sort((a, b) => a - b);
-    const floor = averages[Math.floor(averages.length / 2)];
-    let occupied = 0;
-    let measured = 0;
-    for (let i = 0; i < state.bins; i++) {
-      const pk = state.peak[i];
-      if (!Number.isFinite(pk)) continue;
-      measured++;
-      if (pk >= floor + OCCUPANCY_MIN_DELTA_DB) occupied++;
-    }
-    if (!measured) {
-      el.textContent = "";
-      return;
-    }
+    // Both corrections that were made to the add-on's estimator, applied here too: a low quantile
+    // rather than the median, which is a carrier level once carriers are the majority; and averages
+    // compared against averages rather than peak-hold against an average-derived floor, which
+    // drifts upward without bound as a session lengthens. This fallback stands in for the add-on's
+    // figure, so computing a different quantity would make the two disagree exactly when a user is
+    // least able to tell which they are looking at.
+    const floor = averages[Math.min(averages.length - 1, Math.floor(averages.length * NOISE_FLOOR_QUANTILE))];
+    const occupied = averages.filter((v) => v >= floor + OCCUPANCY_MIN_DELTA_DB).length;
+    const measured = averages.length;
     const pct = (100 * occupied) / measured;
     el.textContent =
       `Noise floor ~${floor.toFixed(1)} dB \u00b7 ${pct.toFixed(1)}% of the band occupied ` +
-      `(peak \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${measured} bins measured`;
+      `(average \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${measured} bins measured`;
   }
 
   // ---- Spectrum CSV --------------------------------------------------------------------------
@@ -4748,35 +5235,27 @@ class SdrHubPanel extends HTMLElement {
     return 10 * Math.log10(state.sum[i] / state.counts[i]);
   }
 
-  // Resets *only* peak hold, which is what the button offers. Rebuilding the whole state also
-  // rebuilt sum and counts from the retained window, so on a long-running sweep the average jumped
-  // to whatever the last 400 rows happened to say - a change the user did not ask for and did not
-  // see coming from a control labelled "Reset peak hold". The average is a session statistic and
-  // has its own meaning; only the peak is being forgotten here.
-  _rebuildTraceFromHistory(sweepId) {
+  // Clears the whole accumulator - peak, linear sums and counts - because that is exactly what
+  // SweepStats.reset clears on the add-on. Clearing only the peak left the grey average trace and
+  // the CSV describing the pre-reset session while the served noise floor, occupancy and the HA
+  // entities restarted, so the two halves of one plot disagreed about which window they covered.
+  _clearTraceState(sweepId) {
     const state = this._traceState[sweepId];
     if (!state) return;
-    const rows = this._sweepRowHistory[sweepId] || [];
     state.peak.fill(NaN);
-    // Recomputed from retained history rather than blanked: those rows are still visible in the
-    // waterfall above, so a peak-hold ignoring them would contradict what is on screen. "Reset"
-    // means "forget what scrolled away", not "forget what I can still see".
-    for (const row of rows) {
-      const power = row.power_db;
-      if (!power || power.length !== state.bins) continue;
-      for (let i = 0; i < power.length; i++) {
-        const v = power[i];
-        if (v === null || !Number.isFinite(v)) continue;
-        if (Number.isNaN(state.peak[i]) || v > state.peak[i]) state.peak[i] = v;
-      }
-    }
+    state.sum.fill(0);
+    state.counts.fill(0);
     this._drawTrace(sweepId);
-    // The peak changed, so both readouts that quote it are stale until refreshed.
     this._renderMarkers(sweepId);
     this._renderOccupancy(sweepId);
   }
 
   _drawTrace(sweepId) {
+    // Before the early return, deliberately. Every path that shows markers already calls this, so
+    // one owner here beats nine call sites each remembering to refresh the overlay - and the
+    // trace-disabled case is exactly the one where the waterfall overlay is the *only* place a
+    // marker can appear, so it must not be skipped along with the trace.
+    this._renderMarkerOverlay(sweepId);
     if (!this._spectrumTraceEnabled) return;
     const canvas = this.querySelector(`[data-sweep-trace="${CSS.escape(sweepId)}"]`);
     const state = this._traceState[sweepId];
@@ -4886,6 +5365,21 @@ class SdrHubPanel extends HTMLElement {
 
     // Markers last, so they are never hidden under a trace. Drawn full height rather than as a
     // point on a curve: the marker identifies a *frequency*, and all three traces are read at it.
+    // Dashed, and drawn before the markers, so the transient keyboard cursor is distinguishable
+    // from a placed marker rather than looking like a third one.
+    const cursorBin = this._markerCursor?.[sweepId];
+    if (cursorBin != null) {
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = "#00897b";
+      ctx.lineWidth = 1;
+      const cx = Math.round(xFor(cursorBin)) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, h);
+      ctx.stroke();
+      ctx.restore();
+    }
     const markers = this._markers[sweepId] || [];
     ctx.strokeStyle = "#00897b";
     ctx.lineWidth = 1;
