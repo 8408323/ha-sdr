@@ -25,6 +25,20 @@ DC_SPIKE_BLANK_BINS: int = 2
 # dongle-is-gone condition once it's persisted for this many consecutive reads in a row.
 MAX_CONSECUTIVE_READ_ERRORS: int = 10
 
+# How many times to re-read a hop that returned OVERFLOW before giving up on it.
+#
+# OVERFLOW is not a symptom of trouble here, it is expected by construction: setFrequency is called
+# with the stream still active, so the driver keeps buffering during retune and settle, and the
+# first read after each hop is the one that reports the buffers filled and were discarded. The
+# device is fine and the very next read succeeds - measured on live hardware, every occurrence was
+# a single one, since the failure itself is what drains the backlog.
+#
+# Treating it as an unrecoverable gap meant discarding a full FFT_SIZE-bin hop for a condition that
+# clears immediately: measured over a 863-870 MHz sweep, 3.3% of emitted rows were missing a whole
+# hop - a third of the spectrum - and nulls render as the weakest signal, so those rows read as a
+# quiet band rather than as missing data.
+OVERFLOW_READ_RETRIES: int = 2
+
 # rtl_433 receiver defaults (ReceiverCreate / ReceiverConfig).
 DEFAULT_HOP_INTERVAL_S: int = 10
 
