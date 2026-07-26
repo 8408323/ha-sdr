@@ -1214,7 +1214,9 @@ class SdrHubPanel extends HTMLElement {
     this._deviceBatteryOk = new Map();
     this._maxSeenOrd = 0;
     // Monotonic counter identifying the currently displayed error - see _showError.
-    this._errorEpoch = 0;
+    // Identifies which operation put the currently displayed error on screen, so a later success
+    // clears only its own message - see _showError.
+    this._errorOwner = null;
     // Bumped synchronously by every battery invalidation. An operation captures it on arrival and
     // re-checks after waiting, which is the only way to tell "nothing happened while I waited"
     // from "an invalidation ran while I waited" - the generation alone cannot, since after the
@@ -2497,14 +2499,19 @@ class SdrHubPanel extends HTMLElement {
     releaseLeadership(SOUND_LEADER_KEY, this._tabId);
   }
 
-  // Clears the banner only if nothing newer has been displayed since `epoch` was captured. Async
-  // success paths use this instead of _showError("") so a slow clipboard or image save cannot wipe
-  // out an error raised by a different action while it was pending.
-  _clearErrorIfCurrent(epoch) {
-    if ((this._errorEpoch || 0) === epoch) this._showError("");
+  // Clears the banner only if it belongs to `owner`. Success paths use this instead of
+  // _showError("") so an operation can retract its own message without touching anyone else's.
+  //
+  // This replaces an epoch counter that compared *recency*. Recency detects an error raised after
+  // the operation started, but is blind to one that was already on screen when it began - so
+  // copying YAML successfully would clear a get_state failure that was displayed beforehand and
+  // has not recovered. Ownership is the property actually wanted, and the file already had a
+  // narrow version of it in _loadStateErrorShowing, now generalised.
+  _clearErrorIfOwnedBy(owner) {
+    if (owner && this._errorOwner === owner) this._showError("");
   }
 
-  _showError(message, { isLoadError = false } = {}) {
+  _showError(message, { isLoadError = false, owner = null } = {}) {
     const el = this.querySelector("#sdr-hub-error");
     if (!el) return;
     // Tracks whether the *currently displayed* error is specifically a get_state load
@@ -2513,12 +2520,10 @@ class SdrHubPanel extends HTMLElement {
     // out the next time a background state refresh happens to succeed, even though the user
     // still needs to see it. Whichever call to _showError ran most recently determines this.
     this._loadStateErrorShowing = isLoadError && !!message;
-    // Bumped on every *display*, so an async operation can tell whether the banner it is about to
-    // clear is still its own. Synchronous handlers clear and act in one tick and cannot be
-    // interleaved, but clipboard writes await a permission prompt and toBlob runs in a callback -
-    // an unrelated failure can appear in between, and an unconditional clear would erase a newer,
-    // still-relevant message. See _errorEpoch's readers.
-    if (message) this._errorEpoch = (this._errorEpoch || 0) + 1;
+    // Who owns what is on screen now. Cleared along with the message, so an empty banner is owned
+    // by nobody and cannot be "cleared" a second time by a stale success handler.
+    this._errorOwner = message ? owner || (isLoadError ? "loadState" : null) : null;
+
     el.textContent = message;
     el.style.display = message ? "block" : "none";
   }
@@ -3184,8 +3189,18 @@ class SdrHubPanel extends HTMLElement {
       }
       return;
     }
-    this._renderedSweepIdsKey = idsKey;
-    this._renderedSweepStatusKey = statusKey;
+    // Not cached while detached. A get_state still in flight when the panel detaches resolves
+    // afterwards and rebuilds into DOM nobody can see - harmless in itself, but recording the id
+    // set means the *next* load after reattachment takes the memo early return, so the rebuild
+    // loop never runs again and the observers it registers are never re-armed.
+    //
+    // Suppressing the write rather than adding an explicit re-arm: rendering into detached DOM has
+    // no user-visible value, so the cache entry is the only thing with consequences, and leaving
+    // it unwritten makes reattachment take the rebuild path naturally.
+    if (this.isConnected) {
+      this._renderedSweepIdsKey = idsKey;
+      this._renderedSweepStatusKey = statusKey;
+    }
     if (this._state.sweeps.length === 0) {
       el.innerHTML = `<p style="color:var(--secondary-text-color,#727272);">No active sweeps.</p>`;
       return;
@@ -4431,8 +4446,7 @@ class SdrHubPanel extends HTMLElement {
     button.addEventListener("click", async () => {
       const original = button.textContent;
       const text = textFn();
-      // Captured before the await below - see _clearErrorIfCurrent.
-      const errorEpoch = this._errorEpoch || 0;
+
       try {
         // navigator.clipboard requires a secure context (HTTPS or localhost) - it's simply
         // undefined otherwise, which is exactly the case for the plain-HTTP HA installs this
@@ -4447,10 +4461,10 @@ class SdrHubPanel extends HTMLElement {
         // Completes the stale-banner sweep. Conditional rather than unconditional: this runs after
         // an await, so an unrelated action may have raised a newer error while the permission
         // prompt was open, and clearing that would hide something the user still needs.
-        this._clearErrorIfCurrent(errorEpoch);
+        this._clearErrorIfOwnedBy("clipboard");
         button.textContent = "Copied!";
       } catch (err) {
-        this._showError(`Could not copy to clipboard: ${err.message || err}`);
+        this._showError(`Could not copy to clipboard: ${err.message || err}`, { owner: "clipboard" });
       }
       setTimeout(() => {
         button.textContent = original;
@@ -4493,16 +4507,15 @@ class SdrHubPanel extends HTMLElement {
     // Composited here rather than drawn into the live canvas: the canvas is the pixel history and
     // gets shifted, resized and blitted, so permanent furniture in it would scroll away.
     const composited = this._compositeSweepImage(sweepId, canvas);
-    // Captured before toBlob's callback - same asynchronous ordering problem as the clipboard.
-    const errorEpoch = this._errorEpoch || 0;
+
     (composited || canvas).toBlob((blob) => {
       if (!blob) {
-        this._showError("Could not save image: canvas produced no data");
+        this._showError("Could not save image: canvas produced no data", { owner: "saveImage" });
         return;
       }
       // Same stale-banner class as the CSV export and the Auto contrast handler, but conditional:
       // toBlob is asynchronous, so an unrelated failure may have been raised since.
-      this._clearErrorIfCurrent(errorEpoch);
+      this._clearErrorIfOwnedBy("saveImage");
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
