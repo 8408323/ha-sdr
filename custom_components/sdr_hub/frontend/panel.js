@@ -35,6 +35,17 @@ const esc = (s) =>
 
 const fmtMHz = (hz) => (Number(hz) / 1e6).toFixed(3);
 
+// A signed spacing, scaled to the unit that keeps it readable. A marker delta spans anything from
+// a few kHz (channel spacing) to several MHz (band edges), and always printing MHz turns the
+// former into 0.012 while always printing kHz turns the latter into 7000.
+const fmtHzSigned = (hz) => {
+  const sign = hz >= 0 ? "+" : "-";
+  const abs = Math.abs(Number(hz));
+  if (abs >= 1e6) return `${sign}${(abs / 1e6).toFixed(3)} MHz`;
+  if (abs >= 1e3) return `${sign}${(abs / 1e3).toFixed(1)} kHz`;
+  return `${sign}${Math.round(abs)} Hz`;
+};
+
 // "2m14s" / "48s" — used for the waterfall's relative-time axis ticks.
 const fmtElapsed = (ms) => {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -1185,6 +1196,11 @@ const WATERFALL_HEIGHT = 400;
 // median by this many dB - a fixed absolute dB floor would need per-device/gain calibration
 // (noise floor varies a lot), but "stands out from this row's own noise" doesn't.
 const PEAK_MIN_DELTA_DB = 6;
+
+// A bin counts as "occupied" when its session peak stands this far above the estimated noise
+// floor. Deliberately the same 6 dB the per-row peak readout already requires: two thresholds for
+// "is this a real signal" would let the two readouts disagree about the same bin.
+const OCCUPANCY_MIN_DELTA_DB = PEAK_MIN_DELTA_DB;
 // "Keep full history (scrollable)" mode caps retained rows by a memory budget rather than a
 // fixed row count - row width varies enormously by sweep range (a narrow sweep might be a
 // few hundred points, a full 24-1764MHz sweep ~8192 after downsampling), and a fixed count
@@ -1331,6 +1347,10 @@ class SdrHubPanel extends HTMLElement {
     // _audioCtx) so a detach/reattach re-arms it - the closed context needs a fresh gesture too.
     this._audioUnlockWired = false;
     this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
+    // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
+    // because that is what the trace and waterfall are both drawn in - storing Hz would need a
+    // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
+    this._markers = {};
     // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
     // persisted or shared. Peak-hold answers "what has this dongle heard since I started watching",
     // which is a property of one observation session at one antenna - restoring a peak from a
@@ -3395,6 +3415,11 @@ class SdrHubPanel extends HTMLElement {
     for (const id of Object.keys(this._traceState)) {
       if (!activeIds.has(id)) delete this._traceState[id];
     }
+    // Markers are bin indices into a specific sweep's spectrum, so they are meaningless once that
+    // sweep is gone - and keyed by the same never-reused UUID, so they would accumulate silently.
+    for (const id of Object.keys(this._markers)) {
+      if (!activeIds.has(id)) delete this._markers[id];
+    }
     // The resize observers are a fifth per-sweep resource and are released here with the other
     // four, above both early returns below. They were previously pruned further down, past the
     // empty-list return - so stopping the *last* sweep skipped the cleanup entirely and left an
@@ -3516,7 +3541,18 @@ class SdrHubPanel extends HTMLElement {
               <span style="width:14px;height:2px;background:#8e8e8e;display:inline-block;"></span>average</span>
             <button type="button" data-sweep-trace-reset="${esc(s.id)}"
               style="${BTN};padding:1px 6px;font-size:.7rem;">Reset peak hold</button>
+            <button type="button" data-sweep-trace-csv="${esc(s.id)}"
+              style="${BTN};padding:1px 6px;font-size:.7rem;">Export spectrum CSV</button>
+            <button type="button" data-sweep-markers-clear="${esc(s.id)}"
+              style="${BTN_SECONDARY};padding:1px 6px;font-size:.7rem;">Clear markers</button>
+            <span style="opacity:.75;">click the plot to place up to two markers</span>
           </div>
+          <div data-sweep-markers="${esc(s.id)}" role="status" aria-live="polite"
+            style="min-height:1.2em;font-size:.75rem;font-variant-numeric:tabular-nums;
+            color:var(--primary-text-color,#212121);margin-bottom:2px;"></div>
+          <div data-sweep-occupancy="${esc(s.id)}"
+            style="min-height:1.2em;font-size:.7rem;color:var(--secondary-text-color,#727272);
+            margin-bottom:6px;"></div>
         </div>
         <div data-sweep-scroll-container="${esc(s.id)}"
           style="max-height:${viewportHeight}px;overflow-y:auto;border-radius:8px;">
@@ -3579,6 +3615,15 @@ class SdrHubPanel extends HTMLElement {
         // "Reset" means "forget what scrolled away", not "forget what I can still see".
         traceReset.addEventListener("click", () => this._rebuildTraceFromHistory(s.id));
       }
+      el.querySelector(`[data-sweep-trace-csv="${CSS.escape(s.id)}"]`)
+        ?.addEventListener("click", () => this._exportSpectrumCsv(s.id));
+      el.querySelector(`[data-sweep-markers-clear="${CSS.escape(s.id)}"]`)
+        ?.addEventListener("click", () => {
+          delete this._markers[s.id];
+          this._renderMarkers(s.id);
+          this._drawTrace(s.id);
+        });
+      this._wireMarkerPlacement(s.id);
       this._wireCanvasHover(s.id);
       this._wireResizeHandle(s.id);
       // The canvas element (and its bitmap) is fresh after this rerender — replay the
@@ -3612,6 +3657,8 @@ class SdrHubPanel extends HTMLElement {
       // Redrawn from the state the replay deliberately did not touch, so the plot reappears on the
       // rebuilt canvas with the whole session's peaks intact.
       this._drawTrace(s.id);
+      this._renderMarkers(s.id);
+      this._renderOccupancy(s.id);
       this._renderTimeAxis(s.id);
       this._renderFrequencyAxis(s.id);
       // Restore the position captured above, now that the replacement container has its
@@ -4470,7 +4517,14 @@ class SdrHubPanel extends HTMLElement {
     if (!canvas) return;
     const peak = this._findPeak(row);
     this._renderPeakReadout(sweepId, peak);
-    if (!this._replayingRows) this._drawTrace(sweepId);
+    if (!this._replayingRows) {
+      this._drawTrace(sweepId);
+      // Derived from the same trace state as the plot, so they refresh wherever it does rather
+      // than on their own schedule - a marker readout quoting different numbers than the line
+      // beside it would be worse than no readout.
+      this._renderMarkers(sweepId);
+      this._renderOccupancy(sweepId);
+    }
     if (this._scrollMode[sweepId]) {
       this._drawScrollRow(canvas, sweepId, row, peak);
     } else {
@@ -4533,6 +4587,161 @@ class SdrHubPanel extends HTMLElement {
     }
   }
 
+  // ---- Frequency markers -------------------------------------------------------------------
+  //
+  // Placed on the trace *or* the waterfall, because they share an x axis and a bin index - the
+  // whole reason the trace is width-matched to the waterfall. A marker is a bin index rather than
+  // a frequency: bin index is what both canvases are drawn in, and a stored frequency would need a
+  // round-trip through bin_hz that drifts if the sweep's bin width changes.
+  _wireMarkerPlacement(sweepId) {
+    for (const sel of [`[data-sweep-trace="${CSS.escape(sweepId)}"]`, `[data-sweep-canvas="${CSS.escape(sweepId)}"]`]) {
+      const canvas = this.querySelector(sel);
+      if (!canvas || canvas._markerWired) continue;
+      // Guarded per element, not per sweep: _renderSweeps rebuilds these canvases, and the flag
+      // lives on the element so a fresh one is wired while an existing one is not re-wired.
+      canvas._markerWired = true;
+      canvas.style.cursor = "crosshair";
+      canvas.addEventListener("click", (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width) return;
+        const state = this._traceState[sweepId];
+        const bins = state ? state.bins : 0;
+        if (!bins) return;
+        const frac = (ev.clientX - rect.left) / rect.width;
+        const bin = Math.max(0, Math.min(bins - 1, Math.round(frac * (bins - 1))));
+        const list = (this._markers[sweepId] ??= []);
+        // Two markers maximum, oldest dropped. A third would need naming to be readable, and the
+        // measurement this exists for - the delta between two points - is defined on exactly two.
+        list.push(bin);
+        while (list.length > 2) list.shift();
+        this._renderMarkers(sweepId);
+        this._drawTrace(sweepId);
+      });
+    }
+  }
+
+  _markerFrequencyHz(sweepId, bin) {
+    const row = (this._sweepRowHistory[sweepId] || [])[0];
+    if (!row) return null;
+    return row.start_hz + bin * row.bin_hz;
+  }
+
+  _renderMarkers(sweepId) {
+    const el = this.querySelector(`[data-sweep-markers="${CSS.escape(sweepId)}"]`);
+    if (!el) return;
+    const list = this._markers[sweepId] || [];
+    const state = this._traceState[sweepId];
+    if (!list.length || !state) {
+      el.textContent = "";
+      return;
+    }
+    const describe = (bin, label) => {
+      const hz = this._markerFrequencyHz(sweepId, bin);
+      const cur = state.latest ? state.latest[bin] : null;
+      const parts = [`${label}: ${hz == null ? "?" : fmtMHz(hz)} MHz`];
+      if (Number.isFinite(cur)) parts.push(`${cur.toFixed(1)} dB`);
+      const pk = state.peak[bin];
+      if (Number.isFinite(pk)) parts.push(`peak ${pk.toFixed(1)} dB`);
+      return parts.join(" ");
+    };
+    const texts = list.map((bin, i) => describe(bin, String.fromCharCode(65 + i)));
+    if (list.length === 2) {
+      const [a, b] = list;
+      const fa = this._markerFrequencyHz(sweepId, a);
+      const fb = this._markerFrequencyHz(sweepId, b);
+      const da = state.latest ? state.latest[a] : null;
+      const db = state.latest ? state.latest[b] : null;
+      const bits = [];
+      // Signed, and always B minus A, so the sign means something: reading it backwards would be
+      // worse than no delta at all for anyone measuring a spacing or a rejection depth.
+      if (fa != null && fb != null) bits.push(`\u0394f ${fmtHzSigned(fb - fa)}`);
+      if (Number.isFinite(da) && Number.isFinite(db)) bits.push(`\u0394 ${(db - da >= 0 ? "+" : "")}${(db - da).toFixed(1)} dB`);
+      if (bits.length) texts.push(bits.join("  "));
+    }
+    el.textContent = texts.join("   |   ");
+  }
+
+  // ---- Band occupancy ----------------------------------------------------------------------
+  //
+  // The noise floor is the *median* of the per-bin averages, not the mean: a band with a few
+  // strong carriers has a mean pulled up by exactly the bins that are not noise, which would then
+  // hide those carriers by raising the threshold they are measured against. The median is
+  // unaffected by a minority of loud bins, which is the property wanted here.
+  _renderOccupancy(sweepId) {
+    const el = this.querySelector(`[data-sweep-occupancy="${CSS.escape(sweepId)}"]`);
+    if (!el) return;
+    const state = this._traceState[sweepId];
+    if (!state) {
+      el.textContent = "";
+      return;
+    }
+    const averages = [];
+    for (let i = 0; i < state.bins; i++) {
+      const v = this._traceAverageDb(state, i);
+      if (Number.isFinite(v)) averages.push(v);
+    }
+    if (!averages.length) {
+      el.textContent = "";
+      return;
+    }
+    averages.sort((a, b) => a - b);
+    const floor = averages[Math.floor(averages.length / 2)];
+    let occupied = 0;
+    let measured = 0;
+    for (let i = 0; i < state.bins; i++) {
+      const pk = state.peak[i];
+      if (!Number.isFinite(pk)) continue;
+      measured++;
+      if (pk >= floor + OCCUPANCY_MIN_DELTA_DB) occupied++;
+    }
+    if (!measured) {
+      el.textContent = "";
+      return;
+    }
+    const pct = (100 * occupied) / measured;
+    el.textContent =
+      `Noise floor ~${floor.toFixed(1)} dB \u00b7 ${pct.toFixed(1)}% of the band occupied ` +
+      `(peak \u2265 ${OCCUPANCY_MIN_DELTA_DB} dB above floor) \u00b7 ${measured} bins measured`;
+  }
+
+  // ---- Spectrum CSV --------------------------------------------------------------------------
+  _exportSpectrumCsv(sweepId) {
+    const errorToken = this._errorToken || 0;
+    const state = this._traceState[sweepId];
+    if (!state || !state.latest) {
+      this._showError("Nothing to export - this sweep has not produced a spectrum yet.", { owner: "spectrumExport" });
+      return;
+    }
+    this._clearErrorIfOwnedBy("spectrumExport", errorToken);
+    const rows = ["frequency_hz,current_db,peak_db,average_db"];
+    for (let i = 0; i < state.bins; i++) {
+      const hz = this._markerFrequencyHz(sweepId, i);
+      const cur = state.latest[i];
+      const pk = state.peak[i];
+      const avg = this._traceAverageDb(state, i);
+      // Empty cells, not zeros, for bins nothing was measured in. A 0 here would read as 0 dB -
+      // an enormous signal - which is the opposite of "no data" in the one column where it matters.
+      rows.push(
+        [
+          hz == null ? "" : Math.round(hz),
+          Number.isFinite(cur) ? cur.toFixed(1) : "",
+          Number.isFinite(pk) ? pk.toFixed(1) : "",
+          Number.isFinite(avg) ? avg.toFixed(1) : "",
+        ].join(","),
+      );
+    }
+    // Same CRLF + BOM reasoning as the decoded-log export.
+    const blob = new Blob(["\ufeff" + rows.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sdr-hub-spectrum-${sweepId}-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   // Mean power of a bin, converted back to dB for plotting, or NaN if nothing landed in it.
   _traceAverageDb(state, i) {
     if (!state.counts[i]) return NaN;
@@ -4562,6 +4771,9 @@ class SdrHubPanel extends HTMLElement {
       }
     }
     this._drawTrace(sweepId);
+    // The peak changed, so both readouts that quote it are stale until refreshed.
+    this._renderMarkers(sweepId);
+    this._renderOccupancy(sweepId);
   }
 
   _drawTrace(sweepId) {
@@ -4671,6 +4883,25 @@ class SdrHubPanel extends HTMLElement {
     stroke((i) => this._traceAverageDb(state, i), "#8e8e8e", 1);
     stroke((i) => state.peak[i], "#e53935", 1);
     stroke((i) => state.latest[i], "#1e88e5", 1.5);
+
+    // Markers last, so they are never hidden under a trace. Drawn full height rather than as a
+    // point on a curve: the marker identifies a *frequency*, and all three traces are read at it.
+    const markers = this._markers[sweepId] || [];
+    ctx.strokeStyle = "#00897b";
+    ctx.lineWidth = 1;
+    ctx.font = "10px sans-serif";
+    ctx.fillStyle = "#00897b";
+    markers.forEach((bin, idx) => {
+      const x = Math.round(xFor(bin)) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+      // Nudged inward at the right edge so the label of a marker placed on the last bin is not
+      // clipped off the canvas.
+      const label = String.fromCharCode(65 + idx);
+      ctx.fillText(label, Math.min(x + 2, w - 8), 10);
+    });
   }
 
   // Finds this row's strongest bin, if it stands out enough from the row's own noise floor to
