@@ -417,6 +417,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if event.get("type") == "sweep_row":
             handle_sweep_stats(event)
             return
+        if event.get("type") in ("stream_gap", "stream_reconnected"):
+            # The epoch has already advanced, so availability is now false for every key whose value
+            # predates it - but nothing writes these entities' state on its own, so the change would
+            # not be observed until a row arrived, which is exactly what a gap may have stopped.
+            for entity in sweep_stat_entities.values():
+                entity.async_write_ha_state_if_added()
+            return
         if event.get("type") == "stats_reset":
             # The accumulator behind these entities has been cleared, so what they hold is no longer
             # a measurement of anything. Dropping the value source makes them unavailable until the

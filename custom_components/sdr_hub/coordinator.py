@@ -212,12 +212,21 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     # polling interval. Availability should not return before the state behind it
                     # is true.
                     await self.async_refresh()
-                    self.stream_epoch += 1
+                    self._advance_stream_epoch()
                     self._set_stream_connected(True)
                     _LOGGER.debug("sdr_hub WS connected")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            self._dispatch(_sanitize_event(msg.json()))
+                            event = _sanitize_event(msg.json())
+                            # A stream_gap means the add-on's per-client queue overflowed and
+                            # discarded an unsent message - the socket never closed, so the
+                            # reconnect path below never runs and nothing else marks what was
+                            # already delivered as stale. It is the same loss of continuity as a
+                            # reconnect and has to advance the same boundary, or a consumer that
+                            # missed a reset or a terminal update keeps publishing what it last saw.
+                            if isinstance(event, dict) and event.get("type") == "stream_gap":
+                                self._advance_stream_epoch()
+                            self._dispatch(event)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - reconnect on any transport failure, not just expected ones
@@ -227,6 +236,17 @@ class SdrHubCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._set_stream_connected(False)
             if not self._stopping:
                 await asyncio.sleep(_RECONNECT_DELAY_S)
+
+    @callback
+    def _advance_stream_epoch(self) -> None:
+        """Marks everything delivered so far as belonging to a closed epoch.
+
+        Announced immediately rather than left for the next update: a push entity only re-evaluates
+        availability when something writes its state, and a gap is precisely a period in which
+        nothing did.
+        """
+        self.stream_epoch += 1
+        self.async_update_listeners()
 
     @callback
     def _set_stream_connected(self, connected: bool) -> None:

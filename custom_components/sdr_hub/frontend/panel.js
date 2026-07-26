@@ -1803,6 +1803,13 @@ class SdrHubPanel extends HTMLElement {
     this._hydrated = this._trackBarrier("both", Promise.all([this._hydrateBatteryState({ adopt: true }), this._hydrateDecodedLog()]));
     this._renderBatteryAlerts();
     if (!this._unsub && !this._subscribing) {
+      // Before resubscribing, not after. A detach drops the subscription while keeping this
+      // instance's state, so every row emitted while the panel was elsewhere in the UI was missed -
+      // and the Home Assistant socket never dropped, so none of the connection-level boundaries
+      // fired. Navigating away and back is the most ordinary way to lose rows and was the one path
+      // that established no boundary at all. Ordered ahead of _subscribe so a row arriving on the
+      // new subscription is not discarded by an invalidation belonging to the gap before it.
+      this._invalidateServedStats();
       this._loadState();
       this._subscribe();
     }
@@ -2134,7 +2141,12 @@ class SdrHubPanel extends HTMLElement {
       // therefore just re-adopt the same stale assertion from a peer. Clear it instead and let
       // the next real report from each device repopulate it - the alternative is a banner that
       // could claim a recovered device is still low indefinitely, if it happens to go quiet.
-      await this._invalidateBatteryState(event.gap_id ?? null);
+      // Before the await, deliberately. Subscription callbacks do not serialise their promises, so
+      // a sweep_row can be handled while this handler is suspended on the IndexedDB transaction -
+      // and invalidating afterwards would delete that *fresh* snapshot, leaving the panel on its
+      // pre-gap fallback until yet another row arrived. The boundary belongs at the instant the gap
+      // is observed, which is here, not after unrelated asynchronous work.
+      //
       // The served statistics are dropped for the same reason the battery map is: rows may have
       // been missed, and the loss is upstream of every tab. A snapshot from before the gap is not a
       // current measurement, and rendering it as one can persist for an entire wide-sweep pass -
@@ -2143,6 +2155,7 @@ class SdrHubPanel extends HTMLElement {
       // trace state is kept: those rows genuinely were received, and the waterfall above still
       // shows them.
       this._invalidateServedStats();
+      await this._invalidateBatteryState(event.gap_id ?? null);
       this._loadState();
     }
   }
@@ -3582,15 +3595,20 @@ class SdrHubPanel extends HTMLElement {
       (this._state.sweeps || []).filter((s) => !TERMINAL_SWEEP_STATUSES.has(s.status)).map((s) => s.id),
     );
     for (const id of Object.keys(this._sweepStats)) {
-      if (!measuringIds.has(id)) {
-        delete this._sweepStats[id];
-        // Re-rendered here, not left to the normal render path. A sweep going terminal changes its
-        // status but not the set of sweep ids, so the memoised early return below patches only the
-        // status label - and with no further rows arriving, the already-drawn occupancy figure
-        // would stay on screen indefinitely, looking exactly as current as a live one. Deleting the
-        // backing value is not the same as removing what was drawn from it.
-        this._renderOccupancy(id);
-      }
+      if (!measuringIds.has(id)) delete this._sweepStats[id];
+    }
+    // Re-rendered here, not left to the normal render path. A sweep going terminal changes its
+    // status but not the set of sweep ids, so the memoised early return below patches only the
+    // status label - and with no further rows arriving, the already-drawn occupancy figure would
+    // stay on screen indefinitely, looking exactly as current as a live one.
+    //
+    // Driven by the sweep list rather than by the served-statistics keys, because a sweep can be
+    // terminal with no served entry at all: an add-on too old to publish them, or one a previous
+    // stream invalidation already removed. Keying the re-render on the value being deleted meant
+    // the case with nothing to delete - where the *locally* computed figure is what stays on
+    // screen - was the one case never re-rendered.
+    for (const sweep of this._state.sweeps || []) {
+      if (TERMINAL_SWEEP_STATUSES.has(sweep.status)) this._renderOccupancy(sweep.id);
     }
     for (const id of Object.keys(this._statsGen)) {
       if (!activeIds.has(id)) delete this._statsGen[id];
