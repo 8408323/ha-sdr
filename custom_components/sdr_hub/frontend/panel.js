@@ -1763,6 +1763,7 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _subscribe() {
+    const errorToken = this._errorToken || 0;
     if (this._unsub || this._subscribing) return; // already subscribed, or another call is in flight
     this._subscribing = true; // set synchronously, before the await below, to close that race
     try {
@@ -1780,6 +1781,12 @@ class SdrHubPanel extends HTMLElement {
         return;
       }
       this._unsub = unsub;
+      // The one owner that could display but never release. Harmless while the banner held a
+      // single message - any later error displaced a stale subscribe failure - but the per-owner
+      // map makes every slot independent and permanent, so a missing clear path turns from
+      // invisible into a banner that stays until reload. Every owner that can display must have
+      // one; this was the gap.
+      this._clearErrorIfOwnedBy("subscribe", errorToken);
     } catch (err) {
       this._showError(`Could not subscribe to live updates: ${err.message || err}`, { owner: "subscribe" });
     } finally {

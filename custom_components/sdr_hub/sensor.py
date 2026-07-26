@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -21,23 +22,37 @@ _LOGGER = logging.getLogger(__name__)
 # meaningless numeric sensor - `id` in particular is a device identifier, not a measurement.
 NON_MEASUREMENT_FIELDS = frozenset({"id", "channel", "model", "time", "mic", "protocol", "raw_message"})
 
+# Flags rtl_433 emits as JSON 0/1 rather than true/false, so they arrive as int and an
+# isinstance(value, bool) guard does not catch them. Excluded by name: a battery indicator charted
+# as a unitless "measurement" oscillating between 0 and 1 is worse than absent, and every device
+# with a battery has one, so they would also consume the entity budget. Exposing them properly
+# needs a binary_sensor platform, which is deliberately out of scope here.
+FLAG_FIELDS = frozenset({"battery_ok", "battery", "button", "tamper", "alarm", "learn", "test"})
+
 # Known rtl_433 field names mapped to their Home Assistant semantics. Anything numeric that is not
 # listed still becomes a sensor, just without a device class or unit - a decoder this integration
 # has never seen should surface its readings rather than be silently dropped.
-FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None]] = {
-    "temperature_C": (SensorDeviceClass.TEMPERATURE, "°C"),
-    "temperature_F": (SensorDeviceClass.TEMPERATURE, "°F"),
-    "humidity": (SensorDeviceClass.HUMIDITY, "%"),
-    "pressure_hPa": (SensorDeviceClass.PRESSURE, "hPa"),
-    "pressure_kPa": (SensorDeviceClass.PRESSURE, "kPa"),
-    "wind_avg_km_h": (SensorDeviceClass.WIND_SPEED, "km/h"),
-    "wind_max_km_h": (SensorDeviceClass.WIND_SPEED, "km/h"),
-    "wind_dir_deg": (None, "°"),
-    "rain_mm": (SensorDeviceClass.PRECIPITATION, "mm"),
-    "moisture": (SensorDeviceClass.MOISTURE, "%"),
-    "rssi": (SensorDeviceClass.SIGNAL_STRENGTH, "dBm"),
-    "snr": (None, "dB"),
-    "noise": (None, "dB"),
+# State class is per-field rather than a blanket MEASUREMENT. Cumulative readings - a rain gauge's
+# lifetime total, a utility meter, an event count - are TOTAL_INCREASING, and recording them as
+# measurements makes HA store sampled min/max/mean instead of period deltas, so the long-term
+# statistics are wrong in a way that is invisible until someone looks at a monthly graph.
+# An unknown field gets no state class at all: no statistics is recoverable, wrong statistics is not.
+FIELD_SEMANTICS: dict[str, tuple[SensorDeviceClass | None, str | None, SensorStateClass | None]] = {
+    "temperature_C": (SensorDeviceClass.TEMPERATURE, "°C", SensorStateClass.MEASUREMENT),
+    "temperature_F": (SensorDeviceClass.TEMPERATURE, "°F", SensorStateClass.MEASUREMENT),
+    "humidity": (SensorDeviceClass.HUMIDITY, "%", SensorStateClass.MEASUREMENT),
+    "pressure_hPa": (SensorDeviceClass.PRESSURE, "hPa", SensorStateClass.MEASUREMENT),
+    "pressure_kPa": (SensorDeviceClass.PRESSURE, "kPa", SensorStateClass.MEASUREMENT),
+    "wind_avg_km_h": (SensorDeviceClass.WIND_SPEED, "km/h", SensorStateClass.MEASUREMENT),
+    "wind_max_km_h": (SensorDeviceClass.WIND_SPEED, "km/h", SensorStateClass.MEASUREMENT),
+    "wind_dir_deg": (None, "°", SensorStateClass.MEASUREMENT),
+    "moisture": (SensorDeviceClass.MOISTURE, "%", SensorStateClass.MEASUREMENT),
+    "rssi": (SensorDeviceClass.SIGNAL_STRENGTH, "dBm", SensorStateClass.MEASUREMENT),
+    "snr": (None, "dB", SensorStateClass.MEASUREMENT),
+    "noise": (None, "dB", SensorStateClass.MEASUREMENT),
+    # Cumulative: rtl_433's rain_mm is a lifetime total from the gauge, not a rate.
+    "rain_mm": (SensorDeviceClass.PRECIPITATION, "mm", SensorStateClass.TOTAL_INCREASING),
+    "rain_in": (SensorDeviceClass.PRECIPITATION, "in", SensorStateClass.TOTAL_INCREASING),
 }
 
 # Hard ceiling on dynamically created entities. A busy 433 MHz band carries traffic from every
@@ -81,6 +96,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     known: dict[tuple[str, str], SdrHubDecodedSensor] = {}
     capped = False
 
+    # Seeded from the entity registry, not from zero. Unique ids are stable across restarts, so HA
+    # remembers every device ever discovered while this dict is rebuilt empty on each setup - a
+    # different set of neighbours after each reload could otherwise register another 200 every
+    # session, and the registry would grow without bound while the counter kept reporting a clean
+    # slate. Counting what already exists makes the cap mean what it says.
+    registry = er.async_get(hass)
+    already_registered = sum(
+        1
+        for e in er.async_entries_for_config_entry(registry, entry.entry_id)
+        if e.domain == "sensor" and e.unique_id != f"{entry.entry_id}_status"
+    )
+
     @callback
     def handle_event(event: dict[str, Any]) -> None:
         nonlocal capped
@@ -94,13 +121,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         key = decoded_device_key(device)
         new_entities: list[SdrHubDecodedSensor] = []
         for field, value in device.items():
-            if field in NON_MEASUREMENT_FIELDS or not isinstance(value, (int, float)) or isinstance(value, bool):
+            if field in NON_MEASUREMENT_FIELDS or field in FLAG_FIELDS:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
                 continue
             existing = known.get((key, field))
             if existing is not None:
                 existing.update_reading(float(value), device)
                 continue
-            if len(known) >= MAX_DECODED_ENTITIES:
+            if len(known) + already_registered >= MAX_DECODED_ENTITIES:
                 if not capped:
                     capped = True
                     _LOGGER.warning(
@@ -159,7 +188,6 @@ class SdrHubDecodedSensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, device: dict[str, Any], field: str, value: float) -> None:
         self._field = field
@@ -169,9 +197,10 @@ class SdrHubDecodedSensor(SensorEntity):
         self._attr_unique_id = f"{entry.entry_id}_{key}_{field}"
         # Underscores read as word breaks in HA's UI, and rtl_433 field names are snake_case.
         self._attr_name = field.replace("_", " ")
-        device_class, unit = FIELD_SEMANTICS.get(field, (None, None))
+        device_class, unit, state_class = FIELD_SEMANTICS.get(field, (None, None, None))
         self._attr_device_class = device_class
         self._attr_native_unit_of_measurement = unit
+        self._attr_state_class = state_class
         # Each decoded sensor is its own HA device, linked to the SDR Hub hub entry via_device so
         # the relationship is visible in the UI and removing the integration removes them all.
         self._attr_device_info = DeviceInfo(
