@@ -1391,6 +1391,8 @@ class SdrHubPanel extends HTMLElement {
     this._markers = {};
     // Last stats generation seen per sweep - see the reset boundary in _handleEvent.
     this._statsGen = {};
+    // Sweeps whose readout is suspended because continuity was lost - see _invalidateServedStats.
+    this._statsStale = {};
     // Latest per-sweep statistics as computed by the add-on, keyed by sweep id.
     this._sweepStats = {};
     // Per sweep: { latest, peak, avgSum, count, bins }. Deliberately in memory only and never
@@ -2064,6 +2066,9 @@ class SdrHubPanel extends HTMLElement {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       // Absent on an older add-on, and absent until a sweep has produced something measurable -
       // both are "no server figure", which the readout distinguishes from a value of zero.
+      // This row was measured after whatever boundary suspended the readout, so it is evidence the
+      // stream is delivering again - whether or not the add-on attaches statistics to it.
+      delete this._statsStale[event.sweep_id];
       if (event.stats) {
         // A new generation means the add-on reset its accumulator, and this row is the first that
         // belongs after the boundary. The local trace is cleared *here*, before this row is
@@ -3613,6 +3618,9 @@ class SdrHubPanel extends HTMLElement {
     for (const id of Object.keys(this._statsGen)) {
       if (!activeIds.has(id)) delete this._statsGen[id];
     }
+    for (const id of Object.keys(this._statsStale)) {
+      if (!activeIds.has(id)) delete this._statsStale[id];
+    }
     for (const id of Object.keys(this._markerCursor || {})) {
       if (!activeIds.has(id)) delete this._markerCursor[id];
     }
@@ -5100,11 +5108,24 @@ class SdrHubPanel extends HTMLElement {
   // strong carriers has a mean pulled up by exactly the bins that are not noise, which would then
   // hide those carriers by raising the threshold they are measured against. The median is
   // unaffected by a minority of loud bins, which is the property wanted here.
-  // Drops every served snapshot, so the readout falls back to locally-accumulated figures until a
-  // fresh row arrives. Not a clear of the local trace: those rows were really received.
+  // Drops every served snapshot and suspends the readout until a post-boundary row arrives.
+  //
+  // Falling back to the local figure was wrong for the same reason the served snapshot was: the
+  // local accumulator is built from the rows this tab received, so after a gap it describes the
+  // same incomplete picture. Dropping one and rendering the other changed which stale number was
+  // shown, not whether one was - and left the panel presenting a numeric occupancy while the HA
+  // entities were deliberately unavailable, indefinitely if the sweep then stalled.
+  //
+  // The fallback itself is still right for an add-on that never publishes statistics; what it
+  // cannot do is stand in for a snapshot that was invalidated because rows were missed. So it is
+  // suspended rather than removed, and the next row - which is post-boundary evidence whether or
+  // not it carries served figures - restores it.
   _invalidateServedStats() {
     for (const id of Object.keys(this._sweepStats)) delete this._sweepStats[id];
-    for (const id of Object.keys(this._traceState)) this._renderOccupancy(id);
+    for (const id of Object.keys(this._traceState)) {
+      this._statsStale[id] = true;
+      this._renderOccupancy(id);
+    }
   }
 
   _renderOccupancy(sweepId) {
@@ -5117,6 +5138,11 @@ class SdrHubPanel extends HTMLElement {
     // because those rows genuinely were received.
     const sweep = (this._state.sweeps || []).find((x) => x.id === sweepId);
     if (sweep && TERMINAL_SWEEP_STATUSES.has(sweep.status)) {
+      el.textContent = "";
+      return;
+    }
+    // Nothing measured since continuity was lost, so there is no figure that is honestly current.
+    if (this._statsStale[sweepId]) {
       el.textContent = "";
       return;
     }
