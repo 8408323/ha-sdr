@@ -66,6 +66,25 @@ NOISE_FLOOR_QUANTILE: float = 0.25
 # rtl_433 receiver defaults (ReceiverCreate / ReceiverConfig).
 DEFAULT_HOP_INTERVAL_S: int = 10
 
+# How long a discovery run listens for, and the bounds a caller may ask for.
+#
+# The default is a compromise against transmit intervals rather than a round number: the ISM
+# sensors this is aimed at report every 30-60 seconds, so a shorter listen routinely reports a
+# quiet band that simply had not spoken yet - the single most misleading answer this feature can
+# give. The upper bound exists because a discovery run holds the dongle claim for its whole
+# duration, blocking every sweep and receiver on that device; anything longer than a few minutes
+# is a receiver, which is the thing that already exists for listening indefinitely.
+DEFAULT_DISCOVERY_DURATION_S: int = 90
+MIN_DISCOVERY_DURATION_S: int = 10
+MAX_DISCOVERY_DURATION_S: int = 600
+
+# Cap on distinct devices one discovery run will accumulate. Reached only on a band far busier
+# than a home installation (a block of flats on 433 MHz, or a decoder mis-triggering on noise),
+# where the list has long since stopped being readable - past this point new devices are dropped
+# and the result is flagged truncated, rather than letting an unbounded dict grow behind a
+# snapshot that is rebroadcast on every single decode.
+DISCOVERY_MAX_DEVICES: int = 200
+
 # Per-client outbound WebSocket queue depth. Once full, the oldest pending
 # message is dropped so a slow client applies backpressure without letting
 # the server's memory grow unboundedly (see Broadcaster).
