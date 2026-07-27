@@ -46,6 +46,75 @@ const fmtHzSigned = (hz) => {
   return `${sign}${Math.round(abs)} Hz`;
 };
 
+// What is allocated to what, so a peak can be read as a service rather than as a number.
+//
+// A spectrum plot answers "something is transmitting at 434.037 MHz" and stops there, which is
+// the least useful half of the question. Naming the allocation turns that into "something is
+// transmitting in the 433 MHz SRD band", which is what decides whether to point rtl_433 at it,
+// ignore it as a broadcast carrier, or go looking for the device that owns it.
+//
+// **These are ITU Region 1 (Europe/Africa) allocations.** Region 2 (Americas) differs on exactly
+// the bands most worth labelling - the SRD band there is 902-928 MHz, not 863-870 - so a reading
+// taken elsewhere would be labelled confidently and wrongly. That is why every label is drawn as
+// an annotation over the measurement and never folded into it: nothing here changes a number, and
+// a user who knows their region is different can disregard the words without losing any data.
+//
+// Ranges may overlap (70cm amateur contains the 433 SRD band). bandAt() resolves that by
+// preferring the narrowest match, since the more specific allocation is the more informative one.
+//
+// Deliberately NOT merged with ISM_BANDS, despite 433.05-434.79 appearing identically in both.
+// That table answers a different question - "which licence-free bands might the devices this
+// panel decodes be using" - and is intentionally multi-region, carrying 315 MHz (US/JP) and
+// 902-928 MHz (US) that have no place in a Region 1 allocation map. Folding those in here would
+// actively mislead: 902-928 overlaps Region 1's GSM 900 uplink, and being the narrower range it
+// would win bandAt() and label a European GSM carrier as ISM. If you edit the 433 or 863-870
+// bounds in one table, change the other to match.
+const BAND_PLAN = [
+  { startHz: 87.5e6, stopHz: 108e6, label: "FM broadcast" },
+  { startHz: 108e6, stopHz: 137e6, label: "Airband (VHF air)" },
+  { startHz: 137e6, stopHz: 138e6, label: "Weather satellites (APT)" },
+  { startHz: 144e6, stopHz: 146e6, label: "2 m amateur" },
+  { startHz: 156e6, stopHz: 162.05e6, label: "Marine VHF / AIS" },
+  { startHz: 174e6, stopHz: 230e6, label: "DAB / DVB-T (VHF III)" },
+  { startHz: 380e6, stopHz: 400e6, label: "TETRA" },
+  { startHz: 430e6, stopHz: 440e6, label: "70 cm amateur" },
+  { startHz: 433.05e6, stopHz: 434.79e6, label: "433 MHz SRD/ISM" },
+  { startHz: 446e6, stopHz: 446.2e6, label: "PMR446" },
+  { startHz: 470e6, stopHz: 694e6, label: "UHF TV / DVB-T" },
+  { startHz: 694e6, stopHz: 790e6, label: "LTE 700" },
+  { startHz: 791e6, stopHz: 862e6, label: "LTE 800" },
+  { startHz: 863e6, stopHz: 870e6, label: "863-870 SRD/ISM" },
+  { startHz: 868e6, stopHz: 868.6e6, label: "868 SRD (home automation)" },
+  { startHz: 880e6, stopHz: 915e6, label: "GSM 900 uplink" },
+  { startHz: 925e6, stopHz: 960e6, label: "GSM 900 downlink" },
+  { startHz: 1087e6, stopHz: 1093e6, label: "ADS-B (1090 MHz)" },
+  { startHz: 1164e6, stopHz: 1215e6, label: "GNSS L5 / E5" },
+  { startHz: 1215e6, stopHz: 1240e6, label: "GNSS L2" },
+  { startHz: 1559e6, stopHz: 1610e6, label: "GNSS L1 / E1" },
+  { startHz: 1710e6, stopHz: 1785e6, label: "LTE 1800 uplink" },
+  { startHz: 1805e6, stopHz: 1880e6, label: "LTE 1800 downlink" },
+];
+
+// The allocation covering this frequency, preferring the narrowest one that does.
+// Returns null outside everything listed, which is a normal answer rather than a failure: the
+// table is deliberately partial, and "unlabelled" is more honest than the nearest wide guess.
+const bandAt = (hz) => {
+  if (!Number.isFinite(hz)) return null;
+  let best = null;
+  for (const band of BAND_PLAN) {
+    if (hz < band.startHz || hz >= band.stopHz) continue;
+    if (best === null || band.stopHz - band.startHz < best.stopHz - best.startHz) best = band;
+  }
+  return best;
+};
+
+// Allocations overlapping a swept range, narrowest first so a wide band never paints over the
+// specific one inside it (the 433 SRD band would otherwise vanish under 70cm amateur).
+const bandsOverlapping = (startHz, stopHz) =>
+  BAND_PLAN.filter((b) => b.stopHz > startHz && b.startHz < stopHz).sort(
+    (a, b) => b.stopHz - b.startHz - (a.stopHz - a.startHz),
+  );
+
 // "2m14s" / "48s" — used for the waterfall's relative-time axis ticks.
 const fmtElapsed = (ms) => {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -561,6 +630,7 @@ const DECODED_LOG_KEY = "sdr_hub_decoded_log";
 const DECODED_LOG_GEN_KEY = "sdr_hub_decoded_log_gen";
 const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 const SPECTRUM_TRACE_KEY = "sdr_hub_spectrum_trace";
+const BAND_PLAN_KEY = "sdr_hub_band_plan";
 
 // Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
 // how the band behaves over time but compresses power into colour, which is poor at exactly the
@@ -591,6 +661,7 @@ const ALL_PREF_KEYS = [
   BATTERY_SOUND_ALERT_KEY,
   BATTERY_LOW_KEY,
   SPECTRUM_TRACE_KEY,
+  BAND_PLAN_KEY,
 ];
 
 // Fingerprint of the persisted values that are baked into the shell's markup when it is rendered
@@ -1086,6 +1157,25 @@ function saveSpectrumTraceEnabled(enabled) {
   }
 }
 
+function loadBandPlanEnabled() {
+  try {
+    // Defaults on. It costs nothing to read past when it is not wanted, and the case it helps most
+    // is the first-time user staring at an unfamiliar peak - who is exactly the user least likely
+    // to go looking for a setting that would explain it.
+    return localStorage.getItem(BAND_PLAN_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveBandPlanEnabled(enabled) {
+  try {
+    localStorage.setItem(BAND_PLAN_KEY, enabled ? "true" : "false");
+  } catch {
+    // See saveColormap above.
+  }
+}
+
 function loadHelpDismissed() {
   try {
     // Some browsers/WebViews (notably with DOM storage disabled) throw a SecurityError just
@@ -1126,6 +1216,8 @@ const RECEIVER_PRESETS = [
 // coverage bar purely as a reference: "is my sweep pointed anywhere useful?" is otherwise
 // impossible to answer from a bare axis. Ranges are the common regional allocations, not an
 // exhaustive or legally authoritative list - hence the note rendered alongside them.
+// See BAND_PLAN for why this stays a separate table rather than being derived from it: this one
+// is deliberately multi-region, and its 433/868 bounds are duplicated there. Keep them in step.
 const ISM_BANDS = [
   { name: "315 MHz (US/JP)", start: 314e6, stop: 316e6 },
   { name: "433 MHz (EU/worldwide)", start: 433.05e6, stop: 434.79e6 },
@@ -1385,6 +1477,7 @@ class SdrHubPanel extends HTMLElement {
     // _audioCtx) so a detach/reattach re-arms it - the closed context needs a fresh gesture too.
     this._audioUnlockWired = false;
     this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
+    this._bandPlanEnabled = loadBandPlanEnabled();
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
@@ -1590,6 +1683,18 @@ class SdrHubPanel extends HTMLElement {
         this._renderDecodedLog();
         return;
       }
+      // Membership in ALL_PREF_KEYS only covers this key being *removed* (a peer's "Reset all
+      // preferences"), which reloads. An ordinary toggle is a plain setItem, and without a branch
+      // here every other open panel received that event and discarded it - keeping its old
+      // overlay and its old marker labels until it happened to be detached or reloaded, which is
+      // precisely the cross-tab behaviour the rest of this handler exists to provide.
+      if (ev.key === BAND_PLAN_KEY) {
+        this._bandPlanEnabled = loadBandPlanEnabled();
+        const toggle = this.querySelector("#sdr-hub-band-plan-toggle");
+        if (toggle) toggle.checked = this._bandPlanEnabled;
+        this._refreshBandPlanViews();
+        return;
+      }
       if (ev.key === BATTERY_SOUND_ALERT_KEY) {
         this._batterySoundEnabled = loadBatterySoundEnabled();
         const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
@@ -1694,6 +1799,7 @@ class SdrHubPanel extends HTMLElement {
     const previousMin = this._dbMin;
     const previousMax = this._dbMax;
     const previousTraceEnabled = this._spectrumTraceEnabled;
+    const previousBandPlan = this._bandPlanEnabled;
     this._deviceAliases = loadDeviceAliases();
     this._batterySoundEnabled = loadBatterySoundEnabled();
     // Re-read with the rest. Initialising it only in the constructor left a reattached panel
@@ -1701,6 +1807,7 @@ class SdrHubPanel extends HTMLElement {
     // was invisible here - and the next local toggle would then persist this tab's stale view over
     // the newer one. Exactly the split this whole block exists to prevent.
     this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
+    this._bandPlanEnabled = loadBandPlanEnabled();
     this._decodedTimeMode = loadDecodedTimeMode();
     this._favoriteDevices = loadFavoriteDevices();
     this._colormap = loadColormap();
@@ -1739,6 +1846,13 @@ class SdrHubPanel extends HTMLElement {
     const traceToggle = this.querySelector("#sdr-hub-spectrum-trace-toggle");
     if (traceToggle) traceToggle.checked = this._spectrumTraceEnabled;
     if (previousTraceEnabled !== this._spectrumTraceEnabled) this._applySpectrumTraceVisibility();
+    const bandPlanToggle = this.querySelector("#sdr-hub-band-plan-toggle");
+    if (bandPlanToggle) bandPlanToggle.checked = this._bandPlanEnabled;
+    // Repainted here rather than left to the colormap/contrast branch below: the overlay lives in
+    // the trace canvas, which that branch's _renderSweeps(true) would redraw - but only when one of
+    // *those* values also changed, so a peer toggling just this one would otherwise show nothing
+    // until the next unrelated repaint.
+    if (previousBandPlan !== this._bandPlanEnabled) this._refreshBandPlanViews();
     this._renderDecodedLog();
     if (previousColormap !== this._colormap || previousMin !== this._dbMin || previousMax !== this._dbMax) {
       this._renderSweeps(true);
@@ -3093,6 +3207,10 @@ class SdrHubPanel extends HTMLElement {
             <input type="checkbox" id="sdr-hub-spectrum-trace-toggle" ${this._spectrumTraceEnabled ? "checked" : ""}>
             Show the spectrum trace (current / peak hold / average) above each waterfall
           </label>
+          <label style="${LABEL};display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:12px;">
+            <input type="checkbox" id="sdr-hub-band-plan-toggle" ${this._bandPlanEnabled ? "checked" : ""}>
+            Label known frequency allocations on the spectrum (ITU Region 1 / Europe)
+          </label>
           <div>
             <button id="sdr-hub-reset-prefs" type="button" title="Clears all locally-saved preferences (colormap, contrast, favorites, decoded log, etc.) and reloads" style="${BTN_DANGER}">Reset all preferences</button>
           </div>
@@ -3177,6 +3295,11 @@ class SdrHubPanel extends HTMLElement {
       this._spectrumTraceEnabled = ev.target.checked;
       saveSpectrumTraceEnabled(this._spectrumTraceEnabled);
       this._applySpectrumTraceVisibility();
+    });
+    this.querySelector("#sdr-hub-band-plan-toggle").addEventListener("change", (ev) => {
+      this._bandPlanEnabled = ev.target.checked;
+      saveBandPlanEnabled(this._bandPlanEnabled);
+      this._refreshBandPlanViews();
     });
     this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
       this._batterySoundEnabled = ev.target.checked;
@@ -5073,6 +5196,10 @@ class SdrHubPanel extends HTMLElement {
       if (Number.isFinite(cur)) parts.push(`${cur.toFixed(1)} dB`);
       const pk = state.peak[bin];
       if (Number.isFinite(pk)) parts.push(`peak ${pk.toFixed(1)} dB`);
+      // Appended last and only when known, so the numbers a marker exists to report keep their
+      // position in the string whether or not the frequency falls in a labelled allocation.
+      const band = this._bandPlanEnabled ? bandAt(hz) : null;
+      if (band) parts.push(`[${band.label}]`);
       return parts.join(" ");
     };
     const texts = list.map((bin, i) => describe(bin, String.fromCharCode(65 + i)));
@@ -5080,9 +5207,11 @@ class SdrHubPanel extends HTMLElement {
     if (cursorBin != null) {
       const hz = this._markerFrequencyHz(sweepId, cursorBin);
       const cur = state.latest ? state.latest[cursorBin] : null;
+      const cursorBand = this._bandPlanEnabled ? bandAt(hz) : null;
       texts.unshift(
         `Cursor ${hz == null ? "?" : fmtMHz(hz)} MHz` +
           (Number.isFinite(cur) ? ` ${cur.toFixed(1)} dB` : "") +
+          (cursorBand ? ` [${cursorBand.label}]` : "") +
           " (Enter places, Esc clears)",
       );
     }
@@ -5250,6 +5379,101 @@ class SdrHubPanel extends HTMLElement {
     this._renderOccupancy(sweepId);
   }
 
+  // Repaints everything the band-plan setting feeds, after it has changed.
+  //
+  // _drawTrace alone is not enough and the omission is invisible in the common case: it redraws
+  // the canvases and the waterfall marker overlay, but the allocation suffix lives in the *text*
+  // readout produced by _renderMarkers. A sweep still delivering rows papers over the difference
+  // by re-rendering shortly afterwards anyway; a stopped or errored one never does, leaving a
+  // marker labelled by a setting that is no longer on. Redraw rather than rebuild - the overlay
+  // is painted inside the existing trace canvas, so nothing about the card's structure changes
+  // and a full _renderSweeps would discard scroll position for a change only affecting paint.
+  _refreshBandPlanViews() {
+    for (const id of Object.keys(this._traceState)) {
+      this._drawTrace(id);
+      this._renderMarkers(id);
+    }
+  }
+
+  // Shades and names the known allocations covering a sweep, as a backdrop for the traces.
+  //
+  // Painted into the trace canvas rather than as DOM beside it so it cannot drift out of
+  // alignment with the plot it annotates: both are drawn from the same width and the same
+  // frequency bounds, in the same pass. Everything here is background - drawn before the traces,
+  // markers and cursor - because an annotation that obscured a measurement would defeat itself.
+  _drawBandPlan(ctx, sweepId, w, h, bins, displayWidth) {
+    const row = (this._sweepRowHistory[sweepId] || [])[0];
+    if (!row || !bins) return;
+    const startHz = row.start_hz;
+    const stopHz = startHz + bins * row.bin_hz;
+    const spanHz = stopHz - startHz;
+    if (!(spanHz > 0)) return;
+    const bands = bandsOverlapping(startHz, stopHz);
+    if (!bands.length) return;
+    const xForHz = (hz) => ((hz - startHz) / spanHz) * (w - 1);
+
+    // The bitmap is one pixel per bin, but the element is only as wide as the card - so a
+    // 7680-bin sweep shown at 600px is squeezed horizontally by 12.8x, and *only* horizontally
+    // (the height is 1:1). Anything with an intrinsic shape rather than a position - text, line
+    // thickness - is therefore distorted rather than merely scaled, which compressed a label to
+    // roughly 8% of its width and made it unreadable. Everything below that is not a plain
+    // rectangle compensates for that ratio explicitly.
+    const scaleX = displayWidth > 0 ? w / displayWidth : 1;
+
+    ctx.save();
+    ctx.font = "10px sans-serif";
+    ctx.textBaseline = "top";
+    bands.forEach((band, i) => {
+      // Clamped to the canvas: a band almost always extends past one or both edges of the swept
+      // range, and an unclamped rect would be drawn off-canvas with its label placed off-canvas
+      // with it - losing the label for exactly the band that fills the view.
+      const x0 = Math.max(0, xForHz(band.startHz));
+      const x1 = Math.min(w, xForHz(band.stopHz));
+      if (!(x1 > x0)) return;
+      // Alternating tint, not per-band colour: the shading exists to show where one allocation
+      // ends and the next begins, and a palette would compete with the traces for meaning when
+      // colour in this panel already encodes power.
+      ctx.fillStyle = i % 2 === 0 ? "rgba(120,144,156,0.16)" : "rgba(120,144,156,0.08)";
+      ctx.fillRect(x0, 0, x1 - x0, h);
+      // Edges drawn only where they are genuinely inside the view, so a band running off-screen
+      // does not gain a boundary line the spectrum does not have.
+      ctx.strokeStyle = "rgba(120,144,156,0.55)";
+      // A 1-unit line in bitmap space renders 1/scaleX px wide, i.e. invisible on a wide sweep.
+      ctx.lineWidth = scaleX;
+      for (const edgeHz of [band.startHz, band.stopHz]) {
+        const ex = xForHz(edgeHz);
+        if (ex <= 0 || ex >= w - 1) continue;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(ex) + 0.5, 0);
+        ctx.lineTo(Math.round(ex) + 0.5, h);
+        ctx.stroke();
+      }
+      // Only label a band wide enough on screen to hold its text. Truncating or rotating instead
+      // would put unreadable marks over the trace on a wide sweep, where dozens of allocations can
+      // be in view at once and none of them has room.
+      // measureText is unaffected by the transform, so this is the label's true on-screen width
+      // and has to be compared against the band's on-screen width, not its width in bitmap pixels.
+      const textWidth = ctx.measureText(band.label).width;
+      if ((x1 - x0) / scaleX < textWidth + 8) return;
+      // Undo the horizontal compression for the text only. Inside this transform an x coordinate
+      // X lands at X*scaleX in the bitmap, so the intended bitmap position is divided back out -
+      // and lineWidth 3 becomes 3*scaleX horizontally and 3 vertically, which is exactly 3 on
+      // screen in both axes once the element's own compression is applied.
+      ctx.save();
+      ctx.scale(scaleX, 1);
+      const tx = (x0 + 4) / scaleX;
+      // Drawn twice - a light halo under the text - so the label stays legible against both the
+      // pale shading and whichever trace happens to pass behind it, in either theme.
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.strokeText(band.label, tx, 2);
+      ctx.fillStyle = "rgba(38,50,56,0.95)";
+      ctx.fillText(band.label, tx, 2);
+      ctx.restore();
+    });
+    ctx.restore();
+  }
+
   _drawTrace(sweepId) {
     // Before the early return, deliberately. Every path that shows markers already calls this, so
     // one owner here beats nine call sites each remembering to refresh the overlay - and the
@@ -5291,6 +5515,12 @@ class SdrHubPanel extends HTMLElement {
     const w = canvas.width;
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
+    if (this._bandPlanEnabled) {
+      // Measured after the alignment block above has applied its CSS width, so this is the width
+      // the bitmap is actually being displayed at rather than the one it had last frame.
+      const displayWidth = canvas.getBoundingClientRect().width;
+      this._drawBandPlan(ctx, sweepId, w, h, state.bins, displayWidth);
+    }
 
     // Shares the waterfall's contrast range so the two read as one instrument: a bin at the top of
     // this plot is the same power as a bin at the top of the colour scale beside it.
