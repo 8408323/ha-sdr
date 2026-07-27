@@ -1683,6 +1683,18 @@ class SdrHubPanel extends HTMLElement {
         this._renderDecodedLog();
         return;
       }
+      // Membership in ALL_PREF_KEYS only covers this key being *removed* (a peer's "Reset all
+      // preferences"), which reloads. An ordinary toggle is a plain setItem, and without a branch
+      // here every other open panel received that event and discarded it - keeping its old
+      // overlay and its old marker labels until it happened to be detached or reloaded, which is
+      // precisely the cross-tab behaviour the rest of this handler exists to provide.
+      if (ev.key === BAND_PLAN_KEY) {
+        this._bandPlanEnabled = loadBandPlanEnabled();
+        const toggle = this.querySelector("#sdr-hub-band-plan-toggle");
+        if (toggle) toggle.checked = this._bandPlanEnabled;
+        this._refreshBandPlanViews();
+        return;
+      }
       if (ev.key === BATTERY_SOUND_ALERT_KEY) {
         this._batterySoundEnabled = loadBatterySoundEnabled();
         const toggle = this.querySelector("#sdr-hub-battery-sound-toggle");
@@ -1840,9 +1852,7 @@ class SdrHubPanel extends HTMLElement {
     // the trace canvas, which that branch's _renderSweeps(true) would redraw - but only when one of
     // *those* values also changed, so a peer toggling just this one would otherwise show nothing
     // until the next unrelated repaint.
-    if (previousBandPlan !== this._bandPlanEnabled) {
-      for (const id of Object.keys(this._traceState)) this._drawTrace(id);
-    }
+    if (previousBandPlan !== this._bandPlanEnabled) this._refreshBandPlanViews();
     this._renderDecodedLog();
     if (previousColormap !== this._colormap || previousMin !== this._dbMin || previousMax !== this._dbMax) {
       this._renderSweeps(true);
@@ -3289,10 +3299,7 @@ class SdrHubPanel extends HTMLElement {
     this.querySelector("#sdr-hub-band-plan-toggle").addEventListener("change", (ev) => {
       this._bandPlanEnabled = ev.target.checked;
       saveBandPlanEnabled(this._bandPlanEnabled);
-      // Redraw rather than rebuild: the overlay is painted inside the trace canvas, so nothing
-      // about the card's structure changes and a full _renderSweeps would discard scroll position
-      // and marker overlays for a change that only affects what is painted.
-      for (const id of Object.keys(this._traceState)) this._drawTrace(id);
+      this._refreshBandPlanViews();
     });
     this.querySelector("#sdr-hub-battery-sound-toggle").addEventListener("change", (ev) => {
       this._batterySoundEnabled = ev.target.checked;
@@ -5372,13 +5379,29 @@ class SdrHubPanel extends HTMLElement {
     this._renderOccupancy(sweepId);
   }
 
+  // Repaints everything the band-plan setting feeds, after it has changed.
+  //
+  // _drawTrace alone is not enough and the omission is invisible in the common case: it redraws
+  // the canvases and the waterfall marker overlay, but the allocation suffix lives in the *text*
+  // readout produced by _renderMarkers. A sweep still delivering rows papers over the difference
+  // by re-rendering shortly afterwards anyway; a stopped or errored one never does, leaving a
+  // marker labelled by a setting that is no longer on. Redraw rather than rebuild - the overlay
+  // is painted inside the existing trace canvas, so nothing about the card's structure changes
+  // and a full _renderSweeps would discard scroll position for a change only affecting paint.
+  _refreshBandPlanViews() {
+    for (const id of Object.keys(this._traceState)) {
+      this._drawTrace(id);
+      this._renderMarkers(id);
+    }
+  }
+
   // Shades and names the known allocations covering a sweep, as a backdrop for the traces.
   //
   // Painted into the trace canvas rather than as DOM beside it so it cannot drift out of
   // alignment with the plot it annotates: both are drawn from the same width and the same
   // frequency bounds, in the same pass. Everything here is background - drawn before the traces,
   // markers and cursor - because an annotation that obscured a measurement would defeat itself.
-  _drawBandPlan(ctx, sweepId, w, h, bins) {
+  _drawBandPlan(ctx, sweepId, w, h, bins, displayWidth) {
     const row = (this._sweepRowHistory[sweepId] || [])[0];
     if (!row || !bins) return;
     const startHz = row.start_hz;
@@ -5388,6 +5411,14 @@ class SdrHubPanel extends HTMLElement {
     const bands = bandsOverlapping(startHz, stopHz);
     if (!bands.length) return;
     const xForHz = (hz) => ((hz - startHz) / spanHz) * (w - 1);
+
+    // The bitmap is one pixel per bin, but the element is only as wide as the card - so a
+    // 7680-bin sweep shown at 600px is squeezed horizontally by 12.8x, and *only* horizontally
+    // (the height is 1:1). Anything with an intrinsic shape rather than a position - text, line
+    // thickness - is therefore distorted rather than merely scaled, which compressed a label to
+    // roughly 8% of its width and made it unreadable. Everything below that is not a plain
+    // rectangle compensates for that ratio explicitly.
+    const scaleX = displayWidth > 0 ? w / displayWidth : 1;
 
     ctx.save();
     ctx.font = "10px sans-serif";
@@ -5407,7 +5438,8 @@ class SdrHubPanel extends HTMLElement {
       // Edges drawn only where they are genuinely inside the view, so a band running off-screen
       // does not gain a boundary line the spectrum does not have.
       ctx.strokeStyle = "rgba(120,144,156,0.55)";
-      ctx.lineWidth = 1;
+      // A 1-unit line in bitmap space renders 1/scaleX px wide, i.e. invisible on a wide sweep.
+      ctx.lineWidth = scaleX;
       for (const edgeHz of [band.startHz, band.stopHz]) {
         const ex = xForHz(edgeHz);
         if (ex <= 0 || ex >= w - 1) continue;
@@ -5419,9 +5451,17 @@ class SdrHubPanel extends HTMLElement {
       // Only label a band wide enough on screen to hold its text. Truncating or rotating instead
       // would put unreadable marks over the trace on a wide sweep, where dozens of allocations can
       // be in view at once and none of them has room.
+      // measureText is unaffected by the transform, so this is the label's true on-screen width
+      // and has to be compared against the band's on-screen width, not its width in bitmap pixels.
       const textWidth = ctx.measureText(band.label).width;
-      if (x1 - x0 < textWidth + 8) return;
-      const tx = x0 + 4;
+      if ((x1 - x0) / scaleX < textWidth + 8) return;
+      // Undo the horizontal compression for the text only. Inside this transform an x coordinate
+      // X lands at X*scaleX in the bitmap, so the intended bitmap position is divided back out -
+      // and lineWidth 3 becomes 3*scaleX horizontally and 3 vertically, which is exactly 3 on
+      // screen in both axes once the element's own compression is applied.
+      ctx.save();
+      ctx.scale(scaleX, 1);
+      const tx = (x0 + 4) / scaleX;
       // Drawn twice - a light halo under the text - so the label stays legible against both the
       // pale shading and whichever trace happens to pass behind it, in either theme.
       ctx.lineWidth = 3;
@@ -5429,6 +5469,7 @@ class SdrHubPanel extends HTMLElement {
       ctx.strokeText(band.label, tx, 2);
       ctx.fillStyle = "rgba(38,50,56,0.95)";
       ctx.fillText(band.label, tx, 2);
+      ctx.restore();
     });
     ctx.restore();
   }
@@ -5474,7 +5515,12 @@ class SdrHubPanel extends HTMLElement {
     const w = canvas.width;
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
-    if (this._bandPlanEnabled) this._drawBandPlan(ctx, sweepId, w, h, state.bins);
+    if (this._bandPlanEnabled) {
+      // Measured after the alignment block above has applied its CSS width, so this is the width
+      // the bitmap is actually being displayed at rather than the one it had last frame.
+      const displayWidth = canvas.getBoundingClientRect().width;
+      this._drawBandPlan(ctx, sweepId, w, h, state.bins, displayWidth);
+    }
 
     // Shares the waterfall's contrast range so the two read as one instrument: a bin at the top of
     // this plot is the same power as a bin at the top of the colour scale beside it.
