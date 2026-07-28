@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import math
+
 from constants import DEFAULT_HOP_INTERVAL_S, DISCOVERY_MAX_DEVICES
 from decode import ReceiverConfig, Rtl433Decoder
 
@@ -45,6 +47,31 @@ def discovered_device_key(device: dict[str, Any]) -> str:
     ident = device.get("id")
     channel = device.get("channel")
     return f"{model}|{'' if ident is None else ident}|{'' if channel is None else channel}"
+
+
+# The range a JSON integer may occupy before the serializers downstream reject it. Matches the
+# integration's own limits, deliberately: this is the same guard applied one layer earlier.
+_MIN_SERIALIZABLE_INT = -(2**63)
+_MAX_SERIALIZABLE_INT = 2**64 - 1
+
+
+def _json_safe(value: Any) -> Any:
+    """Returns the value, or None if it could not survive being serialized as JSON.
+
+    Applied where rtl_433's output is *recorded* rather than where it is sent, so every consumer
+    is protected by construction. The REST responses are encoded by FastAPI with strict JSON
+    rules, which reject NaN and infinity outright - so an unguarded snapshot did not merely lose a
+    field, it turned /discoveries into a 500 and left a reopening panel unable to retrieve any
+    retained run at all. The integration sanitizes as well, since it must tolerate an older
+    add-on, but the value should never have left here in the first place.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value if _MIN_SERIALIZABLE_INT <= value <= _MAX_SERIALIZABLE_INT else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 @dataclass
@@ -84,8 +111,13 @@ class DiscoveryRun:
         # is what snapshots report and a caller asking mid-teardown should not be told the run is
         # still listening. Teardown completing is a different fact, and it is the one that matters
         # to anyone waiting to use the dongle - so it gets its own signal.
-        self._finish_started = False
-        self._teardown_done = asyncio.Event()
+        # Bumped on every change to the run's observable state. Consumers see snapshots from two
+        # independent paths - the response to their own request, and the broadcast stream - which
+        # can arrive in either order, and "is finished" is too coarse to separate two *running*
+        # snapshots: the response to a start can carry an empty device list that lands after a
+        # decode has already been streamed, blanking a device the user just saw appear.
+        self._revision = 0
+        self._teardown_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._decoder = Rtl433Decoder(
@@ -131,8 +163,8 @@ class DiscoveryRun:
             self._devices[key] = {
                 "key": key,
                 "model": device.get("model"),
-                "id": device.get("id"),
-                "channel": device.get("channel"),
+                "id": _json_safe(device.get("id")),
+                "channel": _json_safe(device.get("channel")),
                 "first_seen": now,
                 "last_seen": now,
                 "count": 1,
@@ -152,6 +184,7 @@ class DiscoveryRun:
             freq = _frequency_hz(device, self.config.frequencies_hz)
             if freq is not None:
                 existing["frequency_hz"] = freq
+        self._revision += 1
         if self._on_update is not None:
             self._on_update(self.snapshot())
 
@@ -166,6 +199,16 @@ class DiscoveryRun:
         # forever, holding the dongle claim against every later receiver or sweep.
         asyncio.create_task(self.finish())
 
+    async def _teardown(self) -> None:
+        """Stops the subprocess and releases the dongle. Runs as its own task - see finish()."""
+        try:
+            if self._decoder is not None:
+                await self._decoder.stop()
+                self._decoder = None
+        finally:
+            if self._on_finished is not None:
+                self._on_finished()
+
     async def finish(self) -> None:
         """Ends the run and releases the dongle. Safe to call concurrently and repeatedly.
 
@@ -175,11 +218,11 @@ class DiscoveryRun:
         got a 409 that nothing in the UI explained. It also let DeviceManager.shutdown() return
         with a decoder still shutting down behind it.
         """
-        if self._finish_started:
-            await self._teardown_done.wait()
+        if self._teardown_task is not None:
+            await asyncio.shield(self._teardown_task)
             return
-        self._finish_started = True
         self.finished = True
+        self._revision += 1
         # Not cancelled when finish() is running *inside* it, which is the normal ending: the
         # deadline fires, _await_deadline awaits finish(), and cancelling the task here would
         # cancel the coroutine currently executing. The CancelledError then lands at the very next
@@ -197,18 +240,14 @@ class DiscoveryRun:
         # exception there used to skip the release entirely - and because `finished` was set at
         # the top, neither stopping nor dismissing the run could retry it, so the dongle stayed
         # claimed until the add-on restarted.
-        try:
-            if self._decoder is not None:
-                await self._decoder.stop()
-                self._decoder = None
-        finally:
-            try:
-                if self._on_finished is not None:
-                    self._on_finished()
-            finally:
-                # Set last and unconditionally, so a waiter is released even if teardown raised -
-                # otherwise one failure would strand every concurrent caller forever.
-                self._teardown_done.set()
+        # Teardown runs as its own task, awaited through a shield, so cancelling whoever called
+        # finish() cannot abandon it half-done. Previously a cancellation while awaiting stop()
+        # unwound straight through the release - handing the dongle to the next claimant while
+        # rtl_433 might still be alive and holding it - and left the run marked complete, so no
+        # later caller would retry. Isolating it means the process is always waited out, and the
+        # SIGKILL fallback always reached, whatever happens to the requester.
+        self._teardown_task = asyncio.create_task(self._teardown())
+        await asyncio.shield(self._teardown_task)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -217,6 +256,9 @@ class DiscoveryRun:
             "frequencies_hz": list(self.config.frequencies_hz),
             "duration_s": self.config.duration_s,
             "started_at": self.started_at,
+            # Monotonic within a run, so a consumer can order two snapshots that arrived by
+            # different routes without needing a clock shared with this process.
+            "revision": self._revision,
             "finished": self.finished,
             "truncated": self._truncated,
             "error": self.error,
@@ -236,7 +278,7 @@ def _frequency_hz(device: dict[str, Any], configured: list[float]) -> float | No
     a guess.
     """
     freq_mhz = device.get("freq")
-    if isinstance(freq_mhz, (int, float)) and not isinstance(freq_mhz, bool):
+    if isinstance(freq_mhz, (int, float)) and not isinstance(freq_mhz, bool) and math.isfinite(freq_mhz):
         return float(freq_mhz) * 1e6
     if len(configured) == 1:
         return float(configured[0])
@@ -264,7 +306,13 @@ def _sample_fields(device: dict[str, Any]) -> dict[str, Any]:
         # and passing one through would put an arbitrary payload into every snapshot broadcast.
         if not isinstance(value, (str, int, float, bool)) and value is not None:
             continue
-        out[key] = value
+        safe = _json_safe(value)
+        # Dropped rather than recorded as null: a reading that cannot be represented is not a
+        # reading of None, and showing "temperature_C: null" in a summary row would assert
+        # something the decode never said.
+        if safe is None and value is not None:
+            continue
+        out[key] = safe
         if len(out) >= _SAMPLE_MAX_FIELDS:
             break
     return out

@@ -362,13 +362,25 @@ class DeviceManager:
         self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.ERROR, str(err))
 
     async def shutdown(self) -> None:
-        for receiver_id in list(self._receivers):
-            await self.remove_receiver(receiver_id)
-        for sweep_id in list(self._sweeps):
-            await self.remove_sweep(sweep_id)
-        # Discoveries too, or an in-process lifespan restart leaves an rtl_433 subprocess and a
-        # deadline task alive, still holding the USB device - which the next startup then cannot
-        # claim. forget_discovery, not stop_discovery: the results are being discarded with the
-        # process that held them anyway.
-        for discovery_id in list(self._discoveries):
-            await self.forget_discovery(discovery_id)
+        """Releases every claimed dongle. One kind failing must not strand the others.
+
+        remove_sweep() raises SweepStopTimeoutError when a capture thread outlives its timeout,
+        which used to abort the whole shutdown - so a single stuck sweep left every discovery's
+        rtl_433 subprocess and deadline task running under the old manager, holding a dongle the
+        replacement manager then could not claim. Each kind is now attempted independently, and
+        the first error is re-raised afterwards so a genuinely stuck sweep is still reported.
+        """
+        first_error: Exception | None = None
+        for entity_id, stop in [
+            *((rid, self.remove_receiver) for rid in list(self._receivers)),
+            *((sid, self.remove_sweep) for sid in list(self._sweeps)),
+            *((did, self.forget_discovery) for did in list(self._discoveries)),
+        ]:
+            try:
+                await stop(entity_id)
+            except Exception as err:  # noqa: BLE001 - one stuck entity must not strand the rest
+                _LOGGER.exception("shutdown: failed to stop %s", entity_id)
+                if first_error is None:
+                    first_error = err
+        if first_error is not None:
+            raise first_error

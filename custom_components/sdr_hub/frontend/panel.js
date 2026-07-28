@@ -632,6 +632,12 @@ const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 const SPECTRUM_TRACE_KEY = "sdr_hub_spectrum_trace";
 const BAND_PLAN_KEY = "sdr_hub_band_plan";
 
+// How many dismissed discovery ids to remember (see _rememberDismissed). Generous, because the
+// entries are just strings and the cost of forgetting one too early is a resurrected card: a
+// panel would have to dismiss this many runs in a single session before the oldest is dropped,
+// by which point nothing from that run can still be in flight.
+const MAX_DISMISSED_DISCOVERIES = 200;
+
 // Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
 // how the band behaves over time but compresses power into colour, which is poor at exactly the
 // judgement this plot exists for - how far a signal stands above the noise floor, and whether an
@@ -1489,7 +1495,13 @@ class SdrHubPanel extends HTMLElement {
     // Ids dismissed by this tab. A snapshot for a dismissed run can still be in flight - queued
     // on the add-on stream, or captured by a list request that started earlier - and applying it
     // would put back a card whose next Dismiss returns 404, since the run is already gone
-    // server-side. Held until a list confirms the run is absent, then pruned.
+    // server-side.
+    //
+    // Kept for the life of the panel rather than retired when a list stops reporting the run.
+    // The REST list and the event stream are independent channels, so absence from one says
+    // nothing about what is still queued on the other - retiring on that basis reopened the very
+    // race the tombstone exists to close. Bounded by count instead, which needs no assumption
+    // about delivery timing.
     this._dismissedDiscoveries = new Set();
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
@@ -6423,7 +6435,7 @@ class SdrHubPanel extends HTMLElement {
       // Invalidates any list request already in flight, which may have captured this run before
       // it was dismissed and would otherwise put its card back.
       this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
-      this._dismissedDiscoveries.add(discoveryId);
+      this._rememberDismissed(discoveryId);
       const next = { ...(this._discoveries || {}) };
       delete next[discoveryId];
       this._discoveries = next;
@@ -6452,10 +6464,6 @@ class SdrHubPanel extends HTMLElement {
       if (!Array.isArray(runs)) return;
       const byId = {};
       for (const run of runs) if (run && run.id && !this._dismissedDiscoveries.has(run.id)) byId[run.id] = run;
-      // Authoritative, so it is also what retires a tombstone: once the add-on no longer lists a
-      // run, no further snapshot for it can arrive and the entry would otherwise be kept forever.
-      const present = new Set(runs.filter((r) => r && r.id).map((r) => r.id));
-      for (const id of [...this._dismissedDiscoveries]) if (!present.has(id)) this._dismissedDiscoveries.delete(id);
       this._discoveries = byId;
       this._renderDiscoveries();
     } catch {
@@ -6475,9 +6483,32 @@ class SdrHubPanel extends HTMLElement {
     if (!run || !run.id) return false;
     if (this._dismissedDiscoveries.has(run.id)) return false;
     const existing = (this._discoveries || {})[run.id];
-    if (existing && existing.finished && !run.finished) return false;
+    if (existing) {
+      // The add-on stamps every snapshot with a revision that only increases, which is the only
+      // thing that can order two snapshots of a *running* run: both have finished === false, so
+      // the response to a start - captured before the POST returned - could otherwise land after
+      // a streamed decode and replace a populated device list with the initial empty one, making
+      // a sensor the user just watched appear vanish again.
+      if (Number.isFinite(run.revision) && Number.isFinite(existing.revision)) {
+        if (run.revision <= existing.revision) return false;
+      } else if (existing.finished && !run.finished) {
+        // An add-on too old to send a revision. Coarser, but it still prevents the worst case of
+        // a finished run being shown as running again with a Stop button that does nothing.
+        return false;
+      }
+    }
     this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
     return true;
+  }
+
+  // Records a dismissal, capped so a long-lived panel cannot accumulate ids without limit.
+  // Eviction is oldest-first: the older a dismissal is, the less likely any snapshot predating it
+  // is still in flight, so the entries least worth keeping are exactly the ones dropped.
+  _rememberDismissed(discoveryId) {
+    this._dismissedDiscoveries.add(discoveryId);
+    while (this._dismissedDiscoveries.size > MAX_DISMISSED_DISCOVERIES) {
+      this._dismissedDiscoveries.delete(this._dismissedDiscoveries.values().next().value);
+    }
   }
 
   _renderDiscoveries() {
