@@ -56,6 +56,18 @@ class SdrHubApiClient:
     async def async_remove_receiver(self, receiver_id: str) -> None:
         await self._request("DELETE", f"/receivers/{receiver_id}")
 
+    async def async_get_discoveries(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/discoveries")
+
+    async def async_start_discovery(self, config: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/discoveries", json=config)
+
+    async def async_stop_discovery(self, discovery_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/discoveries/{discovery_id}/stop")
+
+    async def async_forget_discovery(self, discovery_id: str) -> None:
+        await self._request("DELETE", f"/discoveries/{discovery_id}")
+
     async def async_get_sweeps(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/sweeps")
 

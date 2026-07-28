@@ -1478,6 +1478,11 @@ class SdrHubPanel extends HTMLElement {
     this._audioUnlockWired = false;
     this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
     this._bandPlanEnabled = loadBandPlanEnabled();
+    // Discovery runs by id. Deliberately not persisted: a result describes what was on the air
+    // during one bounded listen, and restoring yesterday's from storage would present a stale
+    // observation as a current one. The add-on holds them until dismissed and _loadDiscoveries
+    // re-reads them from there, which keeps a single source of truth.
+    this._discoveries = {};
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
@@ -2148,6 +2153,10 @@ class SdrHubPanel extends HTMLElement {
     //
     // Only this operation is reported ready; subscribe owns its own half of that decision.
     this._noteIntegrationReady("loadState");
+    // Fetched alongside the polled state but deliberately not awaited: discovery results are not
+    // part of get_state, and a slow or unsupported list must not delay rendering everything else.
+    // Its own failure handling is silent, for the reason given on _loadDiscoveries.
+    this._loadDiscoveries();
     // Recovered from a prior load failure - clear its banner now that fresh state actually
     // arrived. Only do this if the banner currently showing IS that load error (the flag
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
@@ -2176,6 +2185,17 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _handleEvent(event) {
+    // Whole-state, so it replaces rather than merges: the add-on rebuilds and broadcasts the
+    // complete snapshot on every decode, and a partial update would have nothing to reconcile
+    // against. Handled before anything else because it shares no state with the rest.
+    if (event.type === "discovery") {
+      const run = event.discovery;
+      if (run && run.id) {
+        this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+        this._renderDiscoveries();
+      }
+      return;
+    }
     if (event.type === "sweep_row") {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       // Absent on an older add-on, and absent until a sweep has produced something measurable -
@@ -3164,6 +3184,25 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
+          <h2 style="margin:0 0 8px;">Discover devices</h2>
+          <p style="margin:0 0 10px;font-size:.85rem;color:var(--secondary-text-color,#727272);">
+            Listens for a fixed time and lists what is transmitting, without adding anything to
+            Home Assistant. Use it to find out what is around before starting a receiver.
+          </p>
+          <form id="sdr-hub-start-discovery" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+            <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
+              <option value="">Custom</option>
+              ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
+            </select></label>
+            <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
+            <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="433.92" style="${INPUT};width:180px"></label>
+            <label style="${LABEL}">Listen for s<input name="duration_s" type="number" min="10" max="600" value="90" style="${INPUT};width:100px"></label>
+            <button type="submit" style="${BTN}">Start listening</button>
+          </form>
+          <div id="sdr-hub-discoveries"></div>
+        </div>
+
+        <div style="${CARD}">
           <h2 style="margin:0 0 8px;">Decoded devices</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
@@ -3271,6 +3310,7 @@ class SdrHubPanel extends HTMLElement {
     });
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
+    this.querySelector("#sdr-hub-start-discovery").addEventListener("submit", (ev) => this._onStartDiscovery(ev));
     this.querySelector("#sdr-hub-sweep-filter").addEventListener("input", (ev) => {
       this._sweepFilter = ev.target.value.trim().toLowerCase();
       this._applySweepFilter();
@@ -3287,6 +3327,9 @@ class SdrHubPanel extends HTMLElement {
     this._wireConfirmButton(this.querySelector("#sdr-hub-stop-all-receivers"), () => this._onStopAllReceivers());
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
+    // Same presets as the receiver form on purpose: discovery answers "what is on this frequency"
+    // and starting a receiver is the next step, so the two must offer the same choices.
+    this._wirePresetSelect("sdr-hub-start-discovery", RECEIVER_PRESETS);
     this._wireColormapControls();
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
@@ -3675,10 +3718,13 @@ class SdrHubPanel extends HTMLElement {
         </table>
         </div>`;
     }
-    for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver"]) {
+    for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver", "sdr-hub-start-discovery"]) {
       const select = this.querySelector(`#${form} select[name="dongle_serial"]`);
       if (!select) continue;
-      const isReceiver = form === "sdr-hub-add-receiver";
+      // Discovery runs rtl_433, exactly as a receiver does, so it is subject to the same
+      // driver restriction and reuses the receiver's remembered dongle - the two are almost
+      // always aimed at the same device.
+      const isReceiver = form === "sdr-hub-add-receiver" || form === "sdr-hub-start-discovery";
       const prefs = loadFormPrefs(isReceiver ? RECEIVER_FORM_PREFS_KEY : SWEEP_FORM_PREFS_KEY);
       this._renderDongleOptions(select, {
         rtlsdrOnly: isReceiver,
@@ -6307,6 +6353,153 @@ class SdrHubPanel extends HTMLElement {
     }
     if (errors.length) this._showError(`Could not stop all sweeps: ${errors.join("; ")}`, { owner: "sweepAction" });
     else this._clearErrorIfOwnedBy("sweepAction", errorToken);
+  }
+
+  async _onStartDiscovery(ev) {
+    const errorToken = this._errorToken || 0;
+    ev.preventDefault();
+    // See _onAddSweep's identical formEl capture - same reasoning.
+    const formEl = ev.target;
+    const form = new FormData(formEl);
+    const frequenciesHz = String(form.get("frequencies_mhz"))
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+      .map((v) => Number(v) * 1e6);
+    try {
+      const run = await this._callWS({
+        type: "sdr_hub/start_discovery",
+        dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(formEl),
+        frequencies_hz: frequenciesHz,
+        duration_s: Number(form.get("duration_s")) || 90,
+      });
+      // Held locally rather than waiting for the first broadcast: a run over a quiet band may
+      // emit nothing at all until it finishes, and a button that appeared to do nothing for
+      // ninety seconds would be indistinguishable from one that failed.
+      if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not start listening: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  async _onStopDiscovery(discoveryId) {
+    const errorToken = this._errorToken || 0;
+    try {
+      const run = await this._callWS({ type: "sdr_hub/stop_discovery", discovery_id: discoveryId });
+      if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not stop listening: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  async _onForgetDiscovery(discoveryId) {
+    const errorToken = this._errorToken || 0;
+    try {
+      await this._callWS({ type: "sdr_hub/forget_discovery", discovery_id: discoveryId });
+      const next = { ...(this._discoveries || {}) };
+      delete next[discoveryId];
+      this._discoveries = next;
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not dismiss the result: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  // Discovery results are not part of the polled snapshot, so a panel opening after a run
+  // finished would otherwise show nothing at all - and the finished result is exactly what a
+  // user comes back to look at. Failure is deliberately silent: this runs on every load, and an
+  // add-on too old to know the command would otherwise put a permanent error banner on the panel
+  // for a feature the user may not be using.
+  async _loadDiscoveries() {
+    try {
+      const runs = await this._callWS({ type: "sdr_hub/list_discoveries" });
+      if (!Array.isArray(runs)) return;
+      const byId = {};
+      for (const run of runs) if (run && run.id) byId[run.id] = run;
+      this._discoveries = byId;
+      this._renderDiscoveries();
+    } catch {
+      // See above - not surfaced.
+    }
+  }
+
+  _renderDiscoveries() {
+    const el = this.querySelector("#sdr-hub-discoveries");
+    if (!el) return;
+    const runs = Object.values(this._discoveries || {}).sort((a, b) => (b.started_at || 0) - (a.started_at || 0));
+    if (!runs.length) {
+      el.innerHTML = `<div style="font-size:.85rem;color:var(--secondary-text-color,#727272);">No listening runs yet.</div>`;
+      return;
+    }
+    el.innerHTML = runs.map((run) => this._discoveryCard(run)).join("");
+    for (const btn of el.querySelectorAll("[data-discovery-stop]")) {
+      btn.addEventListener("click", () => this._onStopDiscovery(btn.getAttribute("data-discovery-stop")));
+    }
+    for (const btn of el.querySelectorAll("[data-discovery-forget]")) {
+      btn.addEventListener("click", () => this._onForgetDiscovery(btn.getAttribute("data-discovery-forget")));
+    }
+  }
+
+  _discoveryCard(run) {
+    const freqs = (run.frequencies_hz || []).map((hz) => `${fmtMHz(hz)} MHz`).join(", ");
+    const running = !run.finished;
+    const devices = run.devices || [];
+    // "Heard nothing" is only the answer once the run is over. Saying it while still listening
+    // would report a conclusion the run has not reached, on precisely the band where the wait is
+    // longest - a sensor that reports once a minute looks like an empty band for most of a run.
+    const body = devices.length
+      ? `<table style="width:100%;border-collapse:collapse;font-size:.85rem;">
+           <thead><tr style="text-align:left;color:var(--secondary-text-color,#727272);">
+             <th style="padding:2px 6px 2px 0;">Device</th>
+             <th style="padding:2px 6px;">Frequency</th>
+             <th style="padding:2px 6px;">Heard</th>
+             <th style="padding:2px 0 2px 6px;">Latest reading</th>
+           </tr></thead>
+           <tbody>${devices.map((d) => this._discoveryRow(d)).join("")}</tbody>
+         </table>`
+      : `<div style="font-size:.85rem;color:var(--secondary-text-color,#727272);">${
+          running ? "Listening…" : "Nothing was heard on this frequency during the run."
+        }</div>`;
+    const note = run.error
+      ? `<div style="color:var(--error-color,#db4437);font-size:.8rem;margin-top:6px;">${esc(run.error)}</div>`
+      : run.truncated
+        ? `<div style="font-size:.8rem;margin-top:6px;color:var(--secondary-text-color,#727272);">Too many devices to list them all; showing the first ones found.</div>`
+        : "";
+    return `
+      <div style="border:1px solid var(--divider-color,#e0e0e0);border-radius:6px;padding:10px;margin-bottom:8px;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+          <strong style="font-size:.9rem;">${esc(freqs)}</strong>
+          <span style="font-size:.8rem;color:var(--secondary-text-color,#727272);">
+            ${running ? `listening for ${esc(String(run.duration_s))}s` : "finished"} ·
+            ${devices.length} device${devices.length === 1 ? "" : "s"}
+          </span>
+          <span style="flex:1"></span>
+          ${running ? `<button type="button" data-discovery-stop="${esc(run.id)}" style="${BTN}">Stop now</button>` : ""}
+          <button type="button" data-discovery-forget="${esc(run.id)}" style="${BTN_DANGER}">Dismiss</button>
+        </div>
+        ${body}${note}
+      </div>`;
+  }
+
+  _discoveryRow(d) {
+    const name = [d.model || "Unknown", d.id != null ? `id ${d.id}` : "", d.channel != null ? `ch ${d.channel}` : ""]
+      .filter(Boolean)
+      .join(" ");
+    const sample = Object.entries(d.sample || {})
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    return `<tr>
+      <td style="padding:2px 6px 2px 0;">${esc(name)}</td>
+      <td style="padding:2px 6px;">${d.frequency_hz ? esc(fmtMHz(d.frequency_hz)) + " MHz" : "—"}</td>
+      <td style="padding:2px 6px;">${esc(String(d.count || 0))}×</td>
+      <td style="padding:2px 0 2px 6px;color:var(--secondary-text-color,#727272);">${esc(sample) || "—"}</td>
+    </tr>`;
   }
 
   async _onAddReceiver(ev) {
