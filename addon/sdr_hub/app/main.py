@@ -358,7 +358,13 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
     Registered app-wide rather than per route: any endpoint taking a float is reachable this way,
     and the frequency fields are simply where it was noticed.
     """
-    return JSONResponse(status_code=422, content=jsonable_encoder(exc.errors(), custom_encoder={float: _json_safe_float}))
+    # Wrapped in {"detail": [...]} exactly as FastAPI's own handler does. This exists only to
+    # change how a value is *encoded*, and returning a bare array would have quietly changed the
+    # response shape of every validation failure in the API to fix a serialization edge case.
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors(), custom_encoder={float: _json_safe_float})},
+    )
 
 
 def _json_safe_float(value: float) -> float | str:

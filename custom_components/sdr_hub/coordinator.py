@@ -91,16 +91,26 @@ def sanitize_discovery_snapshot(discovery: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(entry, dict):
             cleaned_devices.append(entry)
             continue
+        # The entry's own numbers are as externally sourced as the sample's: id, channel and
+        # frequency_hz all come from rtl_433, and one of them outside the serializer's range
+        # discards the whole message just as a bad sample field would. `key` carries the same
+        # identity as a string, so an entry that loses its id is still distinguishable.
+        model = entry.get("model")
         sample = entry.get("sample")
-        if not isinstance(sample, dict):
-            cleaned_devices.append(entry)
-            continue
-        cleaned_sample = _sanitize_device(sample, model=entry.get("model"))
-        if cleaned_sample is sample:
+        # Split so the nested sample is not walked as if it were a scalar field of the entry.
+        outer = {k: v for k, v in entry.items() if k != "sample"}
+        cleaned_outer = _sanitize_device(outer, model=model)
+        cleaned_sample = _sanitize_device(sample, model=model) if isinstance(sample, dict) else sample
+        # _sanitize_device returns its argument unchanged when nothing was dropped, and `outer` is
+        # freshly built here, so identity is an exact test for "this entry was already clean".
+        if cleaned_outer is outer and cleaned_sample is sample:
             cleaned_devices.append(entry)
             continue
         changed = True
-        cleaned_devices.append({**entry, "sample": cleaned_sample})
+        rebuilt = dict(cleaned_outer)
+        if "sample" in entry:
+            rebuilt["sample"] = cleaned_sample
+        cleaned_devices.append(rebuilt)
     if not changed:
         return discovery
     return {**discovery, "devices": cleaned_devices}

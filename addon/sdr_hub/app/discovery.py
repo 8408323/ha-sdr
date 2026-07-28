@@ -80,6 +80,12 @@ class DiscoveryRun:
         self._on_finished = on_finished
         self._decoder: Rtl433Decoder | None = None
         self._deadline_task: asyncio.Task | None = None
+        # `finished` means "the run is over" and is set as soon as teardown *begins*, because it
+        # is what snapshots report and a caller asking mid-teardown should not be told the run is
+        # still listening. Teardown completing is a different fact, and it is the one that matters
+        # to anyone waiting to use the dongle - so it gets its own signal.
+        self._finish_started = False
+        self._teardown_done = asyncio.Event()
 
     async def start(self) -> None:
         self._decoder = Rtl433Decoder(
@@ -161,8 +167,18 @@ class DiscoveryRun:
         asyncio.create_task(self.finish())
 
     async def finish(self) -> None:
-        if self.finished:
+        """Ends the run and releases the dongle. Safe to call concurrently and repeatedly.
+
+        A second caller waits for the first to finish rather than returning immediately. Returning
+        on the flag alone meant a dismiss could answer - and its ownership refresh could run -
+        while a slow-to-terminate rtl_433 still held the device, so a capture started right after
+        got a 409 that nothing in the UI explained. It also let DeviceManager.shutdown() return
+        with a decoder still shutting down behind it.
+        """
+        if self._finish_started:
+            await self._teardown_done.wait()
             return
+        self._finish_started = True
         self.finished = True
         # Not cancelled when finish() is running *inside* it, which is the normal ending: the
         # deadline fires, _await_deadline awaits finish(), and cancelling the task here would
@@ -186,8 +202,13 @@ class DiscoveryRun:
                 await self._decoder.stop()
                 self._decoder = None
         finally:
-            if self._on_finished is not None:
-                self._on_finished()
+            try:
+                if self._on_finished is not None:
+                    self._on_finished()
+            finally:
+                # Set last and unconditionally, so a waiter is released even if teardown raised -
+                # otherwise one failure would strand every concurrent caller forever.
+                self._teardown_done.set()
 
     def snapshot(self) -> dict[str, Any]:
         return {

@@ -1486,6 +1486,11 @@ class SdrHubPanel extends HTMLElement {
     // Monotonic counter guarding the unawaited discovery list against stale responses, exactly as
     // _loadStateRequestId does for state loads.
     this._discoveryLoadId = 0;
+    // Ids dismissed by this tab. A snapshot for a dismissed run can still be in flight - queued
+    // on the add-on stream, or captured by a list request that started earlier - and applying it
+    // would put back a card whose next Dismiss returns 404, since the run is already gone
+    // server-side. Held until a list confirms the run is absent, then pruned.
+    this._dismissedDiscoveries = new Set();
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
@@ -2194,9 +2199,12 @@ class SdrHubPanel extends HTMLElement {
     if (event.type === "discovery") {
       const run = event.discovery;
       if (run && run.id) {
-        this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
         const previous = (this._discoveries || {})[run.id];
-        this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+        // The counter is bumped only when the event is actually adopted. Bumping it for a
+        // snapshot that is then rejected would discard the authoritative list request a dismissal
+        // triggers, leaving exactly the stale card the tombstone exists to prevent.
+        if (!this._mergeDiscovery(run)) return;
+        this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
         this._renderDiscoveries();
         // A run ending releases the dongle, which the polled snapshot reports as in_use_by - and
         // nothing else would tell this panel, since the release happens inside the add-on rather
@@ -6387,7 +6395,7 @@ class SdrHubPanel extends HTMLElement {
       // emit nothing at all until it finishes, and a button that appeared to do nothing for
       // ninety seconds would be indistinguishable from one that failed.
       this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
-      if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+      this._mergeDiscovery(run);
       this._renderDiscoveries();
       this._clearErrorIfOwnedBy("discoveryAction", errorToken);
     } catch (err) {
@@ -6400,7 +6408,7 @@ class SdrHubPanel extends HTMLElement {
     try {
       const run = await this._callWS({ type: "sdr_hub/stop_discovery", discovery_id: discoveryId });
       this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
-      if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+      this._mergeDiscovery(run);
       this._renderDiscoveries();
       this._clearErrorIfOwnedBy("discoveryAction", errorToken);
     } catch (err) {
@@ -6415,6 +6423,7 @@ class SdrHubPanel extends HTMLElement {
       // Invalidates any list request already in flight, which may have captured this run before
       // it was dismissed and would otherwise put its card back.
       this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+      this._dismissedDiscoveries.add(discoveryId);
       const next = { ...(this._discoveries || {}) };
       delete next[discoveryId];
       this._discoveries = next;
@@ -6442,12 +6451,33 @@ class SdrHubPanel extends HTMLElement {
       if (requestId !== this._discoveryLoadId) return; // superseded by a newer load
       if (!Array.isArray(runs)) return;
       const byId = {};
-      for (const run of runs) if (run && run.id) byId[run.id] = run;
+      for (const run of runs) if (run && run.id && !this._dismissedDiscoveries.has(run.id)) byId[run.id] = run;
+      // Authoritative, so it is also what retires a tombstone: once the add-on no longer lists a
+      // run, no further snapshot for it can arrive and the entry would otherwise be kept forever.
+      const present = new Set(runs.filter((r) => r && r.id).map((r) => r.id));
+      for (const id of [...this._dismissedDiscoveries]) if (!present.has(id)) this._dismissedDiscoveries.delete(id);
       this._discoveries = byId;
       this._renderDiscoveries();
     } catch {
       // See above - not surfaced.
     }
+  }
+
+  // Applies a snapshot from any source - the start/stop response, a streamed event, or a list -
+  // under the two rules every source has to obey.
+  //
+  // Snapshots arrive out of order. A start response is captured before the POST returns, so a
+  // streamed event (even the final one, for a short run) can overtake it; applying it blindly
+  // turned a finished run back into a running one, leaving a Stop button that nothing would
+  // correct because no further event was coming. Refusing to move a run from finished back to
+  // running is enough to order them, and needs no clock shared with the add-on.
+  _mergeDiscovery(run) {
+    if (!run || !run.id) return false;
+    if (this._dismissedDiscoveries.has(run.id)) return false;
+    const existing = (this._discoveries || {})[run.id];
+    if (existing && existing.finished && !run.finished) return false;
+    this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+    return true;
   }
 
   _renderDiscoveries() {
