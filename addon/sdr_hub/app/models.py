@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import Enum
 
 from constants import (
@@ -53,8 +54,12 @@ def _validate_rtl433_params(frequencies_hz: list[float], hop_interval_s: int) ->
     what is valid.
     """
     for freq in frequencies_hz:
-        if freq <= 0:
-            raise ValueError("frequencies_hz entries must be positive")
+        # isfinite first: Pydantic accepts NaN and infinity as floats, and both slip past a bare
+        # positivity test (NaN <= 0 and inf <= 0 are each false). Rtl433Decoder.start() then calls
+        # int(freq), which raises for either - after the dongle has already been claimed, so an
+        # invalid request surfaces as a 500 rather than a validation error.
+        if not math.isfinite(freq) or freq <= 0:
+            raise ValueError("frequencies_hz entries must be positive finite numbers")
     if hop_interval_s <= 0:
         raise ValueError("hop_interval_s must be positive")
 

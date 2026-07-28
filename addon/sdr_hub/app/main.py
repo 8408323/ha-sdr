@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import threading
 import os
 import time
@@ -13,7 +14,10 @@ from pathlib import Path
 from auth import resolve_api_token
 from broadcaster import Broadcaster
 from device_manager import DeviceManager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from models import EntityKind, EntityStatus
 from routes import router
 from scanner import SweepRow
@@ -342,4 +346,24 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Returns 422 for an invalid request even when the invalid value cannot be JSON-encoded.
+
+    FastAPI's default handler echoes the offending input back in the error body, and Starlette's
+    JSONResponse encodes with allow_nan=False - so a request carrying NaN or infinity produced a
+    500 while *serialising its own 422*, hiding a perfectly good validation message behind a
+    server error. Rejecting the request was already correct; only the reply was not.
+
+    Registered app-wide rather than per route: any endpoint taking a float is reachable this way,
+    and the frequency fields are simply where it was noticed.
+    """
+    return JSONResponse(status_code=422, content=jsonable_encoder(exc.errors(), custom_encoder={float: _json_safe_float}))
+
+
+def _json_safe_float(value: float) -> float | str:
+    """Renders a non-finite float as its name, so it still appears in the error it caused."""
+    return value if math.isfinite(value) else repr(value)
+
+
 app.include_router(router)

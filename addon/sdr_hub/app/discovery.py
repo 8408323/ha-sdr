@@ -175,11 +175,19 @@ class DiscoveryRun:
         self._deadline_task = None
         if deadline is not None and deadline is not current and not deadline.done():
             deadline.cancel()
-        if self._decoder is not None:
-            await self._decoder.stop()
-            self._decoder = None
-        if self._on_finished is not None:
-            self._on_finished()
+        # on_finished is what releases the dongle, so it has to run even when stopping the decoder
+        # fails. The path that made this necessary: rtl_433 exits by itself, _on_decoder_exit
+        # schedules finish(), and stop() then terminates a process that is already gone. Any
+        # exception there used to skip the release entirely - and because `finished` was set at
+        # the top, neither stopping nor dismissing the run could retry it, so the dongle stayed
+        # claimed until the add-on restarted.
+        try:
+            if self._decoder is not None:
+                await self._decoder.stop()
+                self._decoder = None
+        finally:
+            if self._on_finished is not None:
+                self._on_finished()
 
     def snapshot(self) -> dict[str, Any]:
         return {

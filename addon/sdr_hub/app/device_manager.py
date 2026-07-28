@@ -230,13 +230,19 @@ class DeviceManager:
         if run is not None and self._on_discovery is not None:
             self._on_discovery(run.snapshot())
 
-    async def stop_discovery(self, discovery_id: str) -> bool:
-        """Ends a run early, keeping whatever it heard. False if there is no such run."""
+    async def stop_discovery(self, discovery_id: str) -> DiscoveryRun | None:
+        """Ends a run early, keeping whatever it heard. None if there is no such run.
+
+        Returns the run itself rather than a bool so the caller can snapshot the reference it
+        already holds. Looking it up again after the await is unsafe: finishing a run yields, and
+        a concurrent dismiss can pop the same id during that window - the second lookup then finds
+        nothing and turns a successful stop into a 500.
+        """
         run = self._discoveries.get(discovery_id)
         if run is None:
-            return False
+            return None
         await run.finish()
-        return True
+        return run
 
     async def forget_discovery(self, discovery_id: str) -> bool:
         """Ends the run if still going, then drops the result entirely."""
@@ -360,3 +366,9 @@ class DeviceManager:
             await self.remove_receiver(receiver_id)
         for sweep_id in list(self._sweeps):
             await self.remove_sweep(sweep_id)
+        # Discoveries too, or an in-process lifespan restart leaves an rtl_433 subprocess and a
+        # deadline task alive, still holding the USB device - which the next startup then cannot
+        # claim. forget_discovery, not stop_discovery: the results are being discarded with the
+        # process that held them anyway.
+        for discovery_id in list(self._discoveries):
+            await self.forget_discovery(discovery_id)

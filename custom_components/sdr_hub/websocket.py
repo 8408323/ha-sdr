@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 
 from .api import SdrHubApiError
+from .coordinator import sanitize_discovery_snapshot
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -186,10 +187,11 @@ async def ws_start_discovery(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "start_discovery_failed", err.detail)
         return
-    # Deliberately no async_refresh() here, unlike the receiver and sweep commands. Those mutate
-    # the state the coordinator polls (receivers/sweeps), so other panels have to be told; a
-    # discovery is not part of that snapshot at all and publishes itself over the event stream
-    # instead. Refreshing would cost a full add-on round trip to learn nothing new.
+    # A discovery does change the polled snapshot, even though it is not itself part of it: the
+    # add-on's /devices response now reports this dongle's in_use_by as the discovery id. Without
+    # this refresh every other panel keeps showing the device as free until the next 30 s poll,
+    # and an action taken from that stale display gets an unexplained 409.
+    await coordinator.async_refresh()  # not the debounced variant - see ws_add_receiver
     connection.send_result(msg["id"], run)
 
 
@@ -209,7 +211,9 @@ async def ws_stop_discovery(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "stop_discovery_failed", err.detail)
         return
-    connection.send_result(msg["id"], run)
+    # Stopping frees the dongle, so the same ownership reasoning as starting applies in reverse.
+    await coordinator.async_refresh()
+    connection.send_result(msg["id"], sanitize_discovery_snapshot(run) if isinstance(run, dict) else run)
 
 
 @websocket_api.require_admin
@@ -227,6 +231,11 @@ async def ws_forget_discovery(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "forget_discovery_failed", err.detail)
         return
+    # Dismissing a run that is still going stops it, which frees the dongle - so this changes
+    # device ownership exactly as start and stop do. Missing it left every panel showing the
+    # device as claimed by a discovery that no longer exists, with nothing to correct it before
+    # the next 30 s poll.
+    await coordinator.async_refresh()
     connection.send_result(msg["id"])
 
 
@@ -248,7 +257,13 @@ async def ws_list_discoveries(hass: HomeAssistant, connection, msg) -> None:
     except SdrHubApiError as err:
         connection.send_error(msg["id"], "list_discoveries_failed", err.detail)
         return
-    connection.send_result(msg["id"], runs)
+    # Sanitized exactly as the streamed events are. These snapshots arrive by a different route
+    # but carry the same sampled rtl_433 fields, and websocket_api rejects the *whole* result over
+    # one unrepresentable number - so an unguarded list would make every retained run disappear
+    # for a reopening panel, which is the failure the guard was added for in the first place.
+    connection.send_result(
+        msg["id"], [sanitize_discovery_snapshot(r) if isinstance(r, dict) else r for r in runs]
+    )
 
 
 @websocket_api.require_admin

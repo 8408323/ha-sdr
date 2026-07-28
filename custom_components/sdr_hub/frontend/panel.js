@@ -1483,6 +1483,9 @@ class SdrHubPanel extends HTMLElement {
     // observation as a current one. The add-on holds them until dismissed and _loadDiscoveries
     // re-reads them from there, which keeps a single source of truth.
     this._discoveries = {};
+    // Monotonic counter guarding the unawaited discovery list against stale responses, exactly as
+    // _loadStateRequestId does for state loads.
+    this._discoveryLoadId = 0;
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
@@ -2191,8 +2194,14 @@ class SdrHubPanel extends HTMLElement {
     if (event.type === "discovery") {
       const run = event.discovery;
       if (run && run.id) {
+        this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+        const previous = (this._discoveries || {})[run.id];
         this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
         this._renderDiscoveries();
+        // A run ending releases the dongle, which the polled snapshot reports as in_use_by - and
+        // nothing else would tell this panel, since the release happens inside the add-on rather
+        // than in response to any command from here.
+        if (run.finished && (!previous || !previous.finished)) this._loadState();
       }
       return;
     }
@@ -6377,6 +6386,7 @@ class SdrHubPanel extends HTMLElement {
       // Held locally rather than waiting for the first broadcast: a run over a quiet band may
       // emit nothing at all until it finishes, and a button that appeared to do nothing for
       // ninety seconds would be indistinguishable from one that failed.
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
       if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
       this._renderDiscoveries();
       this._clearErrorIfOwnedBy("discoveryAction", errorToken);
@@ -6389,6 +6399,7 @@ class SdrHubPanel extends HTMLElement {
     const errorToken = this._errorToken || 0;
     try {
       const run = await this._callWS({ type: "sdr_hub/stop_discovery", discovery_id: discoveryId });
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
       if (run && run.id) this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
       this._renderDiscoveries();
       this._clearErrorIfOwnedBy("discoveryAction", errorToken);
@@ -6401,6 +6412,9 @@ class SdrHubPanel extends HTMLElement {
     const errorToken = this._errorToken || 0;
     try {
       await this._callWS({ type: "sdr_hub/forget_discovery", discovery_id: discoveryId });
+      // Invalidates any list request already in flight, which may have captured this run before
+      // it was dismissed and would otherwise put its card back.
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
       const next = { ...(this._discoveries || {}) };
       delete next[discoveryId];
       this._discoveries = next;
@@ -6417,8 +6431,15 @@ class SdrHubPanel extends HTMLElement {
   // add-on too old to know the command would otherwise put a permanent error banner on the panel
   // for a feature the user may not be using.
   async _loadDiscoveries() {
+    // Sequenced like _loadState, and for a sharper reason: this call is deliberately not awaited,
+    // so its response routinely lands after a discovery event, a start, or a dismiss that already
+    // moved _discoveries on. Replacing the map wholesale with an older snapshot would resurrect a
+    // dismissed run's card - and pressing Dismiss on it then 404s, because it is already gone
+    // server-side, leaving a card that cannot be removed until the next load.
+    const requestId = ++this._discoveryLoadId;
     try {
       const runs = await this._callWS({ type: "sdr_hub/list_discoveries" });
+      if (requestId !== this._discoveryLoadId) return; // superseded by a newer load
       if (!Array.isArray(runs)) return;
       const byId = {};
       for (const run of runs) if (run && run.id) byId[run.id] = run;

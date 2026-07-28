@@ -63,11 +63,20 @@ class Rtl433Decoder:
             self._reader_task = None
         if self._process is None:
             return
-        self._process.terminate()
+        try:
+            self._process.terminate()
+        except ProcessLookupError:
+            # Already exited on its own - which is precisely when stop() is most likely to be
+            # called, since the exit callback triggers the same teardown. Nothing to signal, but
+            # the wait below still reaps it.
+            pass
         try:
             await asyncio.wait_for(self._process.wait(), timeout=5)
         except asyncio.TimeoutError:
-            self._process.kill()
+            try:
+                self._process.kill()
+            except ProcessLookupError:
+                pass
             # SIGKILL can't be blocked, but the OS still needs a moment to reap the
             # process - wait for it so the dongle is genuinely free before we return.
             await self._process.wait()

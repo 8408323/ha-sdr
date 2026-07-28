@@ -73,21 +73,18 @@ def _sanitize_device(device: dict[str, Any], model: Any = None) -> dict[str, Any
     return {k: v for k, v in device.items() if k not in dropped}
 
 
-def _sanitize_discovery(event: dict[str, Any]) -> dict[str, Any]:
-    """Applies the same guard to a discovery snapshot's sampled readings.
+def sanitize_discovery_snapshot(discovery: dict[str, Any]) -> dict[str, Any]:
+    """Applies the sampled-reading guard to one discovery snapshot, returning it unchanged if clean.
 
-    A discovery samples whatever rtl_433 emitted, so it carries exactly the same risk the decoded
-    path is guarded against: one integer wider than 64 bits is rejected by websocket_api's
-    serializer, which discards the *entire* message. There the cost is one decode; here it is the
-    whole snapshot - every device found in the run - so the same value that costs a single reading
-    on one path would blank the complete result on this one.
+    Public because the same snapshots reach Home Assistant by two routes: pushed as `discovery`
+    events, and pulled by the list command when a panel opens. Sanitizing only the pushed ones
+    left the pulled path able to be rejected wholesale by websocket_api's serializer - so a single
+    unrepresentable field would make every retained run silently vanish for a reopening panel,
+    which is exactly the failure this guard exists to prevent.
     """
-    discovery = event.get("discovery")
-    if not isinstance(discovery, dict):
-        return event
     devices = discovery.get("devices")
     if not isinstance(devices, list):
-        return event
+        return discovery
     changed = False
     cleaned_devices = []
     for entry in devices:
@@ -105,8 +102,24 @@ def _sanitize_discovery(event: dict[str, Any]) -> dict[str, Any]:
         changed = True
         cleaned_devices.append({**entry, "sample": cleaned_sample})
     if not changed:
+        return discovery
+    return {**discovery, "devices": cleaned_devices}
+
+
+def _sanitize_discovery(event: dict[str, Any]) -> dict[str, Any]:
+    """Applies the same guard to a discovery snapshot's sampled readings.
+
+    A discovery samples whatever rtl_433 emitted, so it carries exactly the same risk the decoded
+    path is guarded against: one integer wider than 64 bits is rejected by websocket_api's
+    serializer, which discards the *entire* message. There the cost is one decode; here it is the
+    whole snapshot - every device found in the run - so the same value that costs a single reading
+    on one path would blank the complete result on this one.
+    """
+    discovery = event.get("discovery")
+    if not isinstance(discovery, dict):
         return event
-    return {**event, "discovery": {**discovery, "devices": cleaned_devices}}
+    cleaned = sanitize_discovery_snapshot(discovery)
+    return event if cleaned is discovery else {**event, "discovery": cleaned}
 
 
 # The range Home Assistant's JSON serializer accepts for an integer. Outside it the value is

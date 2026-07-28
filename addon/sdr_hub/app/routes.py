@@ -84,10 +84,11 @@ async def stop_discovery(discovery_id: str, request: Request) -> dict:
     heard" is the common one, and collapsing it into DELETE would throw away the result at the
     exact moment the user asked to look at it.
     """
-    manager = request.app.state.manager
-    if not await manager.stop_discovery(discovery_id):
+    run = await request.app.state.manager.stop_discovery(discovery_id)
+    if run is None:
         raise HTTPException(status_code=404, detail=f"no discovery with id {discovery_id}")
-    run = manager.get_discovery(discovery_id)
+    # Snapshotted from the reference the manager returned, never from a second lookup - see
+    # DeviceManager.stop_discovery for the concurrent-dismiss race that makes the difference.
     return run.snapshot()
 
 
