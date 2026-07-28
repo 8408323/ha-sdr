@@ -264,6 +264,11 @@ class DeviceManager:
         run = self._discoveries.get(discovery_id)
         if run is not None and self._on_discovery is not None:
             self._on_discovery(run.snapshot())
+        # Also here, not only when the next scan starts. Retiring at start alone bounds the set
+        # only at that moment: runs keep finishing in between, so a user who starts several and
+        # never starts another would sit above the cap indefinitely. Retiring as each one ends
+        # keeps it bounded at all times, and the run that just finished is now itself a candidate.
+        self._retire_old_discoveries()
 
     async def stop_discovery(self, discovery_id: str) -> DiscoveryRun | None:
         """Ends a run early, keeping whatever it heard. None if there is no such run.

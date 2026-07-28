@@ -134,6 +134,9 @@ class DiscoveryRun:
                 hop_interval_s=self.config.hop_interval_s,
                 gain_db=self.config.gain_db,
                 sample_rate_hz=self.config.sample_rate_hz,
+                # A survey is exactly where signal level earns its cost: it is what separates a
+                # device heard once at the noise floor from one heard forty times well above it.
+                report_signal_level=True,
             ),
             on_device=self._on_device,
             on_exit=self._on_decoder_exit,

@@ -25,6 +25,13 @@ class ReceiverConfig:
     # an FSK decoder is enabled). Overriding is occasionally useful - a wider rate catches signals
     # slightly off the nominal frequency - but a wrong value silently stops decoders working.
     sample_rate_hz: float | None = None
+    # Adds `-M time:iso -M level`, so each decode carries a timestamp and signal level (and
+    # rtl_433 then also reports the frequency it measured). Opt-in rather than always-on: these
+    # rows flow to the integration, which turns numeric fields it does not recognise into Home
+    # Assistant entities - so switching it on for receivers would have created rssi, snr and noise
+    # entities for every already-decoded device on upgrade, spending an entity budget the user
+    # never asked to spend. A discovery creates no entities, so it can have them for free.
+    report_signal_level: bool = False
 
 
 class Rtl433Decoder:
@@ -68,7 +75,8 @@ class Rtl433Decoder:
         # Timestamps and signal level on every decode. Level is what makes a marginal result
         # readable as marginal - a device heard once at the noise floor and one heard forty times
         # well above it look identical without it.
-        args += ["-M", "time:iso", "-M", "level"]
+        if self._config.report_signal_level:
+            args += ["-M", "time:iso", "-M", "level"]
         self._process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
