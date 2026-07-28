@@ -17,6 +17,14 @@ class ReceiverConfig:
     frequencies_hz: list[float]
     protocols: list[int] = field(default_factory=list)
     hop_interval_s: int = DEFAULT_HOP_INTERVAL_S
+    # None means "let rtl_433 choose", which is not the same as any particular value: its default
+    # is automatic gain, and there is no number that reproduces that. Naming a gain is worth doing
+    # when a sensor is weak enough that AGC keeps riding over it, and worth *not* doing otherwise.
+    gain_db: float | None = None
+    # Likewise: rtl_433 picks a rate appropriate to the decoders in use (250k for OOK, 1024k when
+    # an FSK decoder is enabled). Overriding is occasionally useful - a wider rate catches signals
+    # slightly off the nominal frequency - but a wrong value silently stops decoders working.
+    sample_rate_hz: float | None = None
 
 
 class Rtl433Decoder:
@@ -50,6 +58,17 @@ class Rtl433Decoder:
             args += ["-H", str(self._config.hop_interval_s)]
         for protocol in self._config.protocols:
             args += ["-R", str(protocol)]
+        # Omitted entirely when unset, rather than passed as a default: rtl_433's own defaults are
+        # automatic gain and a rate chosen from the enabled decoders, and no explicit value
+        # reproduces either.
+        if self._config.gain_db is not None:
+            args += ["-g", str(self._config.gain_db)]
+        if self._config.sample_rate_hz is not None:
+            args += ["-s", str(int(self._config.sample_rate_hz))]
+        # Timestamps and signal level on every decode. Level is what makes a marginal result
+        # readable as marginal - a device heard once at the noise floor and one heard forty times
+        # well above it look identical without it.
+        args += ["-M", "time:iso", "-M", "level"]
         self._process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,

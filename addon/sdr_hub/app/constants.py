@@ -76,7 +76,33 @@ DEFAULT_HOP_INTERVAL_S: int = 10
 # is a receiver, which is the thing that already exists for listening indefinitely.
 DEFAULT_DISCOVERY_DURATION_S: int = 90
 MIN_DISCOVERY_DURATION_S: int = 10
-MAX_DISCOVERY_DURATION_S: int = 600
+# Twelve hours. The original ceiling was ten minutes, on the reasoning that a longer listen is
+# really a receiver - which was wrong about what the two are for. A receiver publishes entities
+# for devices you have decided to keep; a survey answers "what is out there", and the honest
+# answer for an intermittent transmitter takes hours. An overnight run that spans dawn is what
+# catches a light sensor, a rain gauge, or a door contact nobody touched until morning; measured
+# here, a ten-minute listen on a live band found one device where ten hours was needed to be
+# confident that was all of them.
+#
+# It is still bounded, and the bound is still about the dongle: a survey holds the claim for its
+# whole duration, so an unbounded one is indistinguishable from a leak. Twelve hours covers a
+# night without letting a mistyped value occupy the device for a week.
+MAX_DISCOVERY_DURATION_S: int = 43200
+
+# Bounds on the optional rtl_433 tuning overrides. Both are "unset means let rtl_433 decide",
+# so these only constrain a value the user deliberately supplied.
+#
+# Gain: 0 is meaningful (minimum gain, for a transmitter close enough to overload the front end),
+# and ~49.6 dB is the maximum an R820T offers; anything beyond is silently clamped by the driver,
+# which is worse than being told.
+MIN_DISCOVERY_GAIN_DB: float = 0.0
+MAX_DISCOVERY_GAIN_DB: float = 50.0
+# Sample rate: below ~200k the OOK decoders lose the timing resolution they need, and the RTL2832U
+# cannot sustain above 3.2M (it drops samples well before that, but the hard limit is where the
+# driver stops pretending). Between those the value is a real trade: wider catches signals further
+# off the nominal frequency, narrower gives a better noise floor.
+MIN_DISCOVERY_SAMPLE_RATE_HZ: float = 200_000.0
+MAX_DISCOVERY_SAMPLE_RATE_HZ: float = 3_200_000.0
 
 # Cap on distinct devices one discovery run will accumulate. Reached only on a band far busier
 # than a home installation (a block of flats on 433 MHz, or a decoder mis-triggering on noise),
@@ -84,6 +110,15 @@ MAX_DISCOVERY_DURATION_S: int = 600
 # and the result is flagged truncated, rather than letting an unbounded dict grow behind a
 # snapshot that is rebroadcast on every single decode.
 DISCOVERY_MAX_DEVICES: int = 200
+
+# How many *finished* discovery runs to retain before dropping the oldest.
+#
+# Results outlive their run on purpose - a panel opened afterwards has no other way to see what
+# was heard - but "kept until dismissed" is not a bound, and each retained run can hold up to
+# DISCOVERY_MAX_DEVICES entries that /discoveries returns in full. Ten is comfortably more than
+# the handful a user compares while working out what is on a band, and small enough that the
+# worst-case list response stays modest.
+MAX_RETAINED_DISCOVERIES: int = 10
 
 # Per-client outbound WebSocket queue depth. Once full, the oldest pending
 # message is dropped so a slow client applies backpressure without letting

@@ -595,6 +595,7 @@ function colormapGradientCss(name) {
 // not something another client or an automation needs to see.
 const SWEEP_FORM_PREFS_KEY = "sdr_hub_sweep_form_prefs";
 const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
+const DISCOVERY_FORM_PREFS_KEY = "sdr_hub_discovery_form_prefs";
 const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
@@ -668,6 +669,7 @@ const ALL_PREF_KEYS = [
   BATTERY_LOW_KEY,
   SPECTRUM_TRACE_KEY,
   BAND_PLAN_KEY,
+  DISCOVERY_FORM_PREFS_KEY,
 ];
 
 // Fingerprint of the persisted values that are baked into the shell's markup when it is rendered
@@ -675,7 +677,10 @@ const ALL_PREF_KEYS = [
 // value, but it cannot retro-fit markup, so these are handled by rebuilding instead.
 function shellPrefsSignature() {
   try {
-    return [SWEEP_FORM_PREFS_KEY, RECEIVER_FORM_PREFS_KEY, HELP_DISMISSED_KEY]
+    // DISCOVERY_FORM_PREFS_KEY belongs here for the same reason the other two do: its values are
+    // rendered *into* the form markup, so no amount of updating live controls reconciles them -
+    // the shell has to be rebuilt when another tab changes or resets them.
+    return [SWEEP_FORM_PREFS_KEY, RECEIVER_FORM_PREFS_KEY, DISCOVERY_FORM_PREFS_KEY, HELP_DISMISSED_KEY]
       .map((k) => `${k}=${localStorage.getItem(k) ?? ""}`)
       .join("|");
   } catch {
@@ -1208,6 +1213,33 @@ const SWEEP_PRESETS = [
   { label: "ISM 915 MHz, US (902–928 MHz)", start_mhz: 902, stop_mhz: 928 },
   { label: "ADS-B (1089–1091 MHz)", start_mhz: 1089, stop_mhz: 1091 },
 ];
+// Frequency sets worth scanning, as opposed to worth running a receiver on. The two lists differ
+// on purpose: a receiver is pointed at a frequency you have already decided matters, while a scan
+// is how you find out - so these are grouped by *question* ("is there anything on 868?") rather
+// than by device.
+const DISCOVERY_PRESETS = [
+  { label: "433 MHz ISM (most sensors)", frequencies_mhz: "433.92" },
+  { label: "868 MHz SRD, EU", frequencies_mhz: "868.3" },
+  { label: "Somfy (RTS + io-homecontrol)", frequencies_mhz: "433.42,868.25,868.95" },
+  { label: "All common EU ISM", frequencies_mhz: "433.42,433.92,868.25,868.3,868.95" },
+  { label: "915 MHz ISM, US", frequencies_mhz: "915" },
+  { label: "Car remotes / TPMS, US", frequencies_mhz: "314.98,315" },
+];
+
+// Durations offered as named choices rather than a free number. The useful values are not evenly
+// spread - they are set by how often the thing you are looking for transmits - and a plain number
+// box invites 30, which is shorter than the reporting interval of almost every sensor here and so
+// reliably produces an empty result that looks like an answer.
+const DISCOVERY_DURATIONS = [
+  { s: 60, label: "1 minute (quick check)" },
+  { s: 90, label: "90 seconds (default)" },
+  { s: 300, label: "5 minutes" },
+  { s: 900, label: "15 minutes" },
+  { s: 3600, label: "1 hour" },
+  { s: 14400, label: "4 hours" },
+  { s: 43200, label: "12 hours (overnight)" },
+];
+
 const RECEIVER_PRESETS = [
   { label: "ISM 433.92 MHz, EU", frequencies_mhz: "433.92" },
   { label: "ISM 868.3/868.95 MHz, EU", frequencies_mhz: "868.3,868.95" },
@@ -2215,13 +2247,21 @@ class SdrHubPanel extends HTMLElement {
         // The counter is bumped only when the event is actually adopted. Bumping it for a
         // snapshot that is then rejected would discard the authoritative list request a dismissal
         // triggers, leaving exactly the stale card the tombstone exists to prevent.
-        if (!this._mergeDiscovery(run)) return;
-        this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
-        this._renderDiscoveries();
+        const adopted = this._mergeDiscovery(run);
+        if (adopted) {
+          this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+          this._renderDiscoveries();
+        }
         // A run ending releases the dongle, which the polled snapshot reports as in_use_by - and
         // nothing else would tell this panel, since the release happens inside the add-on rather
         // than in response to any command from here.
-        if (run.finished && (!previous || !previous.finished)) this._loadState();
+        //
+        // Deliberately outside the adopted branch: a list request can install the finished
+        // snapshot first, after which the terminal stream event carries an equal revision and is
+        // rejected as a duplicate. Tying the refresh to adoption meant the one event that knows
+        // the dongle was released could be discarded for being redundant about the run - while
+        // being the only thing that was not redundant about the device.
+        this._refreshOwnershipIfStale(run);
       }
       return;
     }
@@ -3041,6 +3081,7 @@ class SdrHubPanel extends HTMLElement {
     this._lastBatteryAlertMessage = null;
     const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
     const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
+    const discoveryPrefs = loadFormPrefs(DISCOVERY_FORM_PREFS_KEY);
     // "Dismissed" only skips showing it by default on load - the Help button in the header
     // always reopens it, so dismissing is never a one-way door for a first-time user who
     // dismissed too quickly or wants a refresher later.
@@ -3218,15 +3259,32 @@ class SdrHubPanel extends HTMLElement {
             Listens for a fixed time and lists what is transmitting, without adding anything to
             Home Assistant. Use it to find out what is around before starting a receiver.
           </p>
-          <form id="sdr-hub-start-discovery" class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-            <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
-              <option value="">Custom</option>
-              ${RECEIVER_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
-            </select></label>
-            <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
-            <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="433.92" style="${INPUT};width:180px"></label>
-            <label style="${LABEL}">Listen for s<input name="duration_s" type="number" min="10" max="600" value="90" style="${INPUT};width:100px"></label>
-            <button type="submit" style="${BTN}">Start listening</button>
+          <form id="sdr-hub-start-discovery">
+            <div class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+              <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
+                <option value="">Custom</option>
+                ${DISCOVERY_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
+              </select></label>
+              <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
+              <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="${esc(discoveryPrefs.frequencies_mhz ?? "433.92")}" style="${INPUT};width:220px"></label>
+              <label style="${LABEL}">Listen for<select name="duration_s" style="${INPUT};width:150px">
+                ${DISCOVERY_DURATIONS.map((d) => `<option value="${d.s}"${String(discoveryPrefs.duration_s ?? 90) === String(d.s) ? " selected" : ""}>${esc(d.label)}</option>`).join("")}
+              </select></label>
+              <button type="submit" style="${BTN}">Start listening</button>
+            </div>
+            <details id="sdr-hub-discovery-advanced" style="margin-bottom:12px;"${discoveryPrefs.advanced_open ? " open" : ""}>
+              <summary style="cursor:pointer;font-size:.85rem;color:var(--secondary-text-color,#727272);">Advanced options</summary>
+              <div class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                <label style="${LABEL}" title="Seconds spent on each frequency before moving to the next. Only used when more than one frequency is listed.">Hop dwell s<input name="hop_interval_s" type="number" min="1" value="${esc(discoveryPrefs.hop_interval_s ?? 10)}" style="${INPUT};width:100px"></label>
+                <label style="${LABEL}" title="Blank for rtl_433's automatic gain. A fixed gain helps when a weak sensor is being ridden over by a strong neighbour.">Gain dB (auto if blank)<input name="gain_db" type="number" min="0" max="50" step="0.1" placeholder="auto" value="${esc(discoveryPrefs.gain_db ?? "")}" style="${INPUT};width:130px"></label>
+                <label style="${LABEL}" title="Blank lets rtl_433 pick (250k for OOK, 1024k when an FSK decoder is enabled). Wider catches signals further off the nominal frequency.">Sample rate Hz (auto if blank)<input name="sample_rate_hz" type="number" min="200000" max="3200000" step="1000" placeholder="auto" value="${esc(discoveryPrefs.sample_rate_hz ?? "")}" style="${INPUT};width:170px"></label>
+                <label style="${LABEL}" title="rtl_433 protocol numbers, comma-separated. Blank uses every enabled decoder. Listing any restricts to only those, which is how you test whether a signal is a specific device.">Protocols (blank = all)<input name="protocols" placeholder="e.g. 26,77,185" value="${esc(discoveryPrefs.protocols ?? "")}" style="${INPUT};width:170px"></label>
+              </div>
+              <div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
+                Listing protocols restricts the scan to <em>only</em> those, so a targeted test will not see anything else.
+                A scan holds the dongle for its whole duration, so sweeps and receivers on the same device cannot run meanwhile.
+              </div>
+            </details>
           </form>
           <div id="sdr-hub-discoveries"></div>
         </div>
@@ -3358,7 +3416,7 @@ class SdrHubPanel extends HTMLElement {
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
     // Same presets as the receiver form on purpose: discovery answers "what is on this frequency"
     // and starting a receiver is the next step, so the two must offer the same choices.
-    this._wirePresetSelect("sdr-hub-start-discovery", RECEIVER_PRESETS);
+    this._wirePresetSelect("sdr-hub-start-discovery", DISCOVERY_PRESETS);
     this._wireColormapControls();
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
@@ -6395,6 +6453,21 @@ class SdrHubPanel extends HTMLElement {
       .map((v) => v.trim())
       .filter(Boolean)
       .map((v) => Number(v) * 1e6);
+    // Blank means "not specified", which is not the same as any number: the add-on omits the
+    // rtl_433 flag entirely, leaving automatic gain and a decoder-chosen sample rate. Sending 0
+    // for a blank gain box would silently mean minimum gain instead.
+    const optionalNumber = (name) => {
+      const raw = String(form.get(name) ?? "").trim();
+      if (!raw) return undefined;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : undefined;
+    };
+    const protocols = String(form.get("protocols") ?? "")
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+      .map((v) => Number(v))
+      .filter((v) => Number.isInteger(v) && v > 0);
     try {
       const run = await this._callWS({
         type: "sdr_hub/start_discovery",
@@ -6402,6 +6475,23 @@ class SdrHubPanel extends HTMLElement {
         dongle_driver: this._selectedDongleDriver(formEl),
         frequencies_hz: frequenciesHz,
         duration_s: Number(form.get("duration_s")) || 90,
+        hop_interval_s: Number(form.get("hop_interval_s")) || 10,
+        ...(protocols.length ? { protocols } : {}),
+        ...(optionalNumber("gain_db") !== undefined ? { gain_db: optionalNumber("gain_db") } : {}),
+        ...(optionalNumber("sample_rate_hz") !== undefined
+          ? { sample_rate_hz: optionalNumber("sample_rate_hz") }
+          : {}),
+      });
+      // Remembered only once the add-on accepted them - see _onAddSweep for why a rejected
+      // configuration must not become the next session's default.
+      saveFormPrefs(DISCOVERY_FORM_PREFS_KEY, {
+        frequencies_mhz: form.get("frequencies_mhz"),
+        duration_s: form.get("duration_s"),
+        hop_interval_s: form.get("hop_interval_s"),
+        gain_db: form.get("gain_db"),
+        sample_rate_hz: form.get("sample_rate_hz"),
+        protocols: form.get("protocols"),
+        advanced_open: !!formEl.querySelector("#sdr-hub-discovery-advanced")?.open,
       });
       // Held locally rather than waiting for the first broadcast: a run over a quiet band may
       // emit nothing at all until it finishes, and a button that appeared to do nothing for
@@ -6466,6 +6556,7 @@ class SdrHubPanel extends HTMLElement {
       for (const run of runs) if (run && run.id && !this._dismissedDiscoveries.has(run.id)) byId[run.id] = run;
       this._discoveries = byId;
       this._renderDiscoveries();
+      for (const run of Object.values(byId)) this._refreshOwnershipIfStale(run);
     } catch {
       // See above - not surfaced.
     }
@@ -6501,6 +6592,21 @@ class SdrHubPanel extends HTMLElement {
     return true;
   }
 
+  // Re-reads the polled snapshot when it still shows a *finished* run holding a device.
+  //
+  // Keyed on what the display currently claims rather than on what changed, because "what
+  // changed" is not knowable from any single path: the run may reach this panel as finished via
+  // the stream, via the authoritative list, or via the response to a stop - and whichever arrives
+  // second carries no evidence that anything changed at all. Asking instead whether the device
+  // list still credits this finished run with a dongle is a question every path can answer
+  // identically, and it is self-limiting: once the refresh lands the owner is cleared, so a
+  // repeated snapshot for the same run cannot trigger an endless refresh loop.
+  _refreshOwnershipIfStale(run) {
+    if (!run || !run.id || !run.finished) return;
+    const owners = ((this._state || {}).devices || []).map((d) => d && d.in_use_by);
+    if (owners.includes(run.id)) this._loadState();
+  }
+
   // Records a dismissal, capped so a long-lived panel cannot accumulate ids without limit.
   // Eviction is oldest-first: the older a dismissal is, the less likely any snapshot predating it
   // is still in flight, so the entries least worth keeping are exactly the ones dropped.
@@ -6530,6 +6636,15 @@ class SdrHubPanel extends HTMLElement {
 
   _discoveryCard(run) {
     const freqs = (run.frequencies_hz || []).map((hz) => `${fmtMHz(hz)} MHz`).join(", ");
+    // A result cannot be read without the settings that produced it: "nothing heard" means
+    // something quite different at automatic gain across five frequencies than at fixed gain on
+    // one, and a protocol-restricted scan cannot see anything outside its list by construction.
+    const settings = [
+      (run.frequencies_hz || []).length > 1 ? `${run.hop_interval_s ?? 10}s dwell` : null,
+      run.gain_db != null ? `gain ${run.gain_db} dB` : null,
+      run.sample_rate_hz != null ? `${Math.round(run.sample_rate_hz / 1000)}k sample rate` : null,
+      (run.protocols || []).length ? `protocols ${run.protocols.join(", ")} only` : null,
+    ].filter(Boolean);
     const running = !run.finished;
     const devices = run.devices || [];
     // "Heard nothing" is only the answer once the run is over. Saying it while still listening
@@ -6558,8 +6673,8 @@ class SdrHubPanel extends HTMLElement {
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
           <strong style="font-size:.9rem;">${esc(freqs)}</strong>
           <span style="font-size:.8rem;color:var(--secondary-text-color,#727272);">
-            ${running ? `listening for ${esc(String(run.duration_s))}s` : "finished"} ·
-            ${devices.length} device${devices.length === 1 ? "" : "s"}
+            ${running ? `listening for ${esc(fmtElapsed(Number(run.duration_s) * 1000))}` : "finished"} ·
+            ${devices.length} device${devices.length === 1 ? "" : "s"}${settings.length ? ` · ${esc(settings.join(" · "))}` : ""}
           </span>
           <span style="flex:1"></span>
           ${running ? `<button type="button" data-discovery-stop="${esc(run.id)}" style="${BTN}">Stop now</button>` : ""}

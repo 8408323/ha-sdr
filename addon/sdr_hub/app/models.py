@@ -10,8 +10,12 @@ from constants import (
     DEFAULT_SAMPLE_RATE_HZ,
     FFT_SIZE,
     MAX_DISCOVERY_DURATION_S,
+    MAX_DISCOVERY_GAIN_DB,
+    MAX_DISCOVERY_SAMPLE_RATE_HZ,
     MAX_NATIVE_BINS,
     MIN_DISCOVERY_DURATION_S,
+    MIN_DISCOVERY_GAIN_DB,
+    MIN_DISCOVERY_SAMPLE_RATE_HZ,
 )
 from pydantic import BaseModel, Field, model_validator
 
@@ -113,10 +117,31 @@ class DiscoveryCreate(BaseModel):
         ge=MIN_DISCOVERY_DURATION_S,
         le=MAX_DISCOVERY_DURATION_S,
     )
+    # Optional overrides. None is not a sentinel for a default here - it means "do not pass the
+    # flag at all", which is genuinely different from passing any value, since rtl_433's own
+    # behaviour is automatic gain and a decoder-dependent sample rate.
+    gain_db: float | None = Field(
+        default=None, ge=MIN_DISCOVERY_GAIN_DB, le=MAX_DISCOVERY_GAIN_DB
+    )
+    sample_rate_hz: float | None = Field(
+        default=None, ge=MIN_DISCOVERY_SAMPLE_RATE_HZ, le=MAX_DISCOVERY_SAMPLE_RATE_HZ
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> DiscoveryCreate:
         _validate_rtl433_params(self.frequencies_hz, self.hop_interval_s)
+        # rtl_433 visits the frequencies in turn, dwelling hop_interval_s on each, so a run has to
+        # last at least one full cycle or some frequencies are never listened to at all. That
+        # failure is silent and actively misleading: the finished card reports "nothing was heard"
+        # for a frequency the receiver was never tuned to. Rejected rather than silently shortened,
+        # since the caller asked for a specific dwell and quietly changing it would make the
+        # result mean something other than what was requested.
+        needed = len(self.frequencies_hz) * self.hop_interval_s
+        if len(self.frequencies_hz) > 1 and self.duration_s < needed:
+            raise ValueError(
+                f"duration_s must be at least {needed}s to visit all {len(self.frequencies_hz)} "
+                f"frequencies at a {self.hop_interval_s}s hop interval"
+            )
         return self
 
 

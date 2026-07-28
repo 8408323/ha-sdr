@@ -81,6 +81,8 @@ class DiscoveryConfig:
     duration_s: int
     protocols: list[int] = field(default_factory=list)
     hop_interval_s: int = DEFAULT_HOP_INTERVAL_S
+    gain_db: float | None = None
+    sample_rate_hz: float | None = None
 
 
 class DiscoveryRun:
@@ -117,6 +119,10 @@ class DiscoveryRun:
         # snapshots: the response to a start can carry an empty device list that lands after a
         # decode has already been streamed, blanking a device the user just saw appear.
         self._revision = 0
+        # Last frequency rtl_433 reported tuning to. Tracked because a hopping run's decode rows
+        # do not carry one, so without it every device found across several frequencies is
+        # reported at an unknown frequency - which is the one fact needed to act on the result.
+        self._current_center_hz: float | None = None
         self._teardown_task: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -126,6 +132,8 @@ class DiscoveryRun:
                 frequencies_hz=self.config.frequencies_hz,
                 protocols=self.config.protocols,
                 hop_interval_s=self.config.hop_interval_s,
+                gain_db=self.config.gain_db,
+                sample_rate_hz=self.config.sample_rate_hz,
             ),
             on_device=self._on_device,
             on_exit=self._on_decoder_exit,
@@ -144,6 +152,21 @@ class DiscoveryRun:
         await self.finish()
 
     def _on_device(self, device: dict[str, Any]) -> None:
+        # rtl_433 writes more than decodes to its JSON stream: tuning changes arrive as bare
+        # {"center_frequency": ...} lines, and there are protocol-level status rows too. Recording
+        # them produced a phantom "None" device that was, in a live 5-minute run, the single
+        # most-heard entry in the list - 29 sightings of the receiver telling us it had retuned.
+        #
+        # A real decode always names its model, so that is the test. The retune notice is not
+        # discarded though: it is the only statement of which frequency the decodes that follow
+        # were heard on, which rtl_433 otherwise omits from the rows themselves when hopping.
+        if "center_frequency" in device and not device.get("model"):
+            center = device.get("center_frequency")
+            if isinstance(center, (int, float)) and not isinstance(center, bool) and math.isfinite(center):
+                self._current_center_hz = float(center)
+            return
+        if not isinstance(device.get("model"), str) or not device["model"]:
+            return
         key = discovered_device_key(device)
         existing = self._devices.get(key)
         now = time.time()
@@ -171,7 +194,7 @@ class DiscoveryRun:
                 # rtl_433 reports the frequency it was tuned to when hopping, which is the single
                 # most useful field for acting on a result: it is what you would configure a
                 # receiver with. Absent on single-frequency runs, where it is already known.
-                "frequency_hz": _frequency_hz(device, self.config.frequencies_hz),
+                "frequency_hz": _frequency_hz(device, self.config.frequencies_hz, self._current_center_hz),
                 # A sample of the actual readings, so the list can show "11.7 C, 48 %" rather
                 # than only a model name - which is what makes a row identifiable as *your*
                 # sensor rather than one of four identical models in the house.
@@ -181,7 +204,7 @@ class DiscoveryRun:
             existing["last_seen"] = now
             existing["count"] += 1
             existing["sample"] = _sample_fields(device)
-            freq = _frequency_hz(device, self.config.frequencies_hz)
+            freq = _frequency_hz(device, self.config.frequencies_hz, self._current_center_hz)
             if freq is not None:
                 existing["frequency_hz"] = freq
         self._revision += 1
@@ -255,6 +278,10 @@ class DiscoveryRun:
             "dongle_serial": self.config.dongle_serial,
             "frequencies_hz": list(self.config.frequencies_hz),
             "duration_s": self.config.duration_s,
+            "hop_interval_s": self.config.hop_interval_s,
+            "protocols": list(self.config.protocols),
+            "gain_db": self.config.gain_db,
+            "sample_rate_hz": self.config.sample_rate_hz,
             "started_at": self.started_at,
             # Monotonic within a run, so a consumer can order two snapshots that arrived by
             # different routes without needing a clock shared with this process.
@@ -269,17 +296,31 @@ class DiscoveryRun:
         }
 
 
-def _frequency_hz(device: dict[str, Any], configured: list[float]) -> float | None:
+def _frequency_hz(
+    device: dict[str, Any], configured: list[float], current_center_hz: float | None = None
+) -> float | None:
     """The frequency this decode was heard on, in Hz.
 
-    rtl_433 reports `freq` in MHz and only while hopping. On a single-frequency run the answer is
-    known without being told, so it is filled in rather than left null - a result whose frequency
-    is unknown is one the user cannot act on, and "the only frequency we were listening to" is not
-    a guess.
+    Three sources, in descending order of directness: the row's own `freq` field when rtl_433
+    includes one; otherwise the last frequency it announced retuning to, which is the only thing
+    that distinguishes frequencies on a hopping run; otherwise the single configured frequency,
+    which needs no reporting to be known. A result whose frequency is unknown is one the user
+    cannot act on, so it is worth reaching for the indirect answers.
     """
     freq_mhz = device.get("freq")
-    if isinstance(freq_mhz, (int, float)) and not isinstance(freq_mhz, bool) and math.isfinite(freq_mhz):
-        return float(freq_mhz) * 1e6
+    if isinstance(freq_mhz, (int, float)) and not isinstance(freq_mhz, bool):
+        try:
+            # The *converted* value is what gets stored, and finite MHz does not imply finite Hz -
+            # 1e308 passes the input check and overflows to inf on the way out. int -> float can
+            # also raise OverflowError outright for a large enough integer, which would otherwise
+            # escape into the decoder's read loop and end it.
+            hz = float(freq_mhz) * 1e6
+        except (OverflowError, ValueError):
+            hz = None
+        if hz is not None and math.isfinite(hz):
+            return hz
+    if current_center_hz is not None:
+        return current_center_hz
     if len(configured) == 1:
         return float(configured[0])
     return None

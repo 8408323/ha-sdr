@@ -172,7 +172,14 @@ async def ws_remove_receiver(hass: HomeAssistant, connection, msg) -> None:
         # would reject an out-of-range value anyway, but only after the panel had been told the
         # request was accepted here - and a range error is exactly the kind a user should see
         # against the control they typed it into.
-        vol.Optional("duration_s", default=90): vol.All(int, vol.Range(min=10, max=600)),
+        vol.Optional("duration_s", default=90): vol.All(int, vol.Range(min=10, max=43200)),
+        # Optional tuning overrides. vol.Any(..., None) rather than a default, because "absent"
+        # has to survive the round trip: the add-on omits the rtl_433 flag entirely when it is
+        # None, and no numeric default reproduces automatic gain or a decoder-chosen sample rate.
+        vol.Optional("gain_db"): vol.Any(vol.All(vol.Coerce(float), vol.Range(min=0, max=50)), None),
+        vol.Optional("sample_rate_hz"): vol.Any(
+            vol.All(vol.Coerce(float), vol.Range(min=200000, max=3200000)), None
+        ),
     }
 )
 @websocket_api.async_response
@@ -181,7 +188,10 @@ async def ws_start_discovery(hass: HomeAssistant, connection, msg) -> None:
     if coordinator is None:
         connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
         return
-    config = {k: v for k, v in msg.items() if k not in ("id", "type")}
+    # None-valued optional keys are dropped rather than forwarded. Sending "gain_db": null would
+    # be rejected by the add-on's float field, and it means the same thing as not sending it - so
+    # the panel can leave an advanced control blank without special-casing every field.
+    config = {k: v for k, v in msg.items() if k not in ("id", "type") and v is not None}
     try:
         run = await coordinator.api.async_start_discovery(config)
     except SdrHubApiError as err:

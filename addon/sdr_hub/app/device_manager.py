@@ -7,6 +7,7 @@ from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
 from devices import Dongle, discover_dongles
+from constants import MAX_RETAINED_DISCOVERIES
 from discovery import DiscoveryConfig, DiscoveryRun
 from models import (
     DiscoveryCreate,
@@ -204,17 +205,51 @@ class DeviceManager:
                 duration_s=cfg.duration_s,
                 protocols=cfg.protocols,
                 hop_interval_s=cfg.hop_interval_s,
+                gain_db=cfg.gain_db,
+                sample_rate_hz=cfg.sample_rate_hz,
             ),
             on_update=self._on_discovery,
             on_finished=lambda: self._on_discovery_finished(discovery_id, driver, cfg.dongle_serial),
         )
         try:
             await run.start()
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: CancelledError does not inherit from Exception, and
+            # cancellation here is entirely ordinary - the Home Assistant command that triggered
+            # this can be cancelled while the subprocess is still being spawned. Escaping through
+            # an Exception-only handler left the claim registered forever against a run that was
+            # never inserted into _discoveries, so no stop, dismiss or shutdown path could ever
+            # find it and the dongle was unusable until the add-on restarted.
+            #
+            # finish() before releasing, because start() may have got far enough to leave an
+            # rtl_433 process behind - releasing a claim while the subprocess still holds the
+            # device would hand it to the next claimant on top of a live tuner.
+            await run.finish()
             self._release(driver, cfg.dongle_serial, discovery_id)
             raise
+        self._retire_old_discoveries()
         self._discoveries[discovery_id] = run
         return run
+
+    def _retire_old_discoveries(self) -> None:
+        """Drops the oldest finished runs once too many are being retained.
+
+        Results are deliberately kept after a run ends - that is the whole product of a discovery,
+        and a panel opening later has no other way to see it - but "until someone dismisses it" is
+        not a bound. Each retained run can hold up to DISCOVERY_MAX_DEVICES entries and is
+        returned in full by /discoveries, so a user who runs discovery repeatedly without
+        dismissing grows both the add-on's memory and every list response without limit.
+
+        Only finished runs are candidates: an active one owns a subprocess and a dongle claim, and
+        dropping it would leak both.
+        """
+        finished = [(run.started_at, did) for did, run in self._discoveries.items() if run.finished]
+        excess = len(finished) - MAX_RETAINED_DISCOVERIES
+        if excess <= 0:
+            return
+        for _, discovery_id in sorted(finished)[:excess]:
+            _LOGGER.info("retiring discovery %s to stay within the retained-result limit", discovery_id)
+            self._discoveries.pop(discovery_id, None)
 
     def _on_discovery_finished(self, discovery_id: str, driver: str, serial: str) -> None:
         """Frees the dongle the moment the run ends, however it ended.
