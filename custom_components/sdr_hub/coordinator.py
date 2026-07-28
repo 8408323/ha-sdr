@@ -36,24 +36,77 @@ def _sanitize_event(event: Any) -> Any:
     keeps the entity path and the panel path agreeing on which readings exist: the same value must
     not become a sensor and reach the panel, or be rejected by one and shown by the other.
     """
-    if not isinstance(event, dict) or event.get("type") != "decoded_device":
+    if not isinstance(event, dict):
         return event
-    device = event.get("device")
-    if not isinstance(device, dict):
-        return event
+    if event.get("type") == "decoded_device":
+        device = event.get("device")
+        if not isinstance(device, dict):
+            return event
+        cleaned = _sanitize_device(device)
+        return event if cleaned is device else {**event, "device": cleaned}
+    if event.get("type") == "discovery":
+        return _sanitize_discovery(event)
+    return event
+
+
+def _sanitize_device(device: dict[str, Any], model: Any = None) -> dict[str, Any]:
+    """The same field-dropping for any dict of rtl_433 readings, returning the original if clean.
+
+    Identity is preserved for the untouched case so callers can rebuild the enclosing event only
+    when something actually changed - a discovery snapshot carries a list of these, and rebuilding
+    the whole structure on every broadcast to drop nothing would be pure waste.
+    """
     dropped = [
         field
         for field, value in device.items()
         if isinstance(value, (int, float)) and not isinstance(value, bool) and not _is_serializable_number(value)
     ]
     if not dropped:
-        return event
+        return device
     _LOGGER.warning(
         "Dropped unrepresentable numeric field(s) %s from a %s decode",
         ", ".join(sorted(dropped)),
-        device.get("model"),
+        # A discovery's sampled readings deliberately exclude the model, so it is passed in
+        # rather than read back out - without it the warning would name no device at all.
+        device.get("model") if model is None else model,
     )
-    return {**event, "device": {k: v for k, v in device.items() if k not in dropped}}
+    return {k: v for k, v in device.items() if k not in dropped}
+
+
+def _sanitize_discovery(event: dict[str, Any]) -> dict[str, Any]:
+    """Applies the same guard to a discovery snapshot's sampled readings.
+
+    A discovery samples whatever rtl_433 emitted, so it carries exactly the same risk the decoded
+    path is guarded against: one integer wider than 64 bits is rejected by websocket_api's
+    serializer, which discards the *entire* message. There the cost is one decode; here it is the
+    whole snapshot - every device found in the run - so the same value that costs a single reading
+    on one path would blank the complete result on this one.
+    """
+    discovery = event.get("discovery")
+    if not isinstance(discovery, dict):
+        return event
+    devices = discovery.get("devices")
+    if not isinstance(devices, list):
+        return event
+    changed = False
+    cleaned_devices = []
+    for entry in devices:
+        if not isinstance(entry, dict):
+            cleaned_devices.append(entry)
+            continue
+        sample = entry.get("sample")
+        if not isinstance(sample, dict):
+            cleaned_devices.append(entry)
+            continue
+        cleaned_sample = _sanitize_device(sample, model=entry.get("model"))
+        if cleaned_sample is sample:
+            cleaned_devices.append(entry)
+            continue
+        changed = True
+        cleaned_devices.append({**entry, "sample": cleaned_sample})
+    if not changed:
+        return event
+    return {**event, "discovery": {**discovery, "devices": cleaned_devices}}
 
 
 # The range Home Assistant's JSON serializer accepts for an integer. Outside it the value is

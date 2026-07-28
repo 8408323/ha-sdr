@@ -18,7 +18,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from models import DongleInfo, Receiver, ReceiverCreate, Sweep, SweepCreate
+from models import DiscoveryCreate, DongleInfo, Receiver, ReceiverCreate, Sweep, SweepCreate
 from scanner import SweepStopTimeoutError
 
 _LOGGER = logging.getLogger("sdr_hub")
@@ -53,6 +53,49 @@ async def create_receiver(cfg: ReceiverCreate, request: Request) -> Receiver:
         raise HTTPException(status_code=400, detail=str(err)) from err
     except UnsupportedReceiverDriverError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
+
+
+@router.get("/discoveries", dependencies=[Depends(verify_token)])
+async def list_discoveries(request: Request) -> list[dict]:
+    return request.app.state.manager.list_discoveries()
+
+
+@router.post("/discoveries", status_code=201, dependencies=[Depends(verify_token)])
+async def start_discovery(payload: DiscoveryCreate, request: Request) -> dict:
+    """Starts a time-boxed listen. Creates no entity - see discovery.py for why that is the point."""
+    try:
+        run = await request.app.state.manager.start_discovery(payload)
+    except DongleBusyError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    except DongleNotFoundError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    except DuplicateDongleSerialError as err:
+        raise HTTPException(status_code=409, detail=str(err)) from err
+    except UnsupportedReceiverDriverError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return run.snapshot()
+
+
+@router.post("/discoveries/{discovery_id}/stop", dependencies=[Depends(verify_token)])
+async def stop_discovery(discovery_id: str, request: Request) -> dict:
+    """Ends a run early but keeps its result - distinct from DELETE, which discards it.
+
+    Two verbs because the two intentions genuinely differ: "I have seen enough, show me what you
+    heard" is the common one, and collapsing it into DELETE would throw away the result at the
+    exact moment the user asked to look at it.
+    """
+    manager = request.app.state.manager
+    if not await manager.stop_discovery(discovery_id):
+        raise HTTPException(status_code=404, detail=f"no discovery with id {discovery_id}")
+    run = manager.get_discovery(discovery_id)
+    return run.snapshot()
+
+
+@router.delete("/discoveries/{discovery_id}", status_code=204, dependencies=[Depends(verify_token)])
+async def forget_discovery(discovery_id: str, request: Request) -> None:
+    """Stops the run if it is still going, then discards the result."""
+    if not await request.app.state.manager.forget_discovery(discovery_id):
+        raise HTTPException(status_code=404, detail=f"no discovery with id {discovery_id}")
 
 
 @router.delete("/receivers/{receiver_id}", status_code=204, dependencies=[Depends(verify_token)])

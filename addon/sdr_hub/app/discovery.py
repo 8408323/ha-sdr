@@ -164,9 +164,17 @@ class DiscoveryRun:
         if self.finished:
             return
         self.finished = True
-        if self._deadline_task is not None and not self._deadline_task.done():
-            self._deadline_task.cancel()
+        # Not cancelled when finish() is running *inside* it, which is the normal ending: the
+        # deadline fires, _await_deadline awaits finish(), and cancelling the task here would
+        # cancel the coroutine currently executing. The CancelledError then lands at the very next
+        # await - stopping the decoder - so the subprocess is left running, on_finished never
+        # fires, and the dongle claim is never released. Measured: a run reported finished=True
+        # while still holding the dongle, and every later sweep on it returned 409 forever.
+        current = asyncio.current_task()
+        deadline = self._deadline_task
         self._deadline_task = None
+        if deadline is not None and deadline is not current and not deadline.done():
+            deadline.cancel()
         if self._decoder is not None:
             await self._decoder.stop()
             self._decoder = None

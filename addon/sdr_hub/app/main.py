@@ -299,6 +299,21 @@ async def lifespan(app: FastAPI):
             }
         )
 
+    def on_discovery(snapshot: dict) -> None:
+        """Broadcasts a discovery snapshot under its own event type.
+
+        Emphatically not "decoded_device": the integration turns every one of those into a Home
+        Assistant entity, and a discovery exists precisely so a user can see what is transmitting
+        without that happening. The distinct type is what enforces that - a consumer that does not
+        know about discovery ignores these events entirely, which is the correct behaviour for
+        every existing client and the reason this is a new type rather than a flag on the old one.
+
+        Carries no sequence number, unlike decoded_device. That counter exists so persisted
+        per-device state (the battery map) can order writes across tabs and restarts; a discovery
+        snapshot is whole-state, self-contained and disposable, so there is nothing to order.
+        """
+        broadcaster.broadcast({"type": "discovery", "discovery": snapshot})
+
     def on_status(kind: EntityKind, entity_id: str, status: EntityStatus, message: str | None) -> None:
         # A sweep that stopped or died is finished with its accumulator. Dropping it here covers
         # every ending, not just an explicit DELETE - an errored sweep never reaches that route, and
@@ -309,7 +324,9 @@ async def lifespan(app: FastAPI):
 
     app.state.forget_sweep_stats = forget_sweep_stats
     app.state.reset_sweep_stats = reset_sweep_stats
-    app.state.manager = DeviceManager(loop=loop, on_row=on_row, on_device=on_device, on_status=on_status)
+    app.state.manager = DeviceManager(
+        loop=loop, on_row=on_row, on_device=on_device, on_status=on_status, on_discovery=on_discovery
+    )
 
     _LOGGER.info("sdr_hub add-on ready")
     yield

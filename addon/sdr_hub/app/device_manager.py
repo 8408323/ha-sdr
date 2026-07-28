@@ -7,7 +7,9 @@ from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
 from devices import Dongle, discover_dongles
+from discovery import DiscoveryConfig, DiscoveryRun
 from models import (
+    DiscoveryCreate,
     EntityKind,
     EntityStatus,
     Receiver,
@@ -75,11 +77,16 @@ class DeviceManager:
         on_row: Callable[[str, SweepRow], None],
         on_device: Callable[[str, dict], None],
         on_status: Callable[[EntityKind, str, EntityStatus, str | None], None],
+        on_discovery: Callable[[dict], None] | None = None,
     ) -> None:
         self._loop = loop
         self._on_row = on_row
         self._on_device = on_device
         self._on_status = on_status
+        # Snapshots from a running discovery. Kept separate from on_device precisely because the
+        # difference is the whole point of the feature: on_device's payload becomes a Home
+        # Assistant entity, and a discovery result must not.
+        self._on_discovery = on_discovery
         # (driver, serial) -> receiver/sweep id. Keyed by the pair, not serial alone - two
         # devices from *different* SoapySDR drivers (or two devices that both omit a serial,
         # reporting "") can otherwise collide on the same key despite being genuinely distinct
@@ -89,6 +96,10 @@ class DeviceManager:
         self._receivers: dict[str, Receiver] = {}
         self._sweepers: dict[str, SoapySweeper] = {}
         self._sweeps: dict[str, Sweep] = {}
+        # Finished runs are kept here, not dropped: the result is the entire product of a
+        # discovery, and it arrives exactly when the run ends. Discarding it on completion would
+        # leave a user who looked away for a minute with nothing at all to show for the listen.
+        self._discoveries: dict[str, DiscoveryRun] = {}
 
     def list_dongles(self) -> list[dict]:
         return [
@@ -167,6 +178,76 @@ class DeviceManager:
         receiver = Receiver(id=receiver_id, **{**cfg.model_dump(), "dongle_driver": dongle.driver})
         self._receivers[receiver_id] = receiver
         return receiver
+
+    # -- Discovery (listen-only rtl_433) ------------------------------------------------------
+
+    def list_discoveries(self) -> list[dict]:
+        return [run.snapshot() for run in self._discoveries.values()]
+
+    def get_discovery(self, discovery_id: str) -> DiscoveryRun | None:
+        return self._discoveries.get(discovery_id)
+
+    async def start_discovery(self, cfg: DiscoveryCreate) -> DiscoveryRun:
+        discovery_id = str(uuid.uuid4())
+        dongle = self._claim(cfg.dongle_serial, discovery_id, cfg.dongle_driver)
+        if dongle.driver != "rtlsdr":
+            self._release(dongle.driver, cfg.dongle_serial, discovery_id)
+            raise UnsupportedReceiverDriverError(cfg.dongle_serial, dongle.driver)
+        # Resolved driver, not the caller's optional hint - the release below has to name the
+        # same (driver, serial) pair the claim used, for the reason spelled out in add_receiver.
+        driver = dongle.driver
+        run = DiscoveryRun(
+            discovery_id,
+            DiscoveryConfig(
+                dongle_serial=cfg.dongle_serial,
+                frequencies_hz=cfg.frequencies_hz,
+                duration_s=cfg.duration_s,
+                protocols=cfg.protocols,
+                hop_interval_s=cfg.hop_interval_s,
+            ),
+            on_update=self._on_discovery,
+            on_finished=lambda: self._on_discovery_finished(discovery_id, driver, cfg.dongle_serial),
+        )
+        try:
+            await run.start()
+        except Exception:
+            self._release(driver, cfg.dongle_serial, discovery_id)
+            raise
+        self._discoveries[discovery_id] = run
+        return run
+
+    def _on_discovery_finished(self, discovery_id: str, driver: str, serial: str) -> None:
+        """Frees the dongle the moment the run ends, however it ended.
+
+        Wired to the run's own completion rather than to the caller stopping it, because the
+        common case is nobody stopping it at all: a discovery ends by reaching its deadline, with
+        no request in flight to hang the release off. Leaving the claim until someone deleted the
+        record would block every sweep and receiver on that dongle for as long as the result sat
+        there unread - which, since results are deliberately retained, could be indefinitely.
+        """
+        self._release(driver, serial, discovery_id)
+        run = self._discoveries.get(discovery_id)
+        if run is not None and self._on_discovery is not None:
+            self._on_discovery(run.snapshot())
+
+    async def stop_discovery(self, discovery_id: str) -> bool:
+        """Ends a run early, keeping whatever it heard. False if there is no such run."""
+        run = self._discoveries.get(discovery_id)
+        if run is None:
+            return False
+        await run.finish()
+        return True
+
+    async def forget_discovery(self, discovery_id: str) -> bool:
+        """Ends the run if still going, then drops the result entirely."""
+        run = self._discoveries.pop(discovery_id, None)
+        if run is None:
+            return False
+        # finish() before dropping, not after: a still-running decoder holds both an rtl_433
+        # subprocess and the dongle claim, and dropping the only reference to it first would
+        # leave nothing able to stop either.
+        await run.finish()
+        return True
 
     async def remove_receiver(self, receiver_id: str) -> None:
         receiver = self._receivers.pop(receiver_id, None)
