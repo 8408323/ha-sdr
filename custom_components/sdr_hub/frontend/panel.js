@@ -639,6 +639,20 @@ const BAND_PLAN_KEY = "sdr_hub_band_plan";
 // by which point nothing from that run can still be in flight.
 const MAX_DISMISSED_DISCOVERIES = 200;
 
+// Sightings below which a discovery result is shown as unconfirmed rather than as a device.
+//
+// rtl_433 runs many permissive OOK decoders at once, and on a long listen some of them latch onto
+// noise: measured over a live overnight survey, spurious single-sighting entries accumulated at
+// roughly one per twenty minutes - a ceiling-fan remote "reversing direction" at 22:50 in an empty
+// house, a curtain-motor protocol decoded 400 MHz away from the band it operates in. Real
+// periodic devices in the same window were heard 17 and 35 times.
+//
+// They are marked rather than hidden, because a genuinely rare transmitter - a door contact, a
+// leak sensor - may legitimately be heard once, and silently dropping it would defeat the point
+// of a long survey. Two sightings is the threshold because a decoder tripping on noise almost
+// never reproduces the same id twice.
+const DISCOVERY_CONFIRM_SIGHTINGS = 2;
+
 // Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
 // how the band behaves over time but compresses power into colour, which is poor at exactly the
 // judgement this plot exists for - how far a signal stands above the noise floor, and whether an
@@ -6659,7 +6673,14 @@ class SdrHubPanel extends HTMLElement {
              <th style="padding:2px 0 2px 6px;">Latest reading</th>
            </tr></thead>
            <tbody>${devices.map((d) => this._discoveryRow(d)).join("")}</tbody>
-         </table>`
+         </table>${
+           devices.some((d) => (d.count || 0) < DISCOVERY_CONFIRM_SIGHTINGS)
+             ? `<div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
+                  Entries marked unconfirmed were heard only once. On a long listen some decoders
+                  occasionally match noise, so treat those as leads rather than devices.
+                </div>`
+             : ""
+         }`
       : `<div style="font-size:.85rem;color:var(--secondary-text-color,#727272);">${
           running ? "Listening…" : "Nothing was heard on this frequency during the run."
         }</div>`;
@@ -6691,8 +6712,15 @@ class SdrHubPanel extends HTMLElement {
     const sample = Object.entries(d.sample || {})
       .map(([k, v]) => `${k}: ${v}`)
       .join(", ");
-    return `<tr>
-      <td style="padding:2px 6px 2px 0;">${esc(name)}</td>
+    const unconfirmed = (d.count || 0) < DISCOVERY_CONFIRM_SIGHTINGS;
+    // Dimmed as a whole rather than badged in one column, so the distinction survives being
+    // skimmed: the risk is a one-off decode being read as a device that is really there.
+    const rowStyle = unconfirmed ? "opacity:.65;" : "";
+    const mark = unconfirmed
+      ? ` <span title="Heard only once. rtl_433 runs many permissive decoders at once and some occasionally match noise, so a single sighting is not evidence a device exists. Listen for longer, or restrict the scan to this protocol, to confirm." style="font-size:.75rem;color:var(--secondary-text-color,#727272);">unconfirmed</span>`
+      : "";
+    return `<tr style="${rowStyle}">
+      <td style="padding:2px 6px 2px 0;">${esc(name)}${mark}</td>
       <td style="padding:2px 6px;">${d.frequency_hz ? esc(fmtMHz(d.frequency_hz)) + " MHz" : "—"}</td>
       <td style="padding:2px 6px;">${esc(String(d.count || 0))}×</td>
       <td style="padding:2px 0 2px 6px;color:var(--secondary-text-color,#727272);">${esc(sample) || "—"}</td>
