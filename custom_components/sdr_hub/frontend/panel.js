@@ -122,6 +122,19 @@ const fmtElapsed = (ms) => {
   return `${Math.floor(s / 60)}m${(s % 60).toString().padStart(2, "0")}s`;
 };
 
+// A scan length, in the largest unit that keeps it readable. Deliberately separate from
+// fmtElapsed rather than an extension of it: that one labels the waterfall's relative-time axis,
+// where the span is minutes and an hours branch would never be reached, while a scan now runs up
+// to twelve hours - which fmtElapsed would render as "720m00s".
+const fmtDuration = (seconds) => {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return s % 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+};
+
 // Local wall-clock (the browser's own timezone), not UTC - "absolute" is meant to match what a
 // user's own clock already shows elsewhere (their OS, HA's own header clock), not to be a
 // portable/unambiguous format.
@@ -6714,7 +6727,13 @@ class SdrHubPanel extends HTMLElement {
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
           <strong style="font-size:.9rem;">${esc(freqs)}</strong>
           <span style="font-size:.8rem;color:var(--secondary-text-color,#727272);">
-            ${running ? `listening for ${esc(fmtElapsed(Number(run.duration_s) * 1000))}` : "finished"} ·
+            ${running
+              ? `listening for ${esc(fmtDuration(run.duration_s))}`
+              // The duration belongs on a finished run more than on a running one: it is what
+              // makes the result interpretable. "Nothing was heard" after ninety seconds says
+              // almost nothing, while the same words after twelve hours are a real finding - and
+              // once the run is over, nothing else on the card carries how long it listened.
+              : `listened ${esc(fmtDuration(run.duration_s))}`} ·
             ${devices.length} device${devices.length === 1 ? "" : "s"}${settings.length ? ` · ${esc(settings.join(" · "))}` : ""}
           </span>
           <span style="flex:1"></span>
