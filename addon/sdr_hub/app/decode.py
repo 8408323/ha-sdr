@@ -32,6 +32,16 @@ class ReceiverConfig:
     # entities for every already-decoded device on upgrade, spending an entity budget the user
     # never asked to spend. A discovery creates no entities, so it can have them for free.
     report_signal_level: bool = False
+    # Decoders to switch off while leaving every other default enabled. Distinct from `protocols`,
+    # which switches everything *else* off - the two answer opposite questions, and the difference
+    # matters because the useful case here is silencing one noisy decoder without giving up the
+    # rest. Measured over a live overnight survey, a handful of permissive decoders produced a
+    # spurious result roughly every twenty minutes while the real devices came from decoders that
+    # never misfired once.
+    exclude_protocols: list[int] = field(default_factory=list)
+    # Tuner frequency-offset correction in ppm. None leaves rtl_433's default of 0 rather than
+    # passing 0 explicitly, so the flag is absent unless a calibration was actually supplied.
+    ppm_error: int | None = None
 
 
 class Rtl433Decoder:
@@ -65,6 +75,14 @@ class Rtl433Decoder:
             args += ["-H", str(self._config.hop_interval_s)]
         for protocol in self._config.protocols:
             args += ["-R", str(protocol)]
+        # Negative protocol numbers disable a decoder. Applied after the positive list because
+        # rtl_433 reads them in order, though the two are mutually exclusive by validation: once
+        # any positive -R is given, everything else is already off and an exclusion would be
+        # meaningless rather than wrong.
+        for protocol in self._config.exclude_protocols:
+            args += ["-R", f"-{protocol}"]
+        if self._config.ppm_error is not None:
+            args += ["-p", str(self._config.ppm_error)]
         # Omitted entirely when unset, rather than passed as a default: rtl_433's own defaults are
         # automatic gain and a rate chosen from the enabled decoders, and no explicit value
         # reproduces either.

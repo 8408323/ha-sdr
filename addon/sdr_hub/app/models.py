@@ -13,6 +13,7 @@ from constants import (
     MAX_DISCOVERY_GAIN_DB,
     MAX_DISCOVERY_SAMPLE_RATE_HZ,
     MAX_NATIVE_BINS,
+    MAX_PPM_ERROR,
     MIN_DISCOVERY_DURATION_S,
     MIN_DISCOVERY_GAIN_DB,
     MIN_DISCOVERY_SAMPLE_RATE_HZ,
@@ -126,6 +127,9 @@ class DiscoveryCreate(BaseModel):
     sample_rate_hz: float | None = Field(
         default=None, ge=MIN_DISCOVERY_SAMPLE_RATE_HZ, le=MAX_DISCOVERY_SAMPLE_RATE_HZ
     )
+    # Decoders to switch off, leaving the rest enabled - the opposite question to `protocols`.
+    exclude_protocols: list[int] = Field(default_factory=list)
+    ppm_error: int | None = Field(default=None, ge=-MAX_PPM_ERROR, le=MAX_PPM_ERROR)
 
     @model_validator(mode="after")
     def _validate(self) -> DiscoveryCreate:
@@ -136,6 +140,18 @@ class DiscoveryCreate(BaseModel):
         # for a frequency the receiver was never tuned to. Rejected rather than silently shortened,
         # since the caller asked for a specific dwell and quietly changing it would make the
         # result mean something other than what was requested.
+        # Both lists together is a contradiction rather than a refinement: naming any protocol
+        # already disables every other decoder, so an exclusion alongside it can only name
+        # something that is off anyway. Rejected rather than ignored, because a user who wrote
+        # both plainly meant one of them and should be told which is being honoured.
+        if self.protocols and self.exclude_protocols:
+            raise ValueError(
+                "protocols and exclude_protocols cannot be combined: naming protocols already "
+                "disables every other decoder"
+            )
+        for protocol in self.exclude_protocols:
+            if protocol <= 0:
+                raise ValueError("exclude_protocols entries must be positive protocol numbers")
         needed = len(self.frequencies_hz) * self.hop_interval_s
         if len(self.frequencies_hz) > 1 and self.duration_s < needed:
             raise ValueError(

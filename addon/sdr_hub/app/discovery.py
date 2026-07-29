@@ -83,6 +83,8 @@ class DiscoveryConfig:
     hop_interval_s: int = DEFAULT_HOP_INTERVAL_S
     gain_db: float | None = None
     sample_rate_hz: float | None = None
+    exclude_protocols: list[int] = field(default_factory=list)
+    ppm_error: int | None = None
 
 
 class DiscoveryRun:
@@ -136,6 +138,8 @@ class DiscoveryRun:
                 sample_rate_hz=self.config.sample_rate_hz,
                 # A survey is exactly where signal level earns its cost: it is what separates a
                 # device heard once at the noise floor from one heard forty times well above it.
+                exclude_protocols=self.config.exclude_protocols,
+                ppm_error=self.config.ppm_error,
                 report_signal_level=True,
             ),
             on_device=self._on_device,
@@ -283,6 +287,8 @@ class DiscoveryRun:
             "duration_s": self.config.duration_s,
             "hop_interval_s": self.config.hop_interval_s,
             "protocols": list(self.config.protocols),
+            "exclude_protocols": list(self.config.exclude_protocols),
+            "ppm_error": self.config.ppm_error,
             "gain_db": self.config.gain_db,
             "sample_rate_hz": self.config.sample_rate_hz,
             "started_at": self.started_at,

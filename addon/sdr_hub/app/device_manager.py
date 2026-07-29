@@ -207,6 +207,8 @@ class DeviceManager:
                 hop_interval_s=cfg.hop_interval_s,
                 gain_db=cfg.gain_db,
                 sample_rate_hz=cfg.sample_rate_hz,
+                exclude_protocols=cfg.exclude_protocols,
+                ppm_error=cfg.ppm_error,
             ),
             on_update=self._on_discovery,
             on_finished=lambda: self._on_discovery_finished(discovery_id, driver, cfg.dongle_serial),

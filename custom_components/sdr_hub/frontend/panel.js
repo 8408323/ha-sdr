@@ -3292,7 +3292,9 @@ class SdrHubPanel extends HTMLElement {
                 <label style="${LABEL}" title="Seconds spent on each frequency before moving to the next. Only used when more than one frequency is listed.">Hop dwell s<input name="hop_interval_s" type="number" min="1" value="${esc(discoveryPrefs.hop_interval_s ?? 10)}" style="${INPUT};width:100px"></label>
                 <label style="${LABEL}" title="Blank for rtl_433's automatic gain. A fixed gain helps when a weak sensor is being ridden over by a strong neighbour.">Gain dB (auto if blank)<input name="gain_db" type="number" min="0" max="50" step="0.1" placeholder="auto" value="${esc(discoveryPrefs.gain_db ?? "")}" style="${INPUT};width:130px"></label>
                 <label style="${LABEL}" title="Blank lets rtl_433 pick (250k for OOK, 1024k when an FSK decoder is enabled). Wider catches signals further off the nominal frequency.">Sample rate Hz (auto if blank)<input name="sample_rate_hz" type="number" min="200000" max="3200000" step="1000" placeholder="auto" value="${esc(discoveryPrefs.sample_rate_hz ?? "")}" style="${INPUT};width:170px"></label>
-                <label style="${LABEL}" title="rtl_433 protocol numbers, comma-separated. Blank uses every enabled decoder. Listing any restricts to only those, which is how you test whether a signal is a specific device.">Protocols (blank = all)<input name="protocols" placeholder="e.g. 26,77,185" value="${esc(discoveryPrefs.protocols ?? "")}" style="${INPUT};width:170px"></label>
+                <label style="${LABEL}" title="rtl_433 protocol numbers, comma-separated. Blank uses every enabled decoder. Listing any restricts to only those, which is how you test whether a signal is a specific device.">Only protocols<input name="protocols" placeholder="e.g. 26,77,185" value="${esc(discoveryPrefs.protocols ?? "")}" style="${INPUT};width:150px"></label>
+                <label style="${LABEL}" title="Protocol numbers to switch off while leaving every other decoder enabled - the opposite of the field to the left. Useful when one permissive decoder keeps producing false results on a long scan. Cannot be combined with 'Only protocols'.">Exclude protocols<input name="exclude_protocols" placeholder="e.g. 155,167" value="${esc(discoveryPrefs.exclude_protocols ?? "")}" style="${INPUT};width:150px"></label>
+                <label style="${LABEL}" title="Tuner frequency-offset correction in parts per million. Blank means no correction. Only worth setting if you have measured this dongle's error against a known transmitter.">PPM error (blank = 0)<input name="ppm_error" type="number" min="-1000" max="1000" placeholder="0" value="${esc(discoveryPrefs.ppm_error ?? "")}" style="${INPUT};width:130px"></label>
               </div>
               <div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
                 Listing protocols restricts the scan to <em>only</em> those, so a targeted test will not see anything else.
@@ -6476,12 +6478,15 @@ class SdrHubPanel extends HTMLElement {
       const value = Number(raw);
       return Number.isFinite(value) ? value : undefined;
     };
-    const protocols = String(form.get("protocols") ?? "")
-      .split(",")
-      .map((v) => v.trim())
-      .filter(Boolean)
-      .map((v) => Number(v))
-      .filter((v) => Number.isInteger(v) && v > 0);
+    const protocolList = (name) =>
+      String(form.get(name) ?? "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean)
+        .map((v) => Number(v))
+        .filter((v) => Number.isInteger(v) && v > 0);
+    const protocols = protocolList("protocols");
+    const excludeProtocols = protocolList("exclude_protocols");
     try {
       const run = await this._callWS({
         type: "sdr_hub/start_discovery",
@@ -6491,6 +6496,8 @@ class SdrHubPanel extends HTMLElement {
         duration_s: Number(form.get("duration_s")) || 90,
         hop_interval_s: Number(form.get("hop_interval_s")) || 10,
         ...(protocols.length ? { protocols } : {}),
+        ...(excludeProtocols.length ? { exclude_protocols: excludeProtocols } : {}),
+        ...(optionalNumber("ppm_error") !== undefined ? { ppm_error: optionalNumber("ppm_error") } : {}),
         ...(optionalNumber("gain_db") !== undefined ? { gain_db: optionalNumber("gain_db") } : {}),
         ...(optionalNumber("sample_rate_hz") !== undefined
           ? { sample_rate_hz: optionalNumber("sample_rate_hz") }
@@ -6505,6 +6512,8 @@ class SdrHubPanel extends HTMLElement {
         gain_db: form.get("gain_db"),
         sample_rate_hz: form.get("sample_rate_hz"),
         protocols: form.get("protocols"),
+        exclude_protocols: form.get("exclude_protocols"),
+        ppm_error: form.get("ppm_error"),
         advanced_open: !!formEl.querySelector("#sdr-hub-discovery-advanced")?.open,
       });
       // Held locally rather than waiting for the first broadcast: a run over a quiet band may
@@ -6658,6 +6667,8 @@ class SdrHubPanel extends HTMLElement {
       run.gain_db != null ? `gain ${run.gain_db} dB` : null,
       run.sample_rate_hz != null ? `${Math.round(run.sample_rate_hz / 1000)}k sample rate` : null,
       (run.protocols || []).length ? `protocols ${run.protocols.join(", ")} only` : null,
+      (run.exclude_protocols || []).length ? `excluding ${run.exclude_protocols.join(", ")}` : null,
+      run.ppm_error != null ? `${run.ppm_error} ppm` : null,
     ].filter(Boolean);
     const running = !run.finished;
     const devices = run.devices || [];

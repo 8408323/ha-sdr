@@ -180,6 +180,8 @@ async def ws_remove_receiver(hass: HomeAssistant, connection, msg) -> None:
         vol.Optional("sample_rate_hz"): vol.Any(
             vol.All(vol.Coerce(float), vol.Range(min=200000, max=3200000)), None
         ),
+        vol.Optional("exclude_protocols", default=[]): [int],
+        vol.Optional("ppm_error"): vol.Any(vol.All(int, vol.Range(min=-1000, max=1000)), None),
     }
 )
 @websocket_api.async_response

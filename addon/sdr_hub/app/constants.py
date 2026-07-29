@@ -120,6 +120,14 @@ DISCOVERY_MAX_DEVICES: int = 200
 # worst-case list response stays modest.
 MAX_RETAINED_DISCOVERIES: int = 10
 
+# Bound on the tuner frequency-offset correction, in parts per million.
+#
+# Real RTL-SDR crystals are out by tens of ppm; the cheapest are specified to 100 and a handful of
+# the worst reach a few hundred. 1000 ppm at 868 MHz is 868 kHz - far more than any band this
+# tunes - so anything beyond that is a typo rather than a calibration, and is worth rejecting
+# rather than quietly tuning the receiver off the band the user asked for.
+MAX_PPM_ERROR: int = 1000
+
 # Per-client outbound WebSocket queue depth. Once full, the oldest pending
 # message is dropped so a slow client applies backpressure without letting
 # the server's memory grow unboundedly (see Broadcaster).
