@@ -128,6 +128,13 @@ MAX_RETAINED_DISCOVERIES: int = 10
 # rather than quietly tuning the receiver off the band the user asked for.
 MAX_PPM_ERROR: int = 1000
 
+# How many lines of rtl_433's stderr to keep for reporting a failure.
+#
+# Enough to carry the actual message and a little context, and no more: on an invalid protocol
+# number rtl_433 follows the one useful sentence with its entire supported-protocol list, which
+# would otherwise be what a user is shown.
+STDERR_TAIL_LINES: int = 12
+
 # Per-client outbound WebSocket queue depth. Once full, the oldest pending
 # message is dropped so a slow client applies backpressure without letting
 # the server's memory grow unboundedly (see Broadcaster).

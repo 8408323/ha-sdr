@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
 
-from constants import DEFAULT_HOP_INTERVAL_S
+from constants import DEFAULT_HOP_INTERVAL_S, STDERR_TAIL_LINES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +46,33 @@ class ReceiverConfig:
     ppm_error: int | None = None
 
 
+# Lines rtl_433 writes that are never the reason it failed.
+#
+# The protocol-list entries matter most. On an invalid protocol number rtl_433 prints the one
+# sentence that explains the failure and then dumps all ~250 supported protocols after it - so a
+# bounded tail that kept everything ended up holding the last dozen protocol names and none of the
+# diagnosis. Measured: the error read "[213] Fine Offset Electronics WS80 weather station ..."
+# where it should have read "Protocol number specified (9) is invalid".
+_STDERR_NOISE = re.compile(
+    r"""^(?:
+        \[\s*\d+\][ ]*\**    # "[213]  Fine Offset ..." protocol list entries
+      | =\s*Supported[ ]device   # the list's own headings
+      | =\s*Disabled[ ]by
+      | \*\s*Disabled[ ]by
+      | Trying[ ]conf[ ]file
+      | rtl_433[ ]version
+      | Use[ ]-h[ ]for[ ]usage
+      | Registered[ ]\d+[ ]out[ ]of
+      | Consider[ ]a[ ]more
+    )""",
+    re.VERBOSE,
+)
+
+
+def _is_stderr_noise(text: str) -> bool:
+    return bool(_STDERR_NOISE.match(text))
+
+
 class Rtl433Decoder:
     """Runs rtl_433 as a subprocess against a specific dongle, emitting one decoded-device dict per JSON line.
 
@@ -64,6 +93,16 @@ class Rtl433Decoder:
         self._on_exit = on_exit
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
+        # Last few lines rtl_433 wrote to stderr, kept so a failure can say *why*.
+        #
+        # stderr used to be discarded, which made every misconfiguration look identical: an invalid
+        # protocol number, an unsupported sample rate and a missing dongle all surfaced as "exited
+        # with code 1". rtl_433 explains itself perfectly well - "Protocol number specified (9) is
+        # invalid" - and that sentence is the entire difference between a user fixing their input
+        # and having no idea what happened. Bounded, because rtl_433 also writes its whole
+        # protocol list to stderr on that particular error.
+        self._stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        self._stderr_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         if self._process is not None:
@@ -98,14 +137,26 @@ class Rtl433Decoder:
         self._process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
+        # Drained continuously rather than read on exit: a pipe nobody reads fills and then blocks
+        # the writer, so leaving it unread would hang rtl_433 mid-run rather than merely lose the
+        # message - the reason it was DEVNULL in the first place.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    @property
+    def stderr_tail(self) -> str:
+        """The last lines rtl_433 wrote to stderr, as one string. Empty if it said nothing."""
+        return "\n".join(self._stderr_tail)
 
     async def stop(self) -> None:
         if self._reader_task is not None:
             self._reader_task.cancel()
             self._reader_task = None
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         if self._process is None:
             return
         try:
@@ -126,6 +177,16 @@ class Rtl433Decoder:
             # process - wait for it so the dongle is genuinely free before we return.
             await self._process.wait()
         self._process = None
+
+    async def _drain_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+        async for line in process.stderr:
+            text = line.decode(errors="replace").strip()
+            if not text or _is_stderr_noise(text):
+                continue
+            self._stderr_tail.append(text)
 
     async def _read_loop(self) -> None:
         assert self._process is not None and self._process.stdout is not None

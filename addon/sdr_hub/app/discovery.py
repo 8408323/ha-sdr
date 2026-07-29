@@ -222,7 +222,13 @@ class DiscoveryRun:
         """rtl_433 ended by itself - a failure, since a healthy run only ends at its deadline."""
         if self.finished:
             return
+        # Include what rtl_433 said, which is usually the whole diagnosis: a mistyped protocol
+        # number, an unsupported sample rate and an absent dongle all exit with code 1, and the
+        # code alone leaves the user with nothing to act on.
+        detail = self._decoder.stderr_tail if self._decoder is not None else ""
         self.error = f"rtl_433 exited unexpectedly with code {returncode}"
+        if detail:
+            self.error += f": {detail}"
         _LOGGER.warning("discovery %s: %s", self.id, self.error)
         # finish() is async and this is a plain callback from the reader task, so the completion
         # has to be scheduled rather than awaited. Without it a failed run would sit "running"
