@@ -639,19 +639,27 @@ const BAND_PLAN_KEY = "sdr_hub_band_plan";
 // by which point nothing from that run can still be in flight.
 const MAX_DISMISSED_DISCOVERIES = 200;
 
-// Sightings below which a discovery result is shown as unconfirmed rather than as a device.
+// Sightings below which a discovery result is shown as weakly-evidenced rather than as a device.
 //
-// rtl_433 runs many permissive OOK decoders at once, and on a long listen some of them latch onto
-// noise: measured over a live overnight survey, spurious single-sighting entries accumulated at
-// roughly one per twenty minutes - a ceiling-fan remote "reversing direction" at 22:50 in an empty
-// house, a curtain-motor protocol decoded 400 MHz away from the band it operates in. Real
-// periodic devices in the same window were heard 17 and 35 times.
+// rtl_433 runs many permissive decoders at once, and on a long listen some latch onto noise. The
+// threshold started at two, on the reasoning that noise would not reproduce the same id twice.
+// A live overnight survey disproved that within hours: a GT-WT02 thermo-hygrometer decoded twice,
+// reporting -131.2 C and then +124.8 C from the same id twenty minutes apart.
 //
-// They are marked rather than hidden, because a genuinely rare transmitter - a door contact, a
-// leak sensor - may legitimately be heard once, and silently dropping it would defeat the point
-// of a long survey. Two sightings is the threshold because a decoder tripping on noise almost
-// never reproduces the same id twice.
-const DISCOVERY_CONFIRM_SIGHTINGS = 2;
+// Measured over that survey, sightings per device:
+//
+//   real:      185, 85, 8, 4        spurious:  2, 2, 1, 1, 1
+//
+// Three is where those populations separate. It is a summary of one night on one band, not a law,
+// which is why results below it are dimmed and labelled rather than hidden - a door contact or a
+// leak sensor may legitimately transmit once, and dropping it silently would defeat the point of
+// listening for hours.
+//
+// Do NOT add a signal-strength filter here. It is the obvious next idea and the same survey shows
+// it inverts: median SNR was 31 dB for a real Somfy, 24 dB for a *spurious* KeeLoq decode, and
+// 8 dB for the real thermometer that transmitted 85 times. Filtering on SNR would have discarded
+// a genuine device and kept a phantom.
+const DISCOVERY_CONFIRM_SIGHTINGS = 3;
 
 // Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
 // how the band behaves over time but compresses power into colour, which is poor at exactly the
@@ -6687,8 +6695,9 @@ class SdrHubPanel extends HTMLElement {
          </table>${
            devices.some((d) => (d.count || 0) < DISCOVERY_CONFIRM_SIGHTINGS)
              ? `<div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
-                  Entries marked unconfirmed were heard only once. On a long listen some decoders
-                  occasionally match noise, so treat those as leads rather than devices.
+                  Entries marked <em>weak evidence</em> were heard fewer than ${DISCOVERY_CONFIRM_SIGHTINGS}
+                  times. Some decoders match noise on a long listen, so treat those as leads: check the
+                  readings are physically plausible and the frequency matches the band that protocol uses.
                 </div>`
              : ""
          }`
@@ -6728,7 +6737,7 @@ class SdrHubPanel extends HTMLElement {
     // skimmed: the risk is a one-off decode being read as a device that is really there.
     const rowStyle = unconfirmed ? "opacity:.65;" : "";
     const mark = unconfirmed
-      ? ` <span title="Heard only once. rtl_433 runs many permissive decoders at once and some occasionally match noise, so a single sighting is not evidence a device exists. Listen for longer, or restrict the scan to this protocol, to confirm." style="font-size:.75rem;color:var(--secondary-text-color,#727272);">unconfirmed</span>`
+      ? ` <span title="Heard only a few times. rtl_433 runs many permissive decoders at once and some match noise on a long listen - one produced readings of -131 C and +124 C from the same id twenty minutes apart. A handful of sightings is not evidence a device exists. Check the readings are physically plausible and the frequency matches the band the protocol actually uses; listening for longer is the reliable test." style="font-size:.75rem;color:var(--secondary-text-color,#727272);">weak evidence</span>`
       : "";
     return `<tr style="${rowStyle}">
       <td style="padding:2px 6px 2px 0;">${esc(name)}${mark}</td>
