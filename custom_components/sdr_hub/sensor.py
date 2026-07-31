@@ -51,6 +51,14 @@ NON_MEASUREMENT_FIELDS = frozenset(
         "freq",
         "freq1",
         "freq2",
+        # Signal strength, likewise: these describe how well *this receiver* heard the
+        # transmission - they move with the antenna, the gain setting and the weather, not with
+        # anything the sensor measured. Listed even though no receiver currently requests them
+        # (rtl_433 emits them only under -M level), because the cost of them arriving unlisted is
+        # three permanent entities per device, silently created on upgrade for everyone.
+        "rssi",
+        "snr",
+        "noise",
     }
 )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import threading
 import os
 import time
@@ -13,7 +14,10 @@ from pathlib import Path
 from auth import resolve_api_token
 from broadcaster import Broadcaster
 from device_manager import DeviceManager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from models import EntityKind, EntityStatus
 from routes import router
 from scanner import SweepRow
@@ -299,6 +303,21 @@ async def lifespan(app: FastAPI):
             }
         )
 
+    def on_discovery(snapshot: dict) -> None:
+        """Broadcasts a discovery snapshot under its own event type.
+
+        Emphatically not "decoded_device": the integration turns every one of those into a Home
+        Assistant entity, and a discovery exists precisely so a user can see what is transmitting
+        without that happening. The distinct type is what enforces that - a consumer that does not
+        know about discovery ignores these events entirely, which is the correct behaviour for
+        every existing client and the reason this is a new type rather than a flag on the old one.
+
+        Carries no sequence number, unlike decoded_device. That counter exists so persisted
+        per-device state (the battery map) can order writes across tabs and restarts; a discovery
+        snapshot is whole-state, self-contained and disposable, so there is nothing to order.
+        """
+        broadcaster.broadcast({"type": "discovery", "discovery": snapshot})
+
     def on_status(kind: EntityKind, entity_id: str, status: EntityStatus, message: str | None) -> None:
         # A sweep that stopped or died is finished with its accumulator. Dropping it here covers
         # every ending, not just an explicit DELETE - an errored sweep never reaches that route, and
@@ -309,7 +328,9 @@ async def lifespan(app: FastAPI):
 
     app.state.forget_sweep_stats = forget_sweep_stats
     app.state.reset_sweep_stats = reset_sweep_stats
-    app.state.manager = DeviceManager(loop=loop, on_row=on_row, on_device=on_device, on_status=on_status)
+    app.state.manager = DeviceManager(
+        loop=loop, on_row=on_row, on_device=on_device, on_status=on_status, on_discovery=on_discovery
+    )
 
     _LOGGER.info("sdr_hub add-on ready")
     yield
@@ -325,4 +346,30 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Returns 422 for an invalid request even when the invalid value cannot be JSON-encoded.
+
+    FastAPI's default handler echoes the offending input back in the error body, and Starlette's
+    JSONResponse encodes with allow_nan=False - so a request carrying NaN or infinity produced a
+    500 while *serialising its own 422*, hiding a perfectly good validation message behind a
+    server error. Rejecting the request was already correct; only the reply was not.
+
+    Registered app-wide rather than per route: any endpoint taking a float is reachable this way,
+    and the frequency fields are simply where it was noticed.
+    """
+    # Wrapped in {"detail": [...]} exactly as FastAPI's own handler does. This exists only to
+    # change how a value is *encoded*, and returning a bare array would have quietly changed the
+    # response shape of every validation failure in the API to fix a serialization edge case.
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors(), custom_encoder={float: _json_safe_float})},
+    )
+
+
+def _json_safe_float(value: float) -> float | str:
+    """Renders a non-finite float as its name, so it still appears in the error it caused."""
+    return value if math.isfinite(value) else repr(value)
+
+
 app.include_router(router)

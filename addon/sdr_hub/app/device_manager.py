@@ -7,7 +7,10 @@ from typing import Callable
 
 from decode import ReceiverConfig, Rtl433Decoder
 from devices import Dongle, discover_dongles
+from constants import MAX_RETAINED_DISCOVERIES
+from discovery import DiscoveryConfig, DiscoveryRun
 from models import (
+    DiscoveryCreate,
     EntityKind,
     EntityStatus,
     Receiver,
@@ -75,11 +78,16 @@ class DeviceManager:
         on_row: Callable[[str, SweepRow], None],
         on_device: Callable[[str, dict], None],
         on_status: Callable[[EntityKind, str, EntityStatus, str | None], None],
+        on_discovery: Callable[[dict], None] | None = None,
     ) -> None:
         self._loop = loop
         self._on_row = on_row
         self._on_device = on_device
         self._on_status = on_status
+        # Snapshots from a running discovery. Kept separate from on_device precisely because the
+        # difference is the whole point of the feature: on_device's payload becomes a Home
+        # Assistant entity, and a discovery result must not.
+        self._on_discovery = on_discovery
         # (driver, serial) -> receiver/sweep id. Keyed by the pair, not serial alone - two
         # devices from *different* SoapySDR drivers (or two devices that both omit a serial,
         # reporting "") can otherwise collide on the same key despite being genuinely distinct
@@ -89,6 +97,10 @@ class DeviceManager:
         self._receivers: dict[str, Receiver] = {}
         self._sweepers: dict[str, SoapySweeper] = {}
         self._sweeps: dict[str, Sweep] = {}
+        # Finished runs are kept here, not dropped: the result is the entire product of a
+        # discovery, and it arrives exactly when the run ends. Discarding it on completion would
+        # leave a user who looked away for a minute with nothing at all to show for the listen.
+        self._discoveries: dict[str, DiscoveryRun] = {}
 
     def list_dongles(self) -> list[dict]:
         return [
@@ -167,6 +179,123 @@ class DeviceManager:
         receiver = Receiver(id=receiver_id, **{**cfg.model_dump(), "dongle_driver": dongle.driver})
         self._receivers[receiver_id] = receiver
         return receiver
+
+    # -- Discovery (listen-only rtl_433) ------------------------------------------------------
+
+    def list_discoveries(self) -> list[dict]:
+        return [run.snapshot() for run in self._discoveries.values()]
+
+    def get_discovery(self, discovery_id: str) -> DiscoveryRun | None:
+        return self._discoveries.get(discovery_id)
+
+    async def start_discovery(self, cfg: DiscoveryCreate) -> DiscoveryRun:
+        discovery_id = str(uuid.uuid4())
+        dongle = self._claim(cfg.dongle_serial, discovery_id, cfg.dongle_driver)
+        if dongle.driver != "rtlsdr":
+            self._release(dongle.driver, cfg.dongle_serial, discovery_id)
+            raise UnsupportedReceiverDriverError(cfg.dongle_serial, dongle.driver)
+        # Resolved driver, not the caller's optional hint - the release below has to name the
+        # same (driver, serial) pair the claim used, for the reason spelled out in add_receiver.
+        driver = dongle.driver
+        run = DiscoveryRun(
+            discovery_id,
+            DiscoveryConfig(
+                dongle_serial=cfg.dongle_serial,
+                frequencies_hz=cfg.frequencies_hz,
+                duration_s=cfg.duration_s,
+                protocols=cfg.protocols,
+                hop_interval_s=cfg.hop_interval_s,
+                gain_db=cfg.gain_db,
+                sample_rate_hz=cfg.sample_rate_hz,
+                exclude_protocols=cfg.exclude_protocols,
+                ppm_error=cfg.ppm_error,
+            ),
+            on_update=self._on_discovery,
+            on_finished=lambda: self._on_discovery_finished(discovery_id, driver, cfg.dongle_serial),
+        )
+        try:
+            await run.start()
+        except BaseException:
+            # BaseException, not Exception: CancelledError does not inherit from Exception, and
+            # cancellation here is entirely ordinary - the Home Assistant command that triggered
+            # this can be cancelled while the subprocess is still being spawned. Escaping through
+            # an Exception-only handler left the claim registered forever against a run that was
+            # never inserted into _discoveries, so no stop, dismiss or shutdown path could ever
+            # find it and the dongle was unusable until the add-on restarted.
+            #
+            # finish() before releasing, because start() may have got far enough to leave an
+            # rtl_433 process behind - releasing a claim while the subprocess still holds the
+            # device would hand it to the next claimant on top of a live tuner.
+            await run.finish()
+            self._release(driver, cfg.dongle_serial, discovery_id)
+            raise
+        self._retire_old_discoveries()
+        self._discoveries[discovery_id] = run
+        return run
+
+    def _retire_old_discoveries(self) -> None:
+        """Drops the oldest finished runs once too many are being retained.
+
+        Results are deliberately kept after a run ends - that is the whole product of a discovery,
+        and a panel opening later has no other way to see it - but "until someone dismisses it" is
+        not a bound. Each retained run can hold up to DISCOVERY_MAX_DEVICES entries and is
+        returned in full by /discoveries, so a user who runs discovery repeatedly without
+        dismissing grows both the add-on's memory and every list response without limit.
+
+        Only finished runs are candidates: an active one owns a subprocess and a dongle claim, and
+        dropping it would leak both.
+        """
+        finished = [(run.started_at, did) for did, run in self._discoveries.items() if run.finished]
+        excess = len(finished) - MAX_RETAINED_DISCOVERIES
+        if excess <= 0:
+            return
+        for _, discovery_id in sorted(finished)[:excess]:
+            _LOGGER.info("retiring discovery %s to stay within the retained-result limit", discovery_id)
+            self._discoveries.pop(discovery_id, None)
+
+    def _on_discovery_finished(self, discovery_id: str, driver: str, serial: str) -> None:
+        """Frees the dongle the moment the run ends, however it ended.
+
+        Wired to the run's own completion rather than to the caller stopping it, because the
+        common case is nobody stopping it at all: a discovery ends by reaching its deadline, with
+        no request in flight to hang the release off. Leaving the claim until someone deleted the
+        record would block every sweep and receiver on that dongle for as long as the result sat
+        there unread - which, since results are deliberately retained, could be indefinitely.
+        """
+        self._release(driver, serial, discovery_id)
+        run = self._discoveries.get(discovery_id)
+        if run is not None and self._on_discovery is not None:
+            self._on_discovery(run.snapshot())
+        # Also here, not only when the next scan starts. Retiring at start alone bounds the set
+        # only at that moment: runs keep finishing in between, so a user who starts several and
+        # never starts another would sit above the cap indefinitely. Retiring as each one ends
+        # keeps it bounded at all times, and the run that just finished is now itself a candidate.
+        self._retire_old_discoveries()
+
+    async def stop_discovery(self, discovery_id: str) -> DiscoveryRun | None:
+        """Ends a run early, keeping whatever it heard. None if there is no such run.
+
+        Returns the run itself rather than a bool so the caller can snapshot the reference it
+        already holds. Looking it up again after the await is unsafe: finishing a run yields, and
+        a concurrent dismiss can pop the same id during that window - the second lookup then finds
+        nothing and turns a successful stop into a 500.
+        """
+        run = self._discoveries.get(discovery_id)
+        if run is None:
+            return None
+        await run.finish()
+        return run
+
+    async def forget_discovery(self, discovery_id: str) -> bool:
+        """Ends the run if still going, then drops the result entirely."""
+        run = self._discoveries.pop(discovery_id, None)
+        if run is None:
+            return False
+        # finish() before dropping, not after: a still-running decoder holds both an rtl_433
+        # subprocess and the dongle claim, and dropping the only reference to it first would
+        # leave nothing able to stop either.
+        await run.finish()
+        return True
 
     async def remove_receiver(self, receiver_id: str) -> None:
         receiver = self._receivers.pop(receiver_id, None)
@@ -275,7 +404,25 @@ class DeviceManager:
         self._on_status(EntityKind.SWEEP, sweep_id, EntityStatus.ERROR, str(err))
 
     async def shutdown(self) -> None:
-        for receiver_id in list(self._receivers):
-            await self.remove_receiver(receiver_id)
-        for sweep_id in list(self._sweeps):
-            await self.remove_sweep(sweep_id)
+        """Releases every claimed dongle. One kind failing must not strand the others.
+
+        remove_sweep() raises SweepStopTimeoutError when a capture thread outlives its timeout,
+        which used to abort the whole shutdown - so a single stuck sweep left every discovery's
+        rtl_433 subprocess and deadline task running under the old manager, holding a dongle the
+        replacement manager then could not claim. Each kind is now attempted independently, and
+        the first error is re-raised afterwards so a genuinely stuck sweep is still reported.
+        """
+        first_error: Exception | None = None
+        for entity_id, stop in [
+            *((rid, self.remove_receiver) for rid in list(self._receivers)),
+            *((sid, self.remove_sweep) for sid in list(self._sweeps)),
+            *((did, self.forget_discovery) for did in list(self._discoveries)),
+        ]:
+            try:
+                await stop(entity_id)
+            except Exception as err:  # noqa: BLE001 - one stuck entity must not strand the rest
+                _LOGGER.exception("shutdown: failed to stop %s", entity_id)
+                if first_error is None:
+                    first_error = err
+        if first_error is not None:
+            raise first_error

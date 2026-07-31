@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 
 from .api import SdrHubApiError
+from .coordinator import sanitize_discovery_snapshot
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -154,6 +155,129 @@ async def ws_remove_receiver(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"])
 
 
+# Admin-gated like every other command that touches the dongle. A discovery claims the device for
+# its whole duration, so a non-admin able to start one could block every sweep and receiver on it -
+# the same exposure as being able to start a receiver, and gated the same way.
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "sdr_hub/start_discovery",
+        vol.Required("dongle_serial"): str,
+        # See ws_add_receiver - same optional disambiguator, same reasoning.
+        vol.Optional("dongle_driver"): vol.Any(str, None),
+        vol.Required("frequencies_hz"): [vol.Coerce(float)],
+        vol.Optional("protocols", default=[]): [int],
+        vol.Optional("hop_interval_s", default=10): vol.All(int, vol.Range(min=0, min_included=False)),
+        # Bounds duplicated from the add-on's DiscoveryCreate rather than left to it. The add-on
+        # would reject an out-of-range value anyway, but only after the panel had been told the
+        # request was accepted here - and a range error is exactly the kind a user should see
+        # against the control they typed it into.
+        vol.Optional("duration_s", default=90): vol.All(int, vol.Range(min=10, max=43200)),
+        # Optional tuning overrides. vol.Any(..., None) rather than a default, because "absent"
+        # has to survive the round trip: the add-on omits the rtl_433 flag entirely when it is
+        # None, and no numeric default reproduces automatic gain or a decoder-chosen sample rate.
+        vol.Optional("gain_db"): vol.Any(vol.All(vol.Coerce(float), vol.Range(min=0, max=50)), None),
+        vol.Optional("sample_rate_hz"): vol.Any(
+            vol.All(vol.Coerce(float), vol.Range(min=200000, max=3200000)), None
+        ),
+        vol.Optional("exclude_protocols", default=[]): [int],
+        vol.Optional("ppm_error"): vol.Any(vol.All(int, vol.Range(min=-1000, max=1000)), None),
+    }
+)
+@websocket_api.async_response
+async def ws_start_discovery(hass: HomeAssistant, connection, msg) -> None:
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    # None-valued optional keys are dropped rather than forwarded. Sending "gain_db": null would
+    # be rejected by the add-on's float field, and it means the same thing as not sending it - so
+    # the panel can leave an advanced control blank without special-casing every field.
+    config = {k: v for k, v in msg.items() if k not in ("id", "type") and v is not None}
+    try:
+        run = await coordinator.api.async_start_discovery(config)
+    except SdrHubApiError as err:
+        connection.send_error(msg["id"], "start_discovery_failed", err.detail)
+        return
+    # A discovery does change the polled snapshot, even though it is not itself part of it: the
+    # add-on's /devices response now reports this dongle's in_use_by as the discovery id. Without
+    # this refresh every other panel keeps showing the device as free until the next 30 s poll,
+    # and an action taken from that stale display gets an unexplained 409.
+    await coordinator.async_refresh()  # not the debounced variant - see ws_add_receiver
+    connection.send_result(msg["id"], run)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "sdr_hub/stop_discovery", vol.Required("discovery_id"): str}
+)
+@websocket_api.async_response
+async def ws_stop_discovery(hass: HomeAssistant, connection, msg) -> None:
+    """Ends a run early and returns what it heard - distinct from forget, which discards it."""
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    try:
+        run = await coordinator.api.async_stop_discovery(msg["discovery_id"])
+    except SdrHubApiError as err:
+        connection.send_error(msg["id"], "stop_discovery_failed", err.detail)
+        return
+    # Stopping frees the dongle, so the same ownership reasoning as starting applies in reverse.
+    await coordinator.async_refresh()
+    connection.send_result(msg["id"], sanitize_discovery_snapshot(run) if isinstance(run, dict) else run)
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): "sdr_hub/forget_discovery", vol.Required("discovery_id"): str}
+)
+@websocket_api.async_response
+async def ws_forget_discovery(hass: HomeAssistant, connection, msg) -> None:
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    try:
+        await coordinator.api.async_forget_discovery(msg["discovery_id"])
+    except SdrHubApiError as err:
+        connection.send_error(msg["id"], "forget_discovery_failed", err.detail)
+        return
+    # Dismissing a run that is still going stops it, which frees the dongle - so this changes
+    # device ownership exactly as start and stop do. Missing it left every panel showing the
+    # device as claimed by a discovery that no longer exists, with nothing to correct it before
+    # the next 30 s poll.
+    await coordinator.async_refresh()
+    connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command({vol.Required("type"): "sdr_hub/list_discoveries"})
+@websocket_api.async_response
+async def ws_list_discoveries(hass: HomeAssistant, connection, msg) -> None:
+    """Read-only, so not admin-gated - it reports what was heard and changes nothing.
+
+    Needed because discovery results are not part of the polled snapshot: a panel that opens
+    after a run finished has no other way to learn it happened, and the result is exactly what a
+    user comes back to look at.
+    """
+    coordinator = _coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_loaded", "SDR Hub is not loaded")
+        return
+    try:
+        runs = await coordinator.api.async_get_discoveries()
+    except SdrHubApiError as err:
+        connection.send_error(msg["id"], "list_discoveries_failed", err.detail)
+        return
+    # Sanitized exactly as the streamed events are. These snapshots arrive by a different route
+    # but carry the same sampled rtl_433 fields, and websocket_api rejects the *whole* result over
+    # one unrepresentable number - so an unguarded list would make every retained run disappear
+    # for a reopening panel, which is the failure the guard was added for in the first place.
+    connection.send_result(
+        msg["id"], [sanitize_discovery_snapshot(r) if isinstance(r, dict) else r for r in runs]
+    )
+
+
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {
@@ -238,3 +362,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_add_sweep)
     websocket_api.async_register_command(hass, ws_remove_sweep)
     websocket_api.async_register_command(hass, ws_reset_sweep_stats)
+    websocket_api.async_register_command(hass, ws_start_discovery)
+    websocket_api.async_register_command(hass, ws_stop_discovery)
+    websocket_api.async_register_command(hass, ws_forget_discovery)
+    websocket_api.async_register_command(hass, ws_list_discoveries)

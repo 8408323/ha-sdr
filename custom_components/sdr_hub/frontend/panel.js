@@ -122,6 +122,19 @@ const fmtElapsed = (ms) => {
   return `${Math.floor(s / 60)}m${(s % 60).toString().padStart(2, "0")}s`;
 };
 
+// A scan length, in the largest unit that keeps it readable. Deliberately separate from
+// fmtElapsed rather than an extension of it: that one labels the waterfall's relative-time axis,
+// where the span is minutes and an hours branch would never be reached, while a scan now runs up
+// to twelve hours - which fmtElapsed would render as "720m00s".
+const fmtDuration = (seconds) => {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return s % 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+};
+
 // Local wall-clock (the browser's own timezone), not UTC - "absolute" is meant to match what a
 // user's own clock already shows elsewhere (their OS, HA's own header clock), not to be a
 // portable/unambiguous format.
@@ -595,6 +608,7 @@ function colormapGradientCss(name) {
 // not something another client or an automation needs to see.
 const SWEEP_FORM_PREFS_KEY = "sdr_hub_sweep_form_prefs";
 const RECEIVER_FORM_PREFS_KEY = "sdr_hub_receiver_form_prefs";
+const DISCOVERY_FORM_PREFS_KEY = "sdr_hub_discovery_form_prefs";
 const HELP_DISMISSED_KEY = "sdr_hub_help_dismissed";
 const COLORMAP_KEY = "sdr_hub_colormap";
 const DB_RANGE_KEY = "sdr_hub_db_range";
@@ -632,6 +646,34 @@ const BATTERY_SOUND_ALERT_KEY = "sdr_hub_battery_sound_alert";
 const SPECTRUM_TRACE_KEY = "sdr_hub_spectrum_trace";
 const BAND_PLAN_KEY = "sdr_hub_band_plan";
 
+// How many dismissed discovery ids to remember (see _rememberDismissed). Generous, because the
+// entries are just strings and the cost of forgetting one too early is a resurrected card: a
+// panel would have to dismiss this many runs in a single session before the oldest is dropped,
+// by which point nothing from that run can still be in flight.
+const MAX_DISMISSED_DISCOVERIES = 200;
+
+// Sightings below which a discovery result is shown as weakly-evidenced rather than as a device.
+//
+// rtl_433 runs many permissive decoders at once, and on a long listen some latch onto noise. The
+// threshold started at two, on the reasoning that noise would not reproduce the same id twice.
+// A live overnight survey disproved that within hours: a GT-WT02 thermo-hygrometer decoded twice,
+// reporting -131.2 C and then +124.8 C from the same id twenty minutes apart.
+//
+// Measured over that survey, sightings per device:
+//
+//   real:      185, 85, 8, 4        spurious:  2, 2, 1, 1, 1
+//
+// Three is where those populations separate. It is a summary of one night on one band, not a law,
+// which is why results below it are dimmed and labelled rather than hidden - a door contact or a
+// leak sensor may legitimately transmit once, and dropping it silently would defeat the point of
+// listening for hours.
+//
+// Do NOT add a signal-strength filter here. It is the obvious next idea and the same survey shows
+// it inverts: median SNR was 31 dB for a real Somfy, 24 dB for a *spurious* KeeLoq decode, and
+// 8 dB for the real thermometer that transmitted 85 times. Filtering on SNR would have discarded
+// a genuine device and kept a phantom.
+const DISCOVERY_CONFIRM_SIGHTINGS = 3;
+
 // Height of the spectrum trace plot drawn above each waterfall, in CSS pixels. The waterfall shows
 // how the band behaves over time but compresses power into colour, which is poor at exactly the
 // judgement this plot exists for - how far a signal stands above the noise floor, and whether an
@@ -662,6 +704,7 @@ const ALL_PREF_KEYS = [
   BATTERY_LOW_KEY,
   SPECTRUM_TRACE_KEY,
   BAND_PLAN_KEY,
+  DISCOVERY_FORM_PREFS_KEY,
 ];
 
 // Fingerprint of the persisted values that are baked into the shell's markup when it is rendered
@@ -669,7 +712,10 @@ const ALL_PREF_KEYS = [
 // value, but it cannot retro-fit markup, so these are handled by rebuilding instead.
 function shellPrefsSignature() {
   try {
-    return [SWEEP_FORM_PREFS_KEY, RECEIVER_FORM_PREFS_KEY, HELP_DISMISSED_KEY]
+    // DISCOVERY_FORM_PREFS_KEY belongs here for the same reason the other two do: its values are
+    // rendered *into* the form markup, so no amount of updating live controls reconciles them -
+    // the shell has to be rebuilt when another tab changes or resets them.
+    return [SWEEP_FORM_PREFS_KEY, RECEIVER_FORM_PREFS_KEY, DISCOVERY_FORM_PREFS_KEY, HELP_DISMISSED_KEY]
       .map((k) => `${k}=${localStorage.getItem(k) ?? ""}`)
       .join("|");
   } catch {
@@ -1202,6 +1248,33 @@ const SWEEP_PRESETS = [
   { label: "ISM 915 MHz, US (902–928 MHz)", start_mhz: 902, stop_mhz: 928 },
   { label: "ADS-B (1089–1091 MHz)", start_mhz: 1089, stop_mhz: 1091 },
 ];
+// Frequency sets worth scanning, as opposed to worth running a receiver on. The two lists differ
+// on purpose: a receiver is pointed at a frequency you have already decided matters, while a scan
+// is how you find out - so these are grouped by *question* ("is there anything on 868?") rather
+// than by device.
+const DISCOVERY_PRESETS = [
+  { label: "433 MHz ISM (most sensors)", frequencies_mhz: "433.92" },
+  { label: "868 MHz SRD, EU", frequencies_mhz: "868.3" },
+  { label: "Somfy (RTS + io-homecontrol)", frequencies_mhz: "433.42,868.25,868.95" },
+  { label: "All common EU ISM", frequencies_mhz: "433.42,433.92,868.25,868.3,868.95" },
+  { label: "915 MHz ISM, US", frequencies_mhz: "915" },
+  { label: "Car remotes / TPMS, US", frequencies_mhz: "314.98,315" },
+];
+
+// Durations offered as named choices rather than a free number. The useful values are not evenly
+// spread - they are set by how often the thing you are looking for transmits - and a plain number
+// box invites 30, which is shorter than the reporting interval of almost every sensor here and so
+// reliably produces an empty result that looks like an answer.
+const DISCOVERY_DURATIONS = [
+  { s: 60, label: "1 minute (quick check)" },
+  { s: 90, label: "90 seconds (default)" },
+  { s: 300, label: "5 minutes" },
+  { s: 900, label: "15 minutes" },
+  { s: 3600, label: "1 hour" },
+  { s: 14400, label: "4 hours" },
+  { s: 43200, label: "12 hours (overnight)" },
+];
+
 const RECEIVER_PRESETS = [
   { label: "ISM 433.92 MHz, EU", frequencies_mhz: "433.92" },
   { label: "ISM 868.3/868.95 MHz, EU", frequencies_mhz: "868.3,868.95" },
@@ -1478,6 +1551,25 @@ class SdrHubPanel extends HTMLElement {
     this._audioUnlockWired = false;
     this._spectrumTraceEnabled = loadSpectrumTraceEnabled();
     this._bandPlanEnabled = loadBandPlanEnabled();
+    // Discovery runs by id. Deliberately not persisted: a result describes what was on the air
+    // during one bounded listen, and restoring yesterday's from storage would present a stale
+    // observation as a current one. The add-on holds them until dismissed and _loadDiscoveries
+    // re-reads them from there, which keeps a single source of truth.
+    this._discoveries = {};
+    // Monotonic counter guarding the unawaited discovery list against stale responses, exactly as
+    // _loadStateRequestId does for state loads.
+    this._discoveryLoadId = 0;
+    // Ids dismissed by this tab. A snapshot for a dismissed run can still be in flight - queued
+    // on the add-on stream, or captured by a list request that started earlier - and applying it
+    // would put back a card whose next Dismiss returns 404, since the run is already gone
+    // server-side.
+    //
+    // Kept for the life of the panel rather than retired when a list stops reporting the run.
+    // The REST list and the event stream are independent channels, so absence from one says
+    // nothing about what is still queued on the other - retiring on that basis reopened the very
+    // race the tombstone exists to close. Bounded by count instead, which needs no assumption
+    // about delivery timing.
+    this._dismissedDiscoveries = new Set();
     // Per sweep: up to two pinned bin indices, in click order. Bin index rather than frequency,
     // because that is what the trace and waterfall are both drawn in - storing Hz would need a
     // round-trip through bin_hz that silently drifts if a sweep's bin width changes.
@@ -2148,6 +2240,10 @@ class SdrHubPanel extends HTMLElement {
     //
     // Only this operation is reported ready; subscribe owns its own half of that decision.
     this._noteIntegrationReady("loadState");
+    // Fetched alongside the polled state but deliberately not awaited: discovery results are not
+    // part of get_state, and a slow or unsupported list must not delay rendering everything else.
+    // Its own failure handling is silent, for the reason given on _loadDiscoveries.
+    this._loadDiscoveries();
     // Recovered from a prior load failure - clear its banner now that fresh state actually
     // arrived. Only do this if the banner currently showing IS that load error (the flag
     // reflects whichever _showError call ran most recently) so an unrelated, still-relevant
@@ -2176,6 +2272,34 @@ class SdrHubPanel extends HTMLElement {
   }
 
   async _handleEvent(event) {
+    // Whole-state, so it replaces rather than merges: the add-on rebuilds and broadcasts the
+    // complete snapshot on every decode, and a partial update would have nothing to reconcile
+    // against. Handled before anything else because it shares no state with the rest.
+    if (event.type === "discovery") {
+      const run = event.discovery;
+      if (run && run.id) {
+        const previous = (this._discoveries || {})[run.id];
+        // The counter is bumped only when the event is actually adopted. Bumping it for a
+        // snapshot that is then rejected would discard the authoritative list request a dismissal
+        // triggers, leaving exactly the stale card the tombstone exists to prevent.
+        const adopted = this._mergeDiscovery(run);
+        if (adopted) {
+          this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+          this._renderDiscoveries();
+        }
+        // A run ending releases the dongle, which the polled snapshot reports as in_use_by - and
+        // nothing else would tell this panel, since the release happens inside the add-on rather
+        // than in response to any command from here.
+        //
+        // Deliberately outside the adopted branch: a list request can install the finished
+        // snapshot first, after which the terminal stream event carries an equal revision and is
+        // rejected as a duplicate. Tying the refresh to adoption meant the one event that knows
+        // the dongle was released could be discarded for being redundant about the run - while
+        // being the only thing that was not redundant about the device.
+        this._refreshOwnershipIfStale(run);
+      }
+      return;
+    }
     if (event.type === "sweep_row") {
       event._receivedAt = Date.now(); // client-side only, for the time axis - the add-on doesn't send one
       // Absent on an older add-on, and absent until a sweep has produced something measurable -
@@ -2992,6 +3116,7 @@ class SdrHubPanel extends HTMLElement {
     this._lastBatteryAlertMessage = null;
     const sweepPrefs = loadFormPrefs(SWEEP_FORM_PREFS_KEY);
     const receiverPrefs = loadFormPrefs(RECEIVER_FORM_PREFS_KEY);
+    const discoveryPrefs = loadFormPrefs(DISCOVERY_FORM_PREFS_KEY);
     // "Dismissed" only skips showing it by default on load - the Help button in the header
     // always reopens it, so dismissing is never a one-way door for a first-time user who
     // dismissed too quickly or wants a refresher later.
@@ -3164,6 +3289,44 @@ class SdrHubPanel extends HTMLElement {
         </div>
 
         <div style="${CARD}">
+          <h2 style="margin:0 0 8px;">Discover devices</h2>
+          <p style="margin:0 0 10px;font-size:.85rem;color:var(--secondary-text-color,#727272);">
+            Listens for a fixed time and lists what is transmitting, without adding anything to
+            Home Assistant. Use it to find out what is around before starting a receiver.
+          </p>
+          <form id="sdr-hub-start-discovery">
+            <div class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+              <label style="${LABEL}">Preset<select name="preset" data-preset-select style="${INPUT}">
+                <option value="">Custom</option>
+                ${DISCOVERY_PRESETS.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("")}
+              </select></label>
+              <label style="${LABEL}">Dongle<select name="dongle_serial" style="${INPUT}"></select></label>
+              <label style="${LABEL}">Frequencies MHz (comma-separated)<input name="frequencies_mhz" value="${esc(discoveryPrefs.frequencies_mhz ?? "433.92")}" style="${INPUT};width:220px"></label>
+              <label style="${LABEL}">Listen for<select name="duration_s" style="${INPUT};width:150px">
+                ${DISCOVERY_DURATIONS.map((d) => `<option value="${d.s}"${String(discoveryPrefs.duration_s ?? 90) === String(d.s) ? " selected" : ""}>${esc(d.label)}</option>`).join("")}
+              </select></label>
+              <button type="submit" style="${BTN}">Start listening</button>
+            </div>
+            <details id="sdr-hub-discovery-advanced" style="margin-bottom:12px;"${discoveryPrefs.advanced_open ? " open" : ""}>
+              <summary style="cursor:pointer;font-size:.85rem;color:var(--secondary-text-color,#727272);">Advanced options</summary>
+              <div class="sdr-hub-form-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                <label style="${LABEL}" title="Seconds spent on each frequency before moving to the next. Only used when more than one frequency is listed.">Hop dwell s<input name="hop_interval_s" type="number" min="1" value="${esc(discoveryPrefs.hop_interval_s ?? 10)}" style="${INPUT};width:100px"></label>
+                <label style="${LABEL}" title="Blank for rtl_433's automatic gain. A fixed gain helps when a weak sensor is being ridden over by a strong neighbour.">Gain dB (auto if blank)<input name="gain_db" type="number" min="0" max="50" step="0.1" placeholder="auto" value="${esc(discoveryPrefs.gain_db ?? "")}" style="${INPUT};width:130px"></label>
+                <label style="${LABEL}" title="Blank lets rtl_433 pick (250k for OOK, 1024k when an FSK decoder is enabled). Wider catches signals further off the nominal frequency.">Sample rate Hz (auto if blank)<input name="sample_rate_hz" type="number" min="200000" max="3200000" step="1000" placeholder="auto" value="${esc(discoveryPrefs.sample_rate_hz ?? "")}" style="${INPUT};width:170px"></label>
+                <label style="${LABEL}" title="rtl_433 protocol numbers, comma-separated. Blank uses every enabled decoder. Listing any restricts to only those, which is how you test whether a signal is a specific device.">Only protocols<input name="protocols" placeholder="e.g. 26,77,185" value="${esc(discoveryPrefs.protocols ?? "")}" style="${INPUT};width:150px"></label>
+                <label style="${LABEL}" title="Protocol numbers to switch off while leaving every other decoder enabled - the opposite of the field to the left. Useful when one permissive decoder keeps producing false results on a long scan. Cannot be combined with 'Only protocols'.">Exclude protocols<input name="exclude_protocols" placeholder="e.g. 155,167" value="${esc(discoveryPrefs.exclude_protocols ?? "")}" style="${INPUT};width:150px"></label>
+                <label style="${LABEL}" title="Tuner frequency-offset correction in parts per million. Blank means no correction. Only worth setting if you have measured this dongle's error against a known transmitter.">PPM error (blank = 0)<input name="ppm_error" type="number" min="-1000" max="1000" placeholder="0" value="${esc(discoveryPrefs.ppm_error ?? "")}" style="${INPUT};width:130px"></label>
+              </div>
+              <div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
+                Listing protocols restricts the scan to <em>only</em> those, so a targeted test will not see anything else.
+                A scan holds the dongle for its whole duration, so sweeps and receivers on the same device cannot run meanwhile.
+              </div>
+            </details>
+          </form>
+          <div id="sdr-hub-discoveries"></div>
+        </div>
+
+        <div style="${CARD}">
           <h2 style="margin:0 0 8px;">Decoded devices</h2>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
             <input id="sdr-hub-decoded-filter" type="text" placeholder="Filter by model or id…" aria-label="Filter decoded devices" style="${INPUT};flex:1;min-width:160px;box-sizing:border-box;">
@@ -3271,6 +3434,7 @@ class SdrHubPanel extends HTMLElement {
     });
     this.querySelector("#sdr-hub-add-sweep").addEventListener("submit", (ev) => this._onAddSweep(ev));
     this.querySelector("#sdr-hub-add-receiver").addEventListener("submit", (ev) => this._onAddReceiver(ev));
+    this.querySelector("#sdr-hub-start-discovery").addEventListener("submit", (ev) => this._onStartDiscovery(ev));
     this.querySelector("#sdr-hub-sweep-filter").addEventListener("input", (ev) => {
       this._sweepFilter = ev.target.value.trim().toLowerCase();
       this._applySweepFilter();
@@ -3287,6 +3451,9 @@ class SdrHubPanel extends HTMLElement {
     this._wireConfirmButton(this.querySelector("#sdr-hub-stop-all-receivers"), () => this._onStopAllReceivers());
     this._wirePresetSelect("sdr-hub-add-sweep", SWEEP_PRESETS);
     this._wirePresetSelect("sdr-hub-add-receiver", RECEIVER_PRESETS);
+    // Same presets as the receiver form on purpose: discovery answers "what is on this frequency"
+    // and starting a receiver is the next step, so the two must offer the same choices.
+    this._wirePresetSelect("sdr-hub-start-discovery", DISCOVERY_PRESETS);
     this._wireColormapControls();
     this.querySelector("#sdr-hub-export-config").addEventListener("click", () => this._exportConfig());
     this.querySelector("#sdr-hub-import-config").addEventListener("change", (ev) => this._onImportConfigFile(ev));
@@ -3675,10 +3842,13 @@ class SdrHubPanel extends HTMLElement {
         </table>
         </div>`;
     }
-    for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver"]) {
+    for (const form of ["sdr-hub-add-sweep", "sdr-hub-add-receiver", "sdr-hub-start-discovery"]) {
       const select = this.querySelector(`#${form} select[name="dongle_serial"]`);
       if (!select) continue;
-      const isReceiver = form === "sdr-hub-add-receiver";
+      // Discovery runs rtl_433, exactly as a receiver does, so it is subject to the same
+      // driver restriction and reuses the receiver's remembered dongle - the two are almost
+      // always aimed at the same device.
+      const isReceiver = form === "sdr-hub-add-receiver" || form === "sdr-hub-start-discovery";
       const prefs = loadFormPrefs(isReceiver ? RECEIVER_FORM_PREFS_KEY : SWEEP_FORM_PREFS_KEY);
       this._renderDongleOptions(select, {
         rtlsdrOnly: isReceiver,
@@ -6307,6 +6477,293 @@ class SdrHubPanel extends HTMLElement {
     }
     if (errors.length) this._showError(`Could not stop all sweeps: ${errors.join("; ")}`, { owner: "sweepAction" });
     else this._clearErrorIfOwnedBy("sweepAction", errorToken);
+  }
+
+  async _onStartDiscovery(ev) {
+    const errorToken = this._errorToken || 0;
+    ev.preventDefault();
+    // See _onAddSweep's identical formEl capture - same reasoning.
+    const formEl = ev.target;
+    const form = new FormData(formEl);
+    const frequenciesHz = String(form.get("frequencies_mhz"))
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+      .map((v) => Number(v) * 1e6);
+    // Blank means "not specified", which is not the same as any number: the add-on omits the
+    // rtl_433 flag entirely, leaving automatic gain and a decoder-chosen sample rate. Sending 0
+    // for a blank gain box would silently mean minimum gain instead.
+    const optionalNumber = (name) => {
+      const raw = String(form.get(name) ?? "").trim();
+      if (!raw) return undefined;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : undefined;
+    };
+    const protocolList = (name) =>
+      String(form.get(name) ?? "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean)
+        .map((v) => Number(v))
+        .filter((v) => Number.isInteger(v) && v > 0);
+    const protocols = protocolList("protocols");
+    const excludeProtocols = protocolList("exclude_protocols");
+    try {
+      const run = await this._callWS({
+        type: "sdr_hub/start_discovery",
+        dongle_serial: form.get("dongle_serial"),
+        dongle_driver: this._selectedDongleDriver(formEl),
+        frequencies_hz: frequenciesHz,
+        duration_s: Number(form.get("duration_s")) || 90,
+        hop_interval_s: Number(form.get("hop_interval_s")) || 10,
+        ...(protocols.length ? { protocols } : {}),
+        ...(excludeProtocols.length ? { exclude_protocols: excludeProtocols } : {}),
+        ...(optionalNumber("ppm_error") !== undefined ? { ppm_error: optionalNumber("ppm_error") } : {}),
+        ...(optionalNumber("gain_db") !== undefined ? { gain_db: optionalNumber("gain_db") } : {}),
+        ...(optionalNumber("sample_rate_hz") !== undefined
+          ? { sample_rate_hz: optionalNumber("sample_rate_hz") }
+          : {}),
+      });
+      // Remembered only once the add-on accepted them - see _onAddSweep for why a rejected
+      // configuration must not become the next session's default.
+      saveFormPrefs(DISCOVERY_FORM_PREFS_KEY, {
+        frequencies_mhz: form.get("frequencies_mhz"),
+        duration_s: form.get("duration_s"),
+        hop_interval_s: form.get("hop_interval_s"),
+        gain_db: form.get("gain_db"),
+        sample_rate_hz: form.get("sample_rate_hz"),
+        protocols: form.get("protocols"),
+        exclude_protocols: form.get("exclude_protocols"),
+        ppm_error: form.get("ppm_error"),
+        advanced_open: !!formEl.querySelector("#sdr-hub-discovery-advanced")?.open,
+      });
+      // Held locally rather than waiting for the first broadcast: a run over a quiet band may
+      // emit nothing at all until it finishes, and a button that appeared to do nothing for
+      // ninety seconds would be indistinguishable from one that failed.
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+      this._mergeDiscovery(run);
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not start listening: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  async _onStopDiscovery(discoveryId) {
+    const errorToken = this._errorToken || 0;
+    try {
+      const run = await this._callWS({ type: "sdr_hub/stop_discovery", discovery_id: discoveryId });
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+      this._mergeDiscovery(run);
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not stop listening: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  async _onForgetDiscovery(discoveryId) {
+    const errorToken = this._errorToken || 0;
+    try {
+      await this._callWS({ type: "sdr_hub/forget_discovery", discovery_id: discoveryId });
+      // Invalidates any list request already in flight, which may have captured this run before
+      // it was dismissed and would otherwise put its card back.
+      this._discoveryLoadId = (this._discoveryLoadId || 0) + 1;
+      this._rememberDismissed(discoveryId);
+      const next = { ...(this._discoveries || {}) };
+      delete next[discoveryId];
+      this._discoveries = next;
+      this._renderDiscoveries();
+      this._clearErrorIfOwnedBy("discoveryAction", errorToken);
+    } catch (err) {
+      this._showError(`Could not dismiss the result: ${err.message || err}`, { owner: "discoveryAction" });
+    }
+  }
+
+  // Discovery results are not part of the polled snapshot, so a panel opening after a run
+  // finished would otherwise show nothing at all - and the finished result is exactly what a
+  // user comes back to look at. Failure is deliberately silent: this runs on every load, and an
+  // add-on too old to know the command would otherwise put a permanent error banner on the panel
+  // for a feature the user may not be using.
+  async _loadDiscoveries() {
+    // Sequenced like _loadState, and for a sharper reason: this call is deliberately not awaited,
+    // so its response routinely lands after a discovery event, a start, or a dismiss that already
+    // moved _discoveries on. Replacing the map wholesale with an older snapshot would resurrect a
+    // dismissed run's card - and pressing Dismiss on it then 404s, because it is already gone
+    // server-side, leaving a card that cannot be removed until the next load.
+    const requestId = ++this._discoveryLoadId;
+    try {
+      const runs = await this._callWS({ type: "sdr_hub/list_discoveries" });
+      if (requestId !== this._discoveryLoadId) return; // superseded by a newer load
+      if (!Array.isArray(runs)) return;
+      const byId = {};
+      for (const run of runs) if (run && run.id && !this._dismissedDiscoveries.has(run.id)) byId[run.id] = run;
+      this._discoveries = byId;
+      this._renderDiscoveries();
+      for (const run of Object.values(byId)) this._refreshOwnershipIfStale(run);
+    } catch {
+      // See above - not surfaced.
+    }
+  }
+
+  // Applies a snapshot from any source - the start/stop response, a streamed event, or a list -
+  // under the two rules every source has to obey.
+  //
+  // Snapshots arrive out of order. A start response is captured before the POST returns, so a
+  // streamed event (even the final one, for a short run) can overtake it; applying it blindly
+  // turned a finished run back into a running one, leaving a Stop button that nothing would
+  // correct because no further event was coming. Refusing to move a run from finished back to
+  // running is enough to order them, and needs no clock shared with the add-on.
+  _mergeDiscovery(run) {
+    if (!run || !run.id) return false;
+    if (this._dismissedDiscoveries.has(run.id)) return false;
+    const existing = (this._discoveries || {})[run.id];
+    if (existing) {
+      // The add-on stamps every snapshot with a revision that only increases, which is the only
+      // thing that can order two snapshots of a *running* run: both have finished === false, so
+      // the response to a start - captured before the POST returned - could otherwise land after
+      // a streamed decode and replace a populated device list with the initial empty one, making
+      // a sensor the user just watched appear vanish again.
+      if (Number.isFinite(run.revision) && Number.isFinite(existing.revision)) {
+        if (run.revision <= existing.revision) return false;
+      } else if (existing.finished && !run.finished) {
+        // An add-on too old to send a revision. Coarser, but it still prevents the worst case of
+        // a finished run being shown as running again with a Stop button that does nothing.
+        return false;
+      }
+    }
+    this._discoveries = { ...(this._discoveries || {}), [run.id]: run };
+    return true;
+  }
+
+  // Re-reads the polled snapshot when it still shows a *finished* run holding a device.
+  //
+  // Keyed on what the display currently claims rather than on what changed, because "what
+  // changed" is not knowable from any single path: the run may reach this panel as finished via
+  // the stream, via the authoritative list, or via the response to a stop - and whichever arrives
+  // second carries no evidence that anything changed at all. Asking instead whether the device
+  // list still credits this finished run with a dongle is a question every path can answer
+  // identically, and it is self-limiting: once the refresh lands the owner is cleared, so a
+  // repeated snapshot for the same run cannot trigger an endless refresh loop.
+  _refreshOwnershipIfStale(run) {
+    if (!run || !run.id || !run.finished) return;
+    const owners = ((this._state || {}).devices || []).map((d) => d && d.in_use_by);
+    if (owners.includes(run.id)) this._loadState();
+  }
+
+  // Records a dismissal, capped so a long-lived panel cannot accumulate ids without limit.
+  // Eviction is oldest-first: the older a dismissal is, the less likely any snapshot predating it
+  // is still in flight, so the entries least worth keeping are exactly the ones dropped.
+  _rememberDismissed(discoveryId) {
+    this._dismissedDiscoveries.add(discoveryId);
+    while (this._dismissedDiscoveries.size > MAX_DISMISSED_DISCOVERIES) {
+      this._dismissedDiscoveries.delete(this._dismissedDiscoveries.values().next().value);
+    }
+  }
+
+  _renderDiscoveries() {
+    const el = this.querySelector("#sdr-hub-discoveries");
+    if (!el) return;
+    const runs = Object.values(this._discoveries || {}).sort((a, b) => (b.started_at || 0) - (a.started_at || 0));
+    if (!runs.length) {
+      el.innerHTML = `<div style="font-size:.85rem;color:var(--secondary-text-color,#727272);">No listening runs yet.</div>`;
+      return;
+    }
+    el.innerHTML = runs.map((run) => this._discoveryCard(run)).join("");
+    for (const btn of el.querySelectorAll("[data-discovery-stop]")) {
+      btn.addEventListener("click", () => this._onStopDiscovery(btn.getAttribute("data-discovery-stop")));
+    }
+    for (const btn of el.querySelectorAll("[data-discovery-forget]")) {
+      btn.addEventListener("click", () => this._onForgetDiscovery(btn.getAttribute("data-discovery-forget")));
+    }
+  }
+
+  _discoveryCard(run) {
+    const freqs = (run.frequencies_hz || []).map((hz) => `${fmtMHz(hz)} MHz`).join(", ");
+    // A result cannot be read without the settings that produced it: "nothing heard" means
+    // something quite different at automatic gain across five frequencies than at fixed gain on
+    // one, and a protocol-restricted scan cannot see anything outside its list by construction.
+    const settings = [
+      (run.frequencies_hz || []).length > 1 ? `${run.hop_interval_s ?? 10}s dwell` : null,
+      run.gain_db != null ? `gain ${run.gain_db} dB` : null,
+      run.sample_rate_hz != null ? `${Math.round(run.sample_rate_hz / 1000)}k sample rate` : null,
+      (run.protocols || []).length ? `protocols ${run.protocols.join(", ")} only` : null,
+      (run.exclude_protocols || []).length ? `excluding ${run.exclude_protocols.join(", ")}` : null,
+      run.ppm_error != null ? `${run.ppm_error} ppm` : null,
+    ].filter(Boolean);
+    const running = !run.finished;
+    const devices = run.devices || [];
+    // "Heard nothing" is only the answer once the run is over. Saying it while still listening
+    // would report a conclusion the run has not reached, on precisely the band where the wait is
+    // longest - a sensor that reports once a minute looks like an empty band for most of a run.
+    const body = devices.length
+      ? `<table style="width:100%;border-collapse:collapse;font-size:.85rem;">
+           <thead><tr style="text-align:left;color:var(--secondary-text-color,#727272);">
+             <th style="padding:2px 6px 2px 0;">Device</th>
+             <th style="padding:2px 6px;">Frequency</th>
+             <th style="padding:2px 6px;">Heard</th>
+             <th style="padding:2px 0 2px 6px;">Latest reading</th>
+           </tr></thead>
+           <tbody>${devices.map((d) => this._discoveryRow(d)).join("")}</tbody>
+         </table>${
+           devices.some((d) => (d.count || 0) < DISCOVERY_CONFIRM_SIGHTINGS)
+             ? `<div style="font-size:.78rem;color:var(--secondary-text-color,#727272);margin-top:6px;">
+                  Entries marked <em>weak evidence</em> were heard fewer than ${DISCOVERY_CONFIRM_SIGHTINGS}
+                  times. Some decoders match noise on a long listen, so treat those as leads: check the
+                  readings are physically plausible and the frequency matches the band that protocol uses.
+                </div>`
+             : ""
+         }`
+      : `<div style="font-size:.85rem;color:var(--secondary-text-color,#727272);">${
+          running ? "Listening…" : "Nothing was heard on this frequency during the run."
+        }</div>`;
+    const note = run.error
+      ? `<div style="color:var(--error-color,#db4437);font-size:.8rem;margin-top:6px;">${esc(run.error)}</div>`
+      : run.truncated
+        ? `<div style="font-size:.8rem;margin-top:6px;color:var(--secondary-text-color,#727272);">Too many devices to list them all; showing the first ones found.</div>`
+        : "";
+    return `
+      <div style="border:1px solid var(--divider-color,#e0e0e0);border-radius:6px;padding:10px;margin-bottom:8px;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+          <strong style="font-size:.9rem;">${esc(freqs)}</strong>
+          <span style="font-size:.8rem;color:var(--secondary-text-color,#727272);">
+            ${running
+              ? `listening for ${esc(fmtDuration(run.duration_s))}`
+              // The duration belongs on a finished run more than on a running one: it is what
+              // makes the result interpretable. "Nothing was heard" after ninety seconds says
+              // almost nothing, while the same words after twelve hours are a real finding - and
+              // once the run is over, nothing else on the card carries how long it listened.
+              : `listened ${esc(fmtDuration(run.duration_s))}`} ·
+            ${devices.length} device${devices.length === 1 ? "" : "s"}${settings.length ? ` · ${esc(settings.join(" · "))}` : ""}
+          </span>
+          <span style="flex:1"></span>
+          ${running ? `<button type="button" data-discovery-stop="${esc(run.id)}" style="${BTN}">Stop now</button>` : ""}
+          <button type="button" data-discovery-forget="${esc(run.id)}" style="${BTN_DANGER}">Dismiss</button>
+        </div>
+        ${body}${note}
+      </div>`;
+  }
+
+  _discoveryRow(d) {
+    const name = [d.model || "Unknown", d.id != null ? `id ${d.id}` : "", d.channel != null ? `ch ${d.channel}` : ""]
+      .filter(Boolean)
+      .join(" ");
+    const sample = Object.entries(d.sample || {})
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    const unconfirmed = (d.count || 0) < DISCOVERY_CONFIRM_SIGHTINGS;
+    // Dimmed as a whole rather than badged in one column, so the distinction survives being
+    // skimmed: the risk is a one-off decode being read as a device that is really there.
+    const rowStyle = unconfirmed ? "opacity:.65;" : "";
+    const mark = unconfirmed
+      ? ` <span title="Heard only a few times. rtl_433 runs many permissive decoders at once and some match noise on a long listen - one produced readings of -131 C and +124 C from the same id twenty minutes apart. A handful of sightings is not evidence a device exists. Check the readings are physically plausible and the frequency matches the band the protocol actually uses; listening for longer is the reliable test." style="font-size:.75rem;color:var(--secondary-text-color,#727272);">weak evidence</span>`
+      : "";
+    return `<tr style="${rowStyle}">
+      <td style="padding:2px 6px 2px 0;">${esc(name)}${mark}</td>
+      <td style="padding:2px 6px;">${d.frequency_hz ? esc(fmtMHz(d.frequency_hz)) + " MHz" : "—"}</td>
+      <td style="padding:2px 6px;">${esc(String(d.count || 0))}×</td>
+      <td style="padding:2px 0 2px 6px;color:var(--secondary-text-color,#727272);">${esc(sample) || "—"}</td>
+    </tr>`;
   }
 
   async _onAddReceiver(ev) {
